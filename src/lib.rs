@@ -35,3 +35,10 @@ pub mod store;
 
 /// MCP server: 6 tools (info, create, get, list, update, delete) over stdio.
 pub mod mcp;
+
+/// Framework-level dump hook utilities (write-only file materialization).
+///
+/// Provides [`dump::on_change`] and [`dump::on_delete`] hooks that `Store`
+/// calls after successful CRUD operations.  Defined here — not in `store.rs` —
+/// so any future mini-app can reuse them directly (Crux #1 compliance).
+pub mod dump;

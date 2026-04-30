@@ -94,22 +94,38 @@ impl Store {
     /// Open the SQLite database at `db_path` and run `CREATE TABLE IF NOT EXISTS rows`.
     ///
     /// # Concurrency
-    /// This function is called once at startup. The returned [`Store`] wraps
-    /// `Arc<Mutex<rusqlite::Connection>>`. [`rusqlite::Connection`] is `Send` but
-    /// `!Sync`; the `Mutex` provides the required exclusive access.
+    /// Returns a [`Store`] that wraps `Arc<Mutex<rusqlite::Connection>>` and is
+    /// `Send + Sync`. [`rusqlite::Connection`] is `Send` but `!Sync`; the
+    /// `std::sync::Mutex` provides exclusive access. All subsequent CRUD calls
+    /// acquire the lock inside `spawn_blocking` closures and drop it before any
+    /// `.await` point — holding a `MutexGuard` across `.await` is never permitted.
     ///
-    /// The `CREATE TABLE` DDL executes inside a `spawn_blocking` task. If the
-    /// blocking task panics, the error propagates as [`MiniAppError::Schema`].
+    /// If `schema.dump.sync` is `Some(SyncMode::Bidirectional)`, a
+    /// `tracing::warn!` is emitted once here; the store behaves as write-only
+    /// until bidirectional sync is implemented.
     ///
     /// # Cancel Safety
-    /// The `spawn_blocking` closure cannot be aborted once started; cancellation
-    /// of the returned `Future` does not prevent the DDL from executing on the
-    /// blocking thread pool.
+    /// Not cancel-safe. Once the `spawn_blocking` closure has started (DDL
+    /// execution), calling `abort` on the `JoinHandle` or dropping the returned
+    /// `Future` has no effect — the DDL completes on the blocking thread pool.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::Storage`] — `Connection::open` or DDL execute failure.
+    /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
     ///
     /// # Panic
-    /// Does not panic. `Connection::open` and `execute` errors are returned as
-    /// `Err(MiniAppError::Storage(_))`.
+    /// Does not panic.
     pub async fn open(db_path: &Path, schema: SchemaConfig) -> Result<Self, MiniAppError> {
+        // Warn if bidirectional sync is configured but not yet implemented.
+        if let Some(crate::dump::SyncMode::Bidirectional) =
+            schema.dump.as_ref().and_then(|d| d.sync.as_ref())
+        {
+            tracing::warn!(
+                target: "mini_app_mcp::dump",
+                "sync=bidirectional configured but not implemented yet; behaving as write-only"
+            );
+        }
+
         let db_path = db_path.to_path_buf();
         let conn =
             tokio::task::spawn_blocking(move || -> Result<rusqlite::Connection, MiniAppError> {
@@ -133,17 +149,26 @@ impl Store {
     /// The rusqlite `INSERT` executes inside `tokio::task::spawn_blocking`.
     /// `Arc<Mutex<Connection>>` is cloned before entering the blocking closure;
     /// the [`std::sync::MutexGuard`] is acquired and dropped entirely within the
-    /// blocking thread—never held across an `.await` point.
+    /// blocking closure — never held across an `.await` point.
+    ///
+    /// After the `spawn_blocking` future resolves, `dump::on_change` is called
+    /// at the `.await` point. The `MutexGuard` is already dropped at this stage.
+    /// If `dump::on_change` fails (e.g. disk full), the error is propagated via
+    /// `?` and the caller receives `Err(MiniAppError::Io(_))`; the row remains
+    /// in the database (DB and file may be transiently inconsistent until the
+    /// next successful write).
     ///
     /// # Cancel Safety
-    /// Not cancel-safe in the standard sense: once the blocking closure has
-    /// started, the `INSERT` will complete even if the caller drops the `Future`.
-    /// The row will exist in the database after the operation finishes.
+    /// Not cancel-safe. Once the `spawn_blocking` closure has started, the
+    /// `INSERT` completes regardless of `Future` cancellation. If the caller
+    /// drops this `Future` after the INSERT but before `dump::on_change`
+    /// completes, the file may not be materialized while the DB row exists.
     ///
     /// # Errors
     /// - [`MiniAppError::Validation`] — required field absent or type mismatch.
     /// - [`MiniAppError::Storage`] — rusqlite error (constraint violation, I/O).
     /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
+    /// - [`MiniAppError::Io`] — dump file write failure (only when `dump` is configured).
     ///
     /// # Panic
     /// Does not panic. Mutex poisoning is propagated as `Err(MiniAppError::Storage(_))`.
@@ -174,6 +199,9 @@ impl Store {
         })
         .await
         .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))??;
+
+        // MutexGuard is already dropped (held only inside the spawn_blocking closure above).
+        crate::dump::on_change(&self.schema, &record).await?;
 
         Ok(record)
     }
@@ -297,19 +325,31 @@ impl Store {
     ///
     /// # Concurrency
     /// The `UPDATE` executes inside `tokio::task::spawn_blocking`. The
-    /// [`std::sync::MutexGuard`] is held only within the blocking closure.
-    /// Concurrent calls with the same `id` are serialized by the `Mutex`.
+    /// [`std::sync::MutexGuard`] is held only within the blocking closure and is
+    /// dropped before any `.await` point. Concurrent calls with the same `id`
+    /// are serialized by the `Mutex`.
+    ///
+    /// After the `spawn_blocking` future resolves, `dump::on_change` is called
+    /// at the `.await` point. The `MutexGuard` is already dropped at this stage.
+    /// If `dump::on_change` fails (e.g. disk full), the error is propagated via
+    /// `?` and the caller receives `Err(MiniAppError::Io(_))`; the row update
+    /// remains in the database (DB and file may be transiently inconsistent
+    /// until the next successful write).
     ///
     /// # Cancel Safety
-    /// Once the blocking closure has started the `UPDATE` will complete
-    /// regardless of `Future` cancellation. Idempotent: calling with the same
-    /// `id` and `value` results in the same final state.
+    /// Not cancel-safe. Once the blocking closure has started the `UPDATE` will
+    /// complete regardless of `Future` cancellation. Idempotent at the SQL
+    /// level: calling with the same `id` and `value` results in the same final
+    /// DB state. If the caller drops this `Future` after the UPDATE but before
+    /// `dump::on_change` completes, the file may not be re-materialized while
+    /// the DB row already reflects the new value.
     ///
     /// # Errors
     /// - [`MiniAppError::NotFound`] — no row with the given `id`.
     /// - [`MiniAppError::Validation`] — required field absent or type mismatch.
     /// - [`MiniAppError::Storage`] — rusqlite error.
     /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
+    /// - [`MiniAppError::Io`] — dump file write failure (only when `dump` is configured).
     ///
     /// # Panic
     /// Does not panic.
@@ -327,7 +367,7 @@ impl Store {
         let conn = self.conn.clone();
         let id = id.to_string();
 
-        tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
+        let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
             let conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Storage(rusqlite::Error::QueryReturnedNoRows))?;
@@ -356,31 +396,59 @@ impl Store {
             })
         })
         .await
-        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))??;
+
+        // MutexGuard is already dropped (held only inside the spawn_blocking closure above).
+        crate::dump::on_change(&self.schema, &record).await?;
+
+        Ok(record)
     }
 
     /// Delete the row identified by `id`.
     ///
     /// # Concurrency
     /// The `DELETE` executes inside `tokio::task::spawn_blocking`. The
-    /// [`std::sync::MutexGuard`] is held only within the blocking closure.
-    /// Idempotent: deleting a non-existent `id` returns
-    /// [`MiniAppError::NotFound`], so calling twice with the same `id` returns
-    /// `Err(MiniAppError::NotFound)` on the second call.
+    /// [`std::sync::MutexGuard`] is held only within the blocking closure and
+    /// is dropped before any `.await` point. Idempotent at the SQL level:
+    /// deleting a non-existent `id` returns [`MiniAppError::NotFound`], so
+    /// calling twice with the same `id` returns `Err(MiniAppError::NotFound)`
+    /// on the second call.
+    ///
+    /// After the `spawn_blocking` future resolves, `dump::on_delete` is called
+    /// at the `.await` point. The `MutexGuard` is already dropped at this stage.
+    /// In the current implementation `on_delete` is a no-op (`Ok(())`) and the
+    /// dump file is preserved on disk by default. The `Result<(), MiniAppError>`
+    /// signature is retained because a future schema flag (e.g.
+    /// `dump.on_delete: keep | remove`) may switch this to an actual file
+    /// removal that can fail with [`MiniAppError::Io`]. Today the value-level
+    /// behaviour is infallible, but the type-level contract (and the
+    /// `?`-propagation site in `Store::delete`) is preserved so that flipping
+    /// the future flag does not require changing the call site.
     ///
     /// # Cancel Safety
-    /// Once the blocking closure has started the `DELETE` runs to completion
-    /// regardless of `Future` cancellation.
+    /// Not cancel-safe with respect to the `spawn_blocking` portion: once the
+    /// blocking closure has started the `DELETE` runs to completion regardless
+    /// of `Future` cancellation. The current `on_delete` no-op is itself
+    /// cancel-safe (no `.await`, no I/O), so dropping this `Future` after the
+    /// DELETE has no observable file-system effect today. When `on_delete`
+    /// gains real file removal in the future, this paragraph must be updated
+    /// in lockstep with the new contract.
     ///
     /// # Errors
     /// - [`MiniAppError::NotFound`] — no row with the given `id`.
     /// - [`MiniAppError::Storage`] — rusqlite error.
     /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
+    /// - [`MiniAppError::Io`] — reserved for a future `on_delete` implementation
+    ///   that performs file removal (currently never returned, but the variant
+    ///   is part of the public contract so the call site does not need to
+    ///   change when the flag is added).
     ///
     /// # Panic
     /// Does not panic.
     pub async fn delete(&self, id: &str) -> Result<(), MiniAppError> {
         let conn = self.conn.clone();
+        // Clone id for use after spawn_blocking (id is moved into the closure).
+        let id_for_hook = id.to_string();
         let id = id.to_string();
 
         tokio::task::spawn_blocking(move || -> Result<(), MiniAppError> {
@@ -394,7 +462,12 @@ impl Store {
             Ok(())
         })
         .await
-        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))??;
+
+        // MutexGuard is already dropped (held only inside the spawn_blocking closure above).
+        crate::dump::on_delete(&self.schema, &id_for_hook).await?;
+
+        Ok(())
     }
 }
 
@@ -424,6 +497,34 @@ mod tests {
                     required: false,
                 },
             ],
+            dump: None,
+        };
+        Store::open(Path::new(":memory:"), schema).await.unwrap()
+    }
+
+    /// Build a test store with dump directed to `dir`.
+    async fn make_test_store_with_dump(dir: &Path) -> Store {
+        use crate::dump::{DumpConfig, SyncMode};
+        let schema = SchemaConfig {
+            table: "test".into(),
+            fields: vec![
+                FieldDef {
+                    name: "title".into(),
+                    ty: FieldType::String,
+                    required: true,
+                },
+                FieldDef {
+                    name: "body".into(),
+                    ty: FieldType::String,
+                    required: false,
+                },
+            ],
+            dump: Some(DumpConfig {
+                dir: Some(dir.to_path_buf()),
+                title_field: None,
+                body_field: None,
+                sync: Some(SyncMode::WriteOnly),
+            }),
         };
         Store::open(Path::new(":memory:"), schema).await.unwrap()
     }
@@ -618,5 +719,129 @@ mod tests {
             .await
             .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")));
         assert!(matches!(result, Err(MiniAppError::Schema(_))));
+    }
+
+    // --- Dump integration tests ---
+
+    #[tokio::test]
+    async fn create_triggers_dump_when_configured() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store_with_dump(tmp.path()).await;
+        let row = store
+            .create(serde_json::json!({"title": "My Issue", "body": "Details"}))
+            .await
+            .expect("create ok");
+        let dump_file = tmp.path().join(format!("{}.md", row.id));
+        assert!(dump_file.exists(), "dump file must be created after create");
+        let content = std::fs::read_to_string(&dump_file).expect("read dump file");
+        assert!(content.starts_with("# My Issue\n"));
+        assert!(content.contains("Details"));
+    }
+
+    #[tokio::test]
+    async fn update_overwrites_dump_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store_with_dump(tmp.path()).await;
+        let row = store
+            .create(serde_json::json!({"title": "Original", "body": "v1"}))
+            .await
+            .expect("create ok");
+
+        store
+            .update(
+                &row.id,
+                serde_json::json!({"title": "Updated", "body": "v2"}),
+            )
+            .await
+            .expect("update ok");
+
+        let dump_file = tmp.path().join(format!("{}.md", row.id));
+        let content = std::fs::read_to_string(&dump_file).expect("read dump file");
+        assert!(
+            content.starts_with("# Updated\n"),
+            "dump file must reflect updated title"
+        );
+        assert!(
+            content.contains("v2"),
+            "dump file must reflect updated body"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_dump_file_by_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = make_test_store_with_dump(tmp.path()).await;
+        let row = store
+            .create(serde_json::json!({"title": "Keep Me", "body": ""}))
+            .await
+            .expect("create ok");
+
+        let dump_file = tmp.path().join(format!("{}.md", row.id));
+        assert!(dump_file.exists(), "dump file must exist after create");
+
+        store.delete(&row.id).await.expect("delete ok");
+        assert!(
+            dump_file.exists(),
+            "dump file must remain after delete (default: keep)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_store_create_concurrent_dump_writes_all_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(make_test_store_with_dump(tmp.path()).await);
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let s = store.clone();
+                tokio::spawn(async move {
+                    s.create(serde_json::json!({
+                        "title": format!("concurrent-{i}"),
+                        "body": format!("body-{i}"),
+                    }))
+                    .await
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = futures::future::join_all(handles).await;
+        // All creates must succeed
+        let rows: Vec<_> = results
+            .into_iter()
+            .map(|r| r.expect("spawn ok").expect("create ok"))
+            .collect();
+
+        // Each row must have a corresponding dump file
+        for row in &rows {
+            let path = tmp.path().join(format!("{}.md", row.id));
+            assert!(path.exists(), "dump file must exist for row {}", row.id);
+        }
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn store_open_with_bidirectional_sync_returns_ok() {
+        use crate::dump::{DumpConfig, SyncMode};
+        // Store::open must succeed and emit warn (we verify Ok return here;
+        // warn log capture is out of scope per Acceptance Criteria §7).
+        let schema = SchemaConfig {
+            table: "test".into(),
+            fields: vec![FieldDef {
+                name: "title".into(),
+                ty: FieldType::String,
+                required: false,
+            }],
+            dump: Some(DumpConfig {
+                dir: None,
+                title_field: None,
+                body_field: None,
+                sync: Some(SyncMode::Bidirectional),
+            }),
+        };
+        let store = Store::open(Path::new(":memory:"), schema).await;
+        assert!(
+            store.is_ok(),
+            "Store::open must succeed even with bidirectional sync configured"
+        );
     }
 }
