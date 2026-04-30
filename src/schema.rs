@@ -86,12 +86,19 @@ pub struct FieldDef {
 /// # Fields
 /// - `table`: the SQLite table name (also used as a human-readable label).
 /// - `fields`: ordered list of field definitions.
+/// - `dump`: optional write-only file-materialization configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SchemaConfig {
     /// The logical table name declared in `schema.yaml`.
     pub table: String,
     /// All field definitions, in declaration order.
     pub fields: Vec<FieldDef>,
+    /// Optional dump / file-materialization configuration.
+    ///
+    /// When absent from `schema.yaml`, the field deserializes to `None` and
+    /// the dump feature is disabled entirely (backward-compatible default).
+    #[serde(default)]
+    pub dump: Option<crate::dump::DumpConfig>,
 }
 
 impl SchemaConfig {
@@ -259,6 +266,7 @@ fields:
                     required: false,
                 },
             ],
+            dump: None,
         };
         let value = serde_json::json!({ "title": "hello", "count": 42 });
         assert!(schema.validate(&value).is_ok());
@@ -273,6 +281,7 @@ fields:
                 ty: FieldType::Array,
                 required: false,
             }],
+            dump: None,
         };
         let value = serde_json::json!({});
         assert!(schema.validate(&value).is_ok());
@@ -288,6 +297,7 @@ fields:
                 ty: FieldType::String,
                 required: true,
             }],
+            dump: None,
         };
         let value = serde_json::json!({ "title": "hi", "extra_key": 99 });
         assert!(schema.validate(&value).is_ok());
@@ -304,6 +314,7 @@ fields:
                 ty: FieldType::String,
                 required: true,
             }],
+            dump: None,
         };
         let value = serde_json::json!({ "title": null });
         let err = schema
@@ -324,6 +335,7 @@ fields:
                 ty: FieldType::String,
                 required: false,
             }],
+            dump: None,
         };
         let value = serde_json::json!({ "state": null });
         assert!(schema.validate(&value).is_ok());
@@ -334,6 +346,7 @@ fields:
         let schema = SchemaConfig {
             table: "t".to_string(),
             fields: vec![],
+            dump: None,
         };
         let value = serde_json::json!({});
         assert!(schema.validate(&value).is_ok());
@@ -344,6 +357,7 @@ fields:
         let schema = SchemaConfig {
             table: "t".to_string(),
             fields: vec![],
+            dump: None,
         };
         let value = serde_json::json!([1, 2, 3]);
         let err = schema.validate(&value).expect_err("array root must error");
@@ -361,6 +375,7 @@ fields:
                 ty: FieldType::String,
                 required: true,
             }],
+            dump: None,
         };
         let value = serde_json::json!({});
         let err = schema
@@ -384,6 +399,7 @@ fields:
                 ty: FieldType::Number,
                 required: true,
             }],
+            dump: None,
         };
         let value = serde_json::json!({ "score": "not-a-number" });
         let err = schema
@@ -414,6 +430,7 @@ fields:
                 ty: FieldType::Boolean,
                 required: true,
             }],
+            dump: None,
         };
         let value = serde_json::json!({ "active": 1 });
         let err = schema.validate(&value).expect_err("number is not boolean");
@@ -429,6 +446,7 @@ fields:
                 ty: FieldType::Array,
                 required: true,
             }],
+            dump: None,
         };
         let value = serde_json::json!({ "tags": "not-an-array" });
         let err = schema.validate(&value).expect_err("string is not array");
@@ -457,6 +475,60 @@ fields:
             "expected Schema error, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn yaml_with_dump_section_deserializes() {
+        let yaml = r#"
+table: issues
+fields:
+  - name: title
+    type: string
+    required: true
+dump:
+  dir: /tmp/test-dump
+  title_field: title
+  body_field: body
+  sync: write-only
+"#;
+        let f = write_yaml(yaml);
+        let schema = load_from_path(f.path()).expect("valid YAML with dump must parse");
+        assert_eq!(schema.table, "issues");
+        let dump = schema.dump.expect("dump must be Some");
+        assert_eq!(dump.title_field.as_deref(), Some("title"));
+        assert_eq!(dump.body_field.as_deref(), Some("body"));
+        assert_eq!(dump.sync, Some(crate::dump::SyncMode::WriteOnly));
+    }
+
+    #[test]
+    fn yaml_without_dump_section_yields_none() {
+        let yaml = r#"
+table: issues
+fields:
+  - name: title
+    type: string
+    required: true
+"#;
+        let f = write_yaml(yaml);
+        let schema = load_from_path(f.path()).expect("valid YAML without dump must parse");
+        assert!(
+            schema.dump.is_none(),
+            "dump must be None when section is absent"
+        );
+    }
+
+    #[test]
+    fn yaml_with_bidirectional_sync_deserializes() {
+        let yaml = r#"
+table: tasks
+fields: []
+dump:
+  sync: bidirectional
+"#;
+        let f = write_yaml(yaml);
+        let schema = load_from_path(f.path()).expect("yaml with bidirectional must parse");
+        let dump = schema.dump.expect("dump must be Some");
+        assert_eq!(dump.sync, Some(crate::dump::SyncMode::Bidirectional));
     }
 
     #[test]
