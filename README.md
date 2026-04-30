@@ -79,6 +79,63 @@ Then register it as an MCP server in `.mcp.json`:
 }
 ```
 
+## Dump / file materialization
+
+`mini-app-mcp` can write each created or updated row to disk as a Markdown file.  This is useful for agents that read context from files, for version-controlling records with `git`, or for quick human inspection.
+
+### How it works
+
+After every successful `create` or `update` call the server writes (or overwrites) a file:
+
+```
+<dump-dir>/<id>.md
+```
+
+The file format is:
+
+```markdown
+# <title-field value>
+
+<body-field value>
+```
+
+`delete` does **not** remove the dump file by default (the record stays on disk as an archive).
+
+### Enabling dump in schema.yaml
+
+Add a `dump:` section to your `schema.yaml`:
+
+```yaml
+table: issues
+fields:
+  - name: title
+    type: string
+    required: true
+  - name: body
+    type: string
+    required: false
+dump:
+  dir: ./issues          # optional; default: <cwd>/.mini-app/<table>/
+  title_field: title     # optional; default: title
+  body_field: body       # optional; default: body
+  sync: write-only       # optional; default: write-only
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `dump.dir` | `<cwd>/.mini-app/<table>/` | Directory where `<id>.md` files are written. Relative paths are resolved from the server's working directory. |
+| `dump.title_field` | `title` | Field name in the stored JSON row to use as the Markdown heading. |
+| `dump.body_field` | `body` | Field name in the stored JSON row to use as the Markdown body. |
+| `dump.sync` | `write-only` | Sync direction. Only `write-only` is implemented. Setting `bidirectional` is accepted without error but logs a warning and behaves as `write-only`. |
+
+### Ignoring dump files in git
+
+Add `.mini-app/` (or your custom `dump.dir`) to `.gitignore` if you do not want dump files tracked by version control:
+
+```
+.mini-app/
+```
+
 ## License
 
 MIT OR Apache-2.0
