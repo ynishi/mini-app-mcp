@@ -390,6 +390,7 @@ mod tests {
                     required: false,
                 },
             ],
+            dump: None,
         };
         let store = Store::open(Path::new(":memory:"), schema.clone())
             .await
