@@ -1,0 +1,49 @@
+error: future cannot be sent between threads safely
+  --> tests/ui/arc_connection_no_sync.rs:12:19
+   |
+12 |       let _handle = tokio::spawn(async move {
+   |  ___________________^
+13 | |         let _c = conn;
+14 | |     });
+   | |______^ future created by async block is not `Send`
+   |
+   = help: within `Connection`, the trait `Sync` is not implemented for `RefCell<rusqlite::inner_connection::InnerConnection>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: captured value is not `Send`
+  --> tests/ui/arc_connection_no_sync.rs:13:18
+   |
+13 |         let _c = conn;
+   |                  ^^^^ has type `Arc<Connection>` which is not `Send`
+note: required by a bound in `tokio::spawn`
+  --> $CARGO/tokio-$VERSION/src/task/spawn.rs
+   |
+   |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+   |            ----- required by a bound in this function
+   |     where
+   |         F: Future + Send + 'static,
+   |                     ^^^^ required by this bound in `spawn`
+
+error: future cannot be sent between threads safely
+  --> tests/ui/arc_connection_no_sync.rs:12:19
+   |
+12 |       let _handle = tokio::spawn(async move {
+   |  ___________________^
+13 | |         let _c = conn;
+14 | |     });
+   | |______^ future created by async block is not `Send`
+   |
+   = help: within `Connection`, the trait `Sync` is not implemented for `RefCell<hashlink::lru_cache::LruCache<Arc<str>, rusqlite::raw_statement::RawStatement>>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: captured value is not `Send`
+  --> tests/ui/arc_connection_no_sync.rs:13:18
+   |
+13 |         let _c = conn;
+   |                  ^^^^ has type `Arc<Connection>` which is not `Send`
+note: required by a bound in `tokio::spawn`
+  --> $CARGO/tokio-$VERSION/src/task/spawn.rs
+   |
+   |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+   |            ----- required by a bound in this function
+   |     where
+   |         F: Future + Send + 'static,
+   |                     ^^^^ required by this bound in `spawn`

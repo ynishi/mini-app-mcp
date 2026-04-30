@@ -1,0 +1,11 @@
+table: issues
+fields:
+  - name: title
+    type: string
+    required: true
+  - name: state
+    type: string
+    required: false
+  - name: tags
+    type: array
+    required: false

@@ -1,0 +1,20 @@
+table: issues
+fields:
+  - name: legacy_id
+    type: string
+    required: false
+  - name: title
+    type: string
+    required: true
+  - name: status
+    type: string
+    required: true
+  - name: body
+    type: string
+    required: false
+  - name: tags
+    type: array
+    required: false
+  - name: target
+    type: string
+    required: false
