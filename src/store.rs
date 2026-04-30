@@ -185,7 +185,7 @@ impl Store {
         let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
             let conn = conn
                 .lock()
-                .map_err(|_| MiniAppError::Storage(rusqlite::Error::QueryReturnedNoRows))?;
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             conn.execute(
                 "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![id_inner, data_str, now, now],
@@ -231,7 +231,7 @@ impl Store {
         tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
             let conn = conn
                 .lock()
-                .map_err(|_| MiniAppError::Storage(rusqlite::Error::QueryReturnedNoRows))?;
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             let mut stmt =
                 conn.prepare("SELECT id, data, created_at, updated_at FROM rows WHERE id = ?1")?;
             let row = stmt
@@ -288,7 +288,7 @@ impl Store {
         tokio::task::spawn_blocking(move || -> Result<Vec<RowRecord>, MiniAppError> {
             let conn = conn
                 .lock()
-                .map_err(|_| MiniAppError::Storage(rusqlite::Error::QueryReturnedNoRows))?;
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             let mut stmt = conn.prepare(
                 "SELECT id, data, created_at, updated_at FROM rows \
                  ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
@@ -336,6 +336,15 @@ impl Store {
     /// remains in the database (DB and file may be transiently inconsistent
     /// until the next successful write).
     ///
+    /// **Same-id concurrent update is not order-preserving with respect to
+    /// file content.** The DB `UPDATE` is serialised by the connection
+    /// `Mutex`, but `dump::on_change` runs *outside* the lock. Two concurrent
+    /// `update(id, A)` / `update(id, B)` calls may finalise the DB row as B
+    /// while the dump file ends up holding A's content (whichever
+    /// `spawn_blocking` write completes last wins on disk). Callers that
+    /// require strict file-DB ordering must serialise updates by `id` at the
+    /// caller side.
+    ///
     /// # Cancel Safety
     /// Not cancel-safe. Once the blocking closure has started the `UPDATE` will
     /// complete regardless of `Future` cancellation. Idempotent at the SQL
@@ -370,7 +379,7 @@ impl Store {
         let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
             let conn = conn
                 .lock()
-                .map_err(|_| MiniAppError::Storage(rusqlite::Error::QueryReturnedNoRows))?;
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
 
             // Fetch created_at first to return it unchanged.
             let created_at: Option<i64> = conn
@@ -454,7 +463,7 @@ impl Store {
         tokio::task::spawn_blocking(move || -> Result<(), MiniAppError> {
             let conn = conn
                 .lock()
-                .map_err(|_| MiniAppError::Storage(rusqlite::Error::QueryReturnedNoRows))?;
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             let n = conn.execute("DELETE FROM rows WHERE id = ?1", rusqlite::params![id])?;
             if n == 0 {
                 return Err(MiniAppError::NotFound { id });

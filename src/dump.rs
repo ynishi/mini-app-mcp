@@ -6,7 +6,7 @@
 //! into `store.rs` — so any future mini-app can call them directly (Crux #1
 //! compliance: framework-level hook placement).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -64,21 +64,26 @@ pub enum SyncMode {
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Pure path-construction helper.  Separated from [`dump_path`] so the
+/// `dir = None` branch can be unit-tested without mutating process-global
+/// `current_dir()` (which would race with other parallel tests).
+fn dump_path_with_cwd(cwd: &Path, schema: &SchemaConfig, dump: &DumpConfig, id: &str) -> PathBuf {
+    match &dump.dir {
+        None => cwd
+            .join(".mini-app")
+            .join(&schema.table)
+            .join(format!("{id}.md")),
+        Some(dir) => dir.join(format!("{id}.md")),
+    }
+}
+
 /// Compute the destination path for a dump file.
 ///
 /// - `DumpConfig.dir = None`  → `<cwd>/.mini-app/<table>/<id>.md`
 /// - `DumpConfig.dir = Some(P)` → `P/<id>.md`
 fn dump_path(schema: &SchemaConfig, dump: &DumpConfig, id: &str) -> Result<PathBuf, MiniAppError> {
-    let path = match &dump.dir {
-        None => {
-            let cwd = std::env::current_dir()?;
-            cwd.join(".mini-app")
-                .join(&schema.table)
-                .join(format!("{id}.md"))
-        }
-        Some(dir) => dir.join(format!("{id}.md")),
-    };
-    Ok(path)
+    let cwd = std::env::current_dir()?;
+    Ok(dump_path_with_cwd(&cwd, schema, dump, id))
 }
 
 /// Render a [`RowRecord`] into the markdown format required by the dump spec.
@@ -104,6 +109,10 @@ fn render(schema_is_unused: &SchemaConfig, dump: &DumpConfig, record: &RowRecord
 
     let title = value_as_str(&record.data, title_key);
     let body = value_as_str(&record.data, body_key);
+    // Strip body trailing newlines so the format always ends with exactly one
+    // LF (POSIX convention) regardless of whether the source body already
+    // included a terminating newline.
+    let body = body.trim_end_matches('\n');
 
     format!("# {title}\n\n{body}\n")
 }
@@ -133,6 +142,12 @@ fn value_as_str(data: &serde_json::Value, key: &str) -> String {
 /// `std::fs::write`), consistent with the existing `Store` I/O pattern.
 /// Concurrent calls with distinct `record.id` values write to distinct paths
 /// (UUID v4) and do not interfere.
+///
+/// Concurrent calls with the **same** `record.id` are *not* order-preserving:
+/// the disk write order is determined by `spawn_blocking` scheduling, so the
+/// final file content reflects whichever write finishes last — which may not
+/// match the DB's last write. Callers that require strict file-DB ordering
+/// must serialise same-id writes upstream.
 ///
 /// # Cancel Safety
 /// Not cancel-safe. Once the `spawn_blocking` closure has started, the file
@@ -322,6 +337,29 @@ mod tests {
     }
 
     #[test]
+    fn render_body_with_trailing_newline_collapses_to_single_lf() {
+        let schema = make_schema_no_dump("t");
+        let dump = DumpConfig {
+            dir: None,
+            title_field: None,
+            body_field: None,
+            sync: None,
+        };
+        // body already ends with "\n" — final output must still end with exactly
+        // one trailing LF, never two.
+        let record = make_record(
+            "id-trailing",
+            serde_json::json!({"title": "T", "body": "B\n"}),
+        );
+        let rendered = render(&schema, &dump, &record);
+        assert!(rendered.ends_with('\n'));
+        assert!(
+            !rendered.ends_with("\n\n"),
+            "must not produce double trailing LF; got {rendered:?}"
+        );
+    }
+
+    #[test]
     fn render_non_string_title_uses_to_string() {
         let schema = make_schema_no_dump("t");
         let dump = DumpConfig {
@@ -340,11 +378,6 @@ mod tests {
     #[test]
     fn dump_path_default_uses_cwd_mini_app_table_id() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // Override cwd is not possible per-test; instead we verify the
-        // custom-dir path variant and rely on the None branch existing in code.
-        // We test the Some(dir) variant as a proxy for the path-join logic,
-        // and separately verify the None branch compiles and runs without error
-        // in the on_change_no_dump_config_is_noop test.
         let schema = SchemaConfig {
             table: "issues".to_string(),
             fields: vec![],
@@ -358,6 +391,29 @@ mod tests {
         let dump_cfg = schema.dump.as_ref().unwrap();
         let path = dump_path(&schema, dump_cfg, "abc-123").expect("dump_path ok");
         assert_eq!(path, tmp.path().join("abc-123.md"));
+    }
+
+    #[test]
+    fn dump_path_with_cwd_none_branch_joins_mini_app_table_id() {
+        // Pure-helper test for the `dump.dir = None` branch — no process-global
+        // cwd mutation needed, so this is safe under parallel test execution.
+        let schema = SchemaConfig {
+            table: "issues".to_string(),
+            fields: vec![],
+            dump: None,
+        };
+        let dump = DumpConfig {
+            dir: None,
+            title_field: None,
+            body_field: None,
+            sync: None,
+        };
+        let cwd = Path::new("/some/cwd");
+        let path = dump_path_with_cwd(cwd, &schema, &dump, "abc-123");
+        assert_eq!(
+            path,
+            Path::new("/some/cwd/.mini-app/issues/abc-123.md").to_path_buf()
+        );
     }
 
     #[test]
