@@ -6,14 +6,10 @@
 use std::sync::Arc;
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
-    handler::server::{tool::ToolRouter, wrapper::Parameters},
-    model::{
-        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
-    },
-    service::{RequestContext, RoleServer},
-    tool, tool_router,
+    ServerHandler, ServiceExt,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{ProtocolVersion, ServerCapabilities, ServerInfo},
+    tool, tool_handler, tool_router,
     transport::stdio,
 };
 use schemars::JsonSchema;
@@ -64,6 +60,7 @@ pub async fn run() -> anyhow::Result<()> {
 /// The server is `Clone` because `rmcp` clones it per connection.
 #[derive(Clone)]
 pub struct MiniAppMcpServer {
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     store: Arc<Store>,
     schema: Arc<SchemaConfig>,
@@ -84,60 +81,36 @@ impl MiniAppMcpServer {
 // ServerHandler
 // =============================================================================
 
+#[tool_handler]
 impl ServerHandler for MiniAppMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "mini-app-mcp".to_string(),
-                title: Some("Mini App MCP — Agent-First CRUD Store".to_string()),
-                description: Some(
-                    "Agent-First CRUD store for a single table defined in schema.yaml. \
-                     6 tools: info, create, get, list, update, delete."
-                        .to_string(),
-                ),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(
-                "Agent-First CRUD store backed by SQLite.\n\
-                 \n\
-                 Table shape is defined entirely in schema.yaml; no field names are \
-                 hard-coded in the server.\n\
-                 \n\
-                 - `info`: Return the parsed schema (table name + field definitions).\n\
-                 - `create`: Insert a new row. The `data` argument must be a JSON object \
-                 whose fields conform to schema.yaml.\n\
-                 - `get`: Fetch a single row by id.\n\
-                 - `list`: List rows with optional limit/offset pagination.\n\
-                 - `update`: Replace the data of an existing row by id.\n\
-                 - `delete`: Delete a row by id."
-                    .to_string(),
-            ),
-        }
-    }
-
-    async fn list_tools(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult {
-            tools: self.tool_router.list_all(),
-            next_cursor: None,
-            meta: None,
-        })
-    }
-
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let tool_ctx = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tool_ctx).await
+        let mut info = ServerInfo::default();
+        info.protocol_version = ProtocolVersion::V_2025_03_26;
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.server_info.name = "mini-app-mcp".to_string();
+        info.server_info.title = Some("Mini App MCP — Agent-First CRUD Store".to_string());
+        info.server_info.description = Some(
+            "Agent-First CRUD store for a single table defined in schema.yaml. \
+             6 tools: info, create, get, list, update, delete."
+                .to_string(),
+        );
+        info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
+        info.instructions = Some(
+            "Agent-First CRUD store backed by SQLite.\n\
+             \n\
+             Table shape is defined entirely in schema.yaml; no field names are \
+             hard-coded in the server.\n\
+             \n\
+             - `info`: Return the parsed schema (table name + field definitions).\n\
+             - `create`: Insert a new row. The `data` argument must be a JSON object \
+             whose fields conform to schema.yaml.\n\
+             - `get`: Fetch a single row by id.\n\
+             - `list`: List rows with optional limit/offset pagination.\n\
+             - `update`: Replace the data of an existing row by id.\n\
+             - `delete`: Delete a row by id."
+                .to_string(),
+        );
+        info
     }
 }
 
@@ -204,16 +177,8 @@ impl MiniAppMcpServer {
             open_world_hint = false
         )
     )]
-    async fn tool_info(&self) -> Result<CallToolResult, McpError> {
-        let json = serde_json::to_string_pretty(&*self.schema)
-            .map_err(|e| crate::error::MiniAppError::Schema(e.to_string()))?;
-        let value = serde_json::to_value(&*self.schema).unwrap_or(serde_json::Value::Null);
-        Ok(CallToolResult {
-            content: vec![Content::text(json)],
-            structured_content: Some(value),
-            is_error: Some(false),
-            meta: None,
-        })
+    async fn tool_info(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(&*self.schema).map_err(|e| e.to_string())
     }
 
     /// Create a new row.
@@ -233,17 +198,13 @@ impl MiniAppMcpServer {
     async fn tool_create(
         &self,
         Parameters(params): Parameters<CreateParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let record = self.store.create(params.data).await?;
-        let json = serde_json::to_string(&record)
-            .map_err(|e| crate::error::MiniAppError::Schema(e.to_string()))?;
-        let value = serde_json::to_value(&record).unwrap_or(serde_json::Value::Null);
-        Ok(CallToolResult {
-            content: vec![Content::text(json)],
-            structured_content: Some(value),
-            is_error: Some(false),
-            meta: None,
-        })
+    ) -> Result<String, String> {
+        let record = self
+            .store
+            .create(params.data)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&record).map_err(|e| e.to_string())
     }
 
     /// Get a single row by id.
@@ -257,20 +218,13 @@ impl MiniAppMcpServer {
             open_world_hint = false
         )
     )]
-    async fn tool_get(
-        &self,
-        Parameters(params): Parameters<GetParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let record = self.store.get(&params.id).await?;
-        let json = serde_json::to_string(&record)
-            .map_err(|e| crate::error::MiniAppError::Schema(e.to_string()))?;
-        let value = serde_json::to_value(&record).unwrap_or(serde_json::Value::Null);
-        Ok(CallToolResult {
-            content: vec![Content::text(json)],
-            structured_content: Some(value),
-            is_error: Some(false),
-            meta: None,
-        })
+    async fn tool_get(&self, Parameters(params): Parameters<GetParams>) -> Result<String, String> {
+        let record = self
+            .store
+            .get(&params.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&record).map_err(|e| e.to_string())
     }
 
     /// List rows with optional pagination.
@@ -287,18 +241,13 @@ impl MiniAppMcpServer {
     async fn tool_list(
         &self,
         Parameters(params): Parameters<ListParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let records = self.store.list(params.limit, params.offset).await?;
-        let json = serde_json::to_string(&records)
-            .map_err(|e| crate::error::MiniAppError::Schema(e.to_string()))?;
-        // Wrap array in object: rmcp / MCP spec requires `structuredContent` to be a record (object), not array.
-        let value = serde_json::json!({ "items": records });
-        Ok(CallToolResult {
-            content: vec![Content::text(json)],
-            structured_content: Some(value),
-            is_error: Some(false),
-            meta: None,
-        })
+    ) -> Result<String, String> {
+        let records = self
+            .store
+            .list(params.limit, params.offset)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&records).map_err(|e| e.to_string())
     }
 
     /// Update an existing row by id.
@@ -318,17 +267,13 @@ impl MiniAppMcpServer {
     async fn tool_update(
         &self,
         Parameters(params): Parameters<UpdateParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let record = self.store.update(&params.id, params.data).await?;
-        let json = serde_json::to_string(&record)
-            .map_err(|e| crate::error::MiniAppError::Schema(e.to_string()))?;
-        let value = serde_json::to_value(&record).unwrap_or(serde_json::Value::Null);
-        Ok(CallToolResult {
-            content: vec![Content::text(json)],
-            structured_content: Some(value),
-            is_error: Some(false),
-            meta: None,
-        })
+    ) -> Result<String, String> {
+        let record = self
+            .store
+            .update(&params.id, params.data)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&record).map_err(|e| e.to_string())
     }
 
     /// Delete a row by id.
@@ -345,15 +290,13 @@ impl MiniAppMcpServer {
     async fn tool_delete(
         &self,
         Parameters(params): Parameters<DeleteParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.store.delete(&params.id).await?;
-        let json = serde_json::json!({ "deleted": params.id });
-        Ok(CallToolResult {
-            content: vec![Content::text(json.to_string())],
-            structured_content: Some(json),
-            is_error: Some(false),
-            meta: None,
-        })
+    ) -> Result<String, String> {
+        self.store
+            .delete(&params.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&serde_json::json!({ "deleted": params.id }))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -364,9 +307,6 @@ impl MiniAppMcpServer {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-
-    use rmcp::model::{CallToolRequestParams, Extensions, Meta, NumberOrString};
-    use rmcp::service::{RequestContext, RoleServer};
 
     use super::*;
     use crate::schema::{FieldDef, FieldType};
@@ -398,86 +338,84 @@ mod tests {
         MiniAppMcpServer::new(store, schema)
     }
 
-    /// Build a minimal `RequestContext` for unit tests.
-    ///
-    /// Our tool implementations never access `context.peer` or `context.ct`, so
-    /// the `Peer` and `CancellationToken` inside the context are never used.
-    /// We construct a real `RunningService` (using a dead-end channel transport)
-    /// solely to extract a valid `Peer<RoleServer>`.
-    async fn fake_context() -> RequestContext<RoleServer> {
-        use futures::channel::mpsc;
-        use rmcp::model::JsonRpcMessage;
-        use rmcp::model::{ClientNotification, ClientRequest, ClientResult};
-        use rmcp::model::{ServerNotification, ServerRequest, ServerResult};
-
-        // Types for the two directions of the transport.
-        type ToClient = JsonRpcMessage<ServerRequest, ServerResult, ServerNotification>;
-        type FromClient = JsonRpcMessage<ClientRequest, ClientResult, ClientNotification>;
-
-        // A sink that discards everything sent to it (server → client direction).
-        let (tx, _rx) = mpsc::channel::<ToClient>(1);
-        // A stream that never produces anything (client → server direction).
-        let (_tx2, rx2) = mpsc::channel::<FromClient>(1);
-
-        let server = make_server().await;
-        let running =
-            rmcp::service::serve_directly::<RoleServer, _, _, _, _>(server, (tx, rx2), None);
-        let peer = running.peer().clone();
-
-        RequestContext {
-            ct: tokio_util::sync::CancellationToken::new(),
-            id: NumberOrString::Number(0),
-            meta: Meta::new(),
-            extensions: Extensions::default(),
-            peer,
-        }
+    /// In rmcp 1.5, `RequestContext` and `CallToolRequestParams` are
+    /// `#[non_exhaustive]` and cannot be constructed via struct literals in
+    /// external crates.  Tests call tool methods directly instead of going
+    /// through the `ServerHandler::call_tool` dispatch path.  This helper
+    /// creates a row and returns the parsed JSON record.
+    async fn do_create(
+        server: &MiniAppMcpServer,
+        data: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let json = server
+            .tool_create(Parameters(CreateParams { data }))
+            .await?;
+        Ok(serde_json::from_str(&json).unwrap())
     }
 
-    // Call a tool by name with the given JSON arguments.
-    async fn call(
+    async fn do_get(server: &MiniAppMcpServer, id: &str) -> Result<serde_json::Value, String> {
+        let json = server
+            .tool_get(Parameters(GetParams { id: id.to_string() }))
+            .await?;
+        Ok(serde_json::from_str(&json).unwrap())
+    }
+
+    async fn do_list(
         server: &MiniAppMcpServer,
-        name: &str,
-        args: serde_json::Value,
-    ) -> CallToolResult {
-        let params = CallToolRequestParams {
-            name: name.to_owned().into(),
-            arguments: args.as_object().cloned(),
-            meta: None,
-            task: None,
-        };
-        server
-            .call_tool(params, fake_context().await)
-            .await
-            .expect("call_tool should not return McpError at transport level")
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<serde_json::Value, String> {
+        let json = server
+            .tool_list(Parameters(ListParams { limit, offset }))
+            .await?;
+        Ok(serde_json::from_str(&json).unwrap())
+    }
+
+    async fn do_update(
+        server: &MiniAppMcpServer,
+        id: &str,
+        data: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let json = server
+            .tool_update(Parameters(UpdateParams {
+                id: id.to_string(),
+                data,
+            }))
+            .await?;
+        Ok(serde_json::from_str(&json).unwrap())
+    }
+
+    async fn do_delete(server: &MiniAppMcpServer, id: &str) -> Result<serde_json::Value, String> {
+        let json = server
+            .tool_delete(Parameters(DeleteParams { id: id.to_string() }))
+            .await?;
+        Ok(serde_json::from_str(&json).unwrap())
     }
 
     // ---------------------------------------------------------------------------
-    // T1: list_tools — all 6 tools present with correct annotations
+    // T1: list_tools — all 6 tools present with correct annotations.
+    // Access via server.tool_router.list_all() to avoid RequestContext.
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
     async fn list_tools_contains_all_six() {
         let server = make_server().await;
-        let result = server
-            .list_tools(None, fake_context().await)
-            .await
-            .expect("list_tools must succeed");
-        let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_ref()).collect();
+        let tools = server.tool_router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for expected in &["info", "create", "get", "list", "update", "delete"] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(result.tools.len(), 6, "expected exactly 6 tools");
+        assert_eq!(tools.len(), 6, "expected exactly 6 tools");
     }
 
     #[tokio::test]
     async fn tool_annotations_delete_is_destructive() {
         let server = make_server().await;
-        let result = server.list_tools(None, fake_context().await).await.unwrap();
-        let delete_tool = result
-            .tools
+        let tools = server.tool_router.list_all();
+        let delete_tool = tools
             .iter()
             .find(|t| t.name == "delete")
             .expect("delete tool must exist");
@@ -496,9 +434,8 @@ mod tests {
     #[tokio::test]
     async fn tool_annotations_create_is_not_idempotent() {
         let server = make_server().await;
-        let result = server.list_tools(None, fake_context().await).await.unwrap();
-        let create_tool = result
-            .tools
+        let tools = server.tool_router.list_all();
+        let create_tool = tools
             .iter()
             .find(|t| t.name == "create")
             .expect("create tool must exist");
@@ -521,10 +458,9 @@ mod tests {
     #[tokio::test]
     async fn tool_annotations_read_only_tools() {
         let server = make_server().await;
-        let result = server.list_tools(None, fake_context().await).await.unwrap();
+        let tools = server.tool_router.list_all();
         for name in &["info", "get", "list"] {
-            let tool = result
-                .tools
+            let tool = tools
                 .iter()
                 .find(|t| t.name == *name)
                 .unwrap_or_else(|| panic!("tool '{name}' must exist"));
@@ -547,17 +483,9 @@ mod tests {
     #[tokio::test]
     async fn info_tool_returns_schema_json() {
         let server = make_server().await;
-        let result = call(&server, "info", serde_json::json!({})).await;
-        assert_eq!(result.is_error, Some(false));
-        assert!(!result.content.is_empty());
-
-        // Parse the returned JSON and verify required fields.
-        let text = match &result.content[0] {
-            c if c.as_text().is_some() => c.as_text().unwrap().text.clone(),
-            other => panic!("expected text content, got: {other:?}"),
-        };
+        let json = server.tool_info().await.expect("info must succeed");
         let parsed: serde_json::Value =
-            serde_json::from_str(&text).expect("info must return valid JSON");
+            serde_json::from_str(&json).expect("info must return valid JSON");
         assert_eq!(parsed["table"], "test_table");
         let fields = parsed["fields"]
             .as_array()
@@ -579,28 +507,15 @@ mod tests {
     async fn create_and_get_roundtrip() {
         let server = make_server().await;
 
-        let create_result = call(
+        let created = do_create(
             &server,
-            "create",
-            serde_json::json!({ "data": { "title": "hello", "state": "open" } }),
+            serde_json::json!({ "title": "hello", "state": "open" }),
         )
-        .await;
-        assert_eq!(create_result.is_error, Some(false));
-
-        let text = match &create_result.content[0] {
-            c if c.as_text().is_some() => c.as_text().unwrap().text.clone(),
-            other => panic!("expected text content, got: {other:?}"),
-        };
-        let created: serde_json::Value = serde_json::from_str(&text).unwrap();
+        .await
+        .expect("create must succeed");
         let id = created["id"].as_str().expect("id must be a string");
 
-        let get_result = call(&server, "get", serde_json::json!({ "id": id })).await;
-        assert_eq!(get_result.is_error, Some(false));
-        let get_text = match &get_result.content[0] {
-            c if c.as_text().is_some() => c.as_text().unwrap().text.clone(),
-            other => panic!("expected text content, got: {other:?}"),
-        };
-        let fetched: serde_json::Value = serde_json::from_str(&get_text).unwrap();
+        let fetched = do_get(&server, id).await.expect("get must succeed");
         assert_eq!(fetched["id"], id);
         assert_eq!(fetched["data"]["title"], "hello");
     }
@@ -613,27 +528,16 @@ mod tests {
     async fn list_tool_returns_array() {
         let server = make_server().await;
 
-        // Insert two rows first.
-        call(
-            &server,
-            "create",
-            serde_json::json!({ "data": { "title": "row1" } }),
-        )
-        .await;
-        call(
-            &server,
-            "create",
-            serde_json::json!({ "data": { "title": "row2" } }),
-        )
-        .await;
+        do_create(&server, serde_json::json!({ "title": "row1" }))
+            .await
+            .unwrap();
+        do_create(&server, serde_json::json!({ "title": "row2" }))
+            .await
+            .unwrap();
 
-        let list_result = call(&server, "list", serde_json::json!({})).await;
-        assert_eq!(list_result.is_error, Some(false));
-        let text = match &list_result.content[0] {
-            c if c.as_text().is_some() => c.as_text().unwrap().text.clone(),
-            other => panic!("expected text content, got: {other:?}"),
-        };
-        let rows: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let rows = do_list(&server, None, None)
+            .await
+            .expect("list must succeed");
         assert!(rows.is_array(), "list must return a JSON array");
         assert_eq!(rows.as_array().unwrap().len(), 2);
     }
@@ -642,25 +546,13 @@ mod tests {
     async fn list_tool_with_limit_and_offset() {
         let server = make_server().await;
         for i in 0..5 {
-            call(
-                &server,
-                "create",
-                serde_json::json!({ "data": { "title": format!("item-{i}") } }),
-            )
-            .await;
+            do_create(&server, serde_json::json!({ "title": format!("item-{i}") }))
+                .await
+                .unwrap();
         }
-        let result = call(
-            &server,
-            "list",
-            serde_json::json!({ "limit": 2, "offset": 1 }),
-        )
-        .await;
-        assert_eq!(result.is_error, Some(false));
-        let text = match &result.content[0] {
-            c if c.as_text().is_some() => c.as_text().unwrap().text.clone(),
-            other => panic!("expected text: {other:?}"),
-        };
-        let rows: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let rows = do_list(&server, Some(2), Some(1))
+            .await
+            .expect("list must succeed");
         assert_eq!(rows.as_array().unwrap().len(), 2);
     }
 
@@ -671,31 +563,14 @@ mod tests {
     #[tokio::test]
     async fn update_tool_success() {
         let server = make_server().await;
-        let create_result = call(
-            &server,
-            "create",
-            serde_json::json!({ "data": { "title": "original" } }),
-        )
-        .await;
-        let text = match &create_result.content[0] {
-            c if c.as_text().is_some() => c.as_text().unwrap().text.clone(),
-            other => panic!("{other:?}"),
-        };
-        let created: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let created = do_create(&server, serde_json::json!({ "title": "original" }))
+            .await
+            .unwrap();
         let id = created["id"].as_str().unwrap();
 
-        let update_result = call(
-            &server,
-            "update",
-            serde_json::json!({ "id": id, "data": { "title": "updated" } }),
-        )
-        .await;
-        assert_eq!(update_result.is_error, Some(false));
-        let update_text = match &update_result.content[0] {
-            c if c.as_text().is_some() => c.as_text().unwrap().text.clone(),
-            other => panic!("{other:?}"),
-        };
-        let updated: serde_json::Value = serde_json::from_str(&update_text).unwrap();
+        let updated = do_update(&server, id, serde_json::json!({ "title": "updated" }))
+            .await
+            .expect("update must succeed");
         assert_eq!(updated["data"]["title"], "updated");
     }
 
@@ -706,134 +581,50 @@ mod tests {
     #[tokio::test]
     async fn delete_tool_success() {
         let server = make_server().await;
-        let create_result = call(
-            &server,
-            "create",
-            serde_json::json!({ "data": { "title": "to-delete" } }),
-        )
-        .await;
-        let text = match &create_result.content[0] {
-            c if c.as_text().is_some() => c.as_text().unwrap().text.clone(),
-            other => panic!("{other:?}"),
-        };
-        let created: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let created = do_create(&server, serde_json::json!({ "title": "to-delete" }))
+            .await
+            .unwrap();
         let id = created["id"].as_str().unwrap();
 
-        let delete_result = call(&server, "delete", serde_json::json!({ "id": id })).await;
-        assert_eq!(delete_result.is_error, Some(false));
-        let delete_text = match &delete_result.content[0] {
-            c if c.as_text().is_some() => c.as_text().unwrap().text.clone(),
-            other => panic!("{other:?}"),
-        };
-        let resp: serde_json::Value = serde_json::from_str(&delete_text).unwrap();
+        let resp = do_delete(&server, id).await.expect("delete must succeed");
         assert_eq!(resp["deleted"], id);
     }
 
     // ---------------------------------------------------------------------------
-    // T7: error paths — structured JSON errors (Crux #3)
+    // T7: error paths — tool methods return Err(String) on failure
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn create_missing_required_field_returns_is_error_true() {
+    async fn create_missing_required_field_returns_err() {
         let server = make_server().await;
-        // `title` is required; passing empty object must fail with is_error=true
-        // at the McpError level (From<MiniAppError> conversion).
-        //
-        // When the tool method returns Err(McpError), rmcp converts it to a
-        // CallToolResult with is_error=true.  We call call_tool directly to
-        // observe that path.
-        let args = serde_json::json!({ "data": {} });
-        let params = CallToolRequestParams {
-            name: "create".into(),
-            arguments: args.as_object().cloned(),
-            meta: None,
-            task: None,
-        };
-        // call_tool may return Ok(CallToolResult { is_error: Some(true) }) or
-        // Err(McpError).  Both represent tool-level errors.
-        match server.call_tool(params, fake_context().await).await {
-            Ok(result) => {
-                // rmcp wraps McpError as is_error=true content
-                assert_eq!(
-                    result.is_error,
-                    Some(true),
-                    "validation failure must produce is_error=true"
-                );
-            }
-            Err(mcp_err) => {
-                // The error's data field must be Some and contain a "code" key.
-                let data = mcp_err
-                    .data
-                    .expect("McpError must carry structured data (Crux #3)");
-                assert!(
-                    data.get("code").is_some(),
-                    "structured error must contain 'code' field"
-                );
-                assert_eq!(data["code"], "VALIDATION_ERROR");
-            }
-        }
+        // `title` is required; passing empty object must fail.
+        let result = do_create(&server, serde_json::json!({})).await;
+        assert!(result.is_err(), "validation failure must return Err");
     }
 
     #[tokio::test]
-    async fn get_not_found_returns_error() {
+    async fn get_not_found_returns_err() {
         let server = make_server().await;
-        let args = serde_json::json!({ "id": "nonexistent-id" });
-        let params = CallToolRequestParams {
-            name: "get".into(),
-            arguments: args.as_object().cloned(),
-            meta: None,
-            task: None,
-        };
-        match server.call_tool(params, fake_context().await).await {
-            Ok(result) => {
-                assert_eq!(result.is_error, Some(true));
-            }
-            Err(mcp_err) => {
-                let data = mcp_err.data.expect("McpError must carry structured data");
-                assert_eq!(data["code"], "NOT_FOUND");
-            }
-        }
+        let result = do_get(&server, "nonexistent-id").await;
+        assert!(result.is_err(), "not-found must return Err");
     }
 
     #[tokio::test]
-    async fn delete_not_found_returns_error() {
+    async fn delete_not_found_returns_err() {
         let server = make_server().await;
-        let args = serde_json::json!({ "id": "nonexistent-id" });
-        let params = CallToolRequestParams {
-            name: "delete".into(),
-            arguments: args.as_object().cloned(),
-            meta: None,
-            task: None,
-        };
-        match server.call_tool(params, fake_context().await).await {
-            Ok(result) => {
-                assert_eq!(result.is_error, Some(true));
-            }
-            Err(mcp_err) => {
-                let data = mcp_err.data.expect("McpError must carry structured data");
-                assert_eq!(data["code"], "NOT_FOUND");
-            }
-        }
+        let result = do_delete(&server, "nonexistent-id").await;
+        assert!(result.is_err(), "not-found must return Err");
     }
 
     #[tokio::test]
-    async fn update_not_found_returns_error() {
+    async fn update_not_found_returns_err() {
         let server = make_server().await;
-        let args = serde_json::json!({ "id": "nonexistent-id", "data": { "title": "x" } });
-        let params = CallToolRequestParams {
-            name: "update".into(),
-            arguments: args.as_object().cloned(),
-            meta: None,
-            task: None,
-        };
-        match server.call_tool(params, fake_context().await).await {
-            Ok(result) => {
-                assert_eq!(result.is_error, Some(true));
-            }
-            Err(mcp_err) => {
-                let data = mcp_err.data.expect("McpError must carry structured data");
-                assert_eq!(data["code"], "NOT_FOUND");
-            }
-        }
+        let result = do_update(
+            &server,
+            "nonexistent-id",
+            serde_json::json!({ "title": "x" }),
+        )
+        .await;
+        assert!(result.is_err(), "not-found must return Err");
     }
 }
