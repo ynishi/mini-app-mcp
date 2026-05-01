@@ -2,9 +2,14 @@
 name = "mini-app-mcp"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Yutaka Nishimura"]
 license = "MIT OR Apache-2.0"
 description = "Agent-First CRUD store MCP server — 1 daemon per table, schema.yaml driven, SQLite backend"
+repository = "https://github.com/ynishi/mini-app-mcp"
+readme = "README.md"
+keywords = ["mcp", "sqlite", "agent", "crud", "schema"]
+categories = ["database", "command-line-utilities"]
 
 [dependencies]
 rmcp = { version = "1.5", features = ["server", "transport-io"] }
