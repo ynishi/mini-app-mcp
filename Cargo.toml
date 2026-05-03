@@ -26,6 +26,7 @@ dirs = "5"
 dotenvy = "0.15"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+arc-swap = "1"
 
 [dev-dependencies]
 tempfile = "3"
