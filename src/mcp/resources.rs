@@ -11,12 +11,12 @@ use crate::schema::{FieldType, SchemaConfig};
 /// README.md embedded at compile time so it ships in the binary.
 pub const README: &str = include_str!("../../README.md");
 
-/// Hand-written cheat sheet listing all 6 tools with descriptions / shapes.
+/// Hand-written cheat sheet listing all 7 tools with descriptions / shapes.
 pub const TOOLS_DOC: &str = r#"# mini-app-mcp — Tools Reference
 
 ## `table` argument (all tools)
 
-All 6 tools accept an optional `table` argument:
+All tools accept an optional `table` argument:
 - **Multi-table mode** (`MINI_APP_USER_DIR`/`MINI_APP_PROJECT_DIR` set): `table` is **required**.
   Omitting it returns a `TABLE_REQUIRED` error (`data.code="TABLE_REQUIRED"`).
 - **Legacy single-table mode** (`MINI_APP_SCHEMA`+`MINI_APP_DB` set): `table` may be **omitted**.
@@ -59,6 +59,13 @@ Delete the row with the given UUID from the given `table`. Returns an error if t
 - **Input**: `{ "id": "<uuid>", "table": "<name>" }` (table optional in legacy mode)
 - **Output**: `{ "deleted": "<uuid>" }`
 - Annotations: `readOnlyHint=false`, `destructiveHint=true`, `idempotentHint=true`
+
+## `reload`
+Re-scan `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and atomically replace the table registry. Legacy `MINI_APP_SCHEMA` + `MINI_APP_DB` are re-applied if set. In-flight requests complete against the previous snapshot.
+- **Input**: `{}` — no arguments required (`table` argument is ignored)
+- **Output**: `{ "mounted": N, "added": ["table1", ...], "removed": ["table2", ...] }`
+- **Limitations**: no file watcher (explicit invocation only); whole-registry replace (no per-table partial reload); no schema migration for existing rows.
+- Annotations: `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=false`
 "#;
 
 /// Hand-written reference table of all error codes from `src/error.rs`.
@@ -251,8 +258,10 @@ mod tests {
     }
 
     #[test]
-    fn tools_doc_contains_all_six_tools() {
-        for tool in &["info", "create", "get", "list", "update", "delete"] {
+    fn tools_doc_contains_all_seven_tools() {
+        for tool in &[
+            "info", "create", "get", "list", "update", "delete", "reload",
+        ] {
             assert!(
                 TOOLS_DOC.contains(&format!("## `{tool}`")),
                 "TOOLS_DOC must contain section for '{tool}'"

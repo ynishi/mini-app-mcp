@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`reload` MCP tool** (`mcp/server.rs`) — new tool that re-scans `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` (and re-applies `MINI_APP_SCHEMA` + `MINI_APP_DB` if set) and atomically replaces the live table registry without restarting the server. Returns `{ mounted: usize, added: Vec<String>, removed: Vec<String> }` so callers can observe which tables changed. The swap is performed via `ArcSwap::store()` — in-flight tool calls running against the previous registry complete normally; subsequent calls see the new registry. Limitations: no file-system watcher (explicit invocation only); whole-registry replacement (no per-table partial reload); no schema migration for existing rows; concurrent `reload` calls are last-write-wins.
+
+### Changed
+
+- **WAL journal mode on all SQLite connections** (`store.rs`) — `Store::open` now executes `PRAGMA journal_mode = WAL` immediately after opening every connection. WAL mode is persistent (SQLite retains it across close/reopen) and enables one writer + many concurrent readers, which is required for safe operation during the dual-registry window that exists while `reload` replaces the table registry. Existing `.db` files are migrated transparently on next open. Sidecar files `<db>.db-wal` and `<db>.db-shm` are created alongside each `.db` file; these are managed by SQLite and must not be deleted manually.
+- **`MiniAppMcpServer` internals** (`mcp/server.rs`) — `tables` field changed from `Arc<TableRegistry>` to `Arc<ArcSwap<TableRegistry>>` to support atomic hot-reload. `Config` is now retained on the server struct (`Arc<Config>`) so the `reload` tool can re-scan the same directories that were used at startup. All existing tool implementations (`info`, `create`, `get`, `list`, `update`, `delete`) load a snapshot of the registry via `ArcSwap::load()` at the start of each call and release the guard before any `await` point. `TableRegistry` doc comment updated from "immutable, no interior mutability" to "snapshot is immutable; replaced via ArcSwap on reload".
+- **`arc-swap` dependency added** (`Cargo.toml`) — `arc-swap = "1"` added to support the wait-free atomic swap of `TableRegistry`.
+
 ## [0.3.1] - 2026-05-03
 
 ### Changed

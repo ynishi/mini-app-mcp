@@ -20,9 +20,9 @@
 ///
 /// # Thread safety
 ///
-/// Once built, a [`TableRegistry`] is immutable and shared via
-/// `Arc<TableRegistry>`. There is no interior mutability; runtime add/remove
-/// of tables is not supported.
+/// Each [`TableRegistry`] snapshot is immutable. The active registry held by
+/// the server is replaced atomically via `ArcSwap` on `reload` tool
+/// invocation; in-flight requests continue against their captured snapshot.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

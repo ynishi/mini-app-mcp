@@ -1,10 +1,10 @@
 /// MCP server implementation for mini-app-mcp.
 ///
-/// Exposes 6 tools (`info`, `create`, `get`, `list`, `update`, `delete`) and
-/// resources (`schema://yaml`, `schema://json`, `schema://json-schema`,
-/// `docs://readme`, `docs://tools`, `docs://errors`) as MCP capabilities over
-/// stdio transport.  No HTTP / REST / CLI-CRUD entry points are provided
-/// (Crux "MCP-only entry point" constraint).
+/// Exposes 7 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
+/// `reload`) and resources (`schema://yaml`, `schema://json`,
+/// `schema://json-schema`, `docs://readme`, `docs://tools`, `docs://errors`)
+/// as MCP capabilities over stdio transport.  No HTTP / REST / CLI-CRUD entry
+/// points are provided (Crux "MCP-only entry point" constraint).
 ///
 /// # Multi-table mode
 ///
@@ -18,9 +18,11 @@
 /// When only `MINI_APP_SCHEMA` and `MINI_APP_DB` are set, the server operates
 /// in single-table mode: one table is mounted and `table` may be omitted from
 /// all tool calls.
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -34,7 +36,7 @@ use rmcp::{
     transport::stdio,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::MiniAppError;
@@ -63,8 +65,10 @@ use crate::store::Store;
 /// # Errors
 ///
 /// Returns an error if:
-/// - No tables were mounted (both dir scans yielded nothing and no legacy env).
 /// - The transport setup fails.
+///
+/// Zero-table start is **not** an error: the server logs a warning and starts
+/// in empty mode, returning `TABLE_REQUIRED` on tool calls.
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
 
@@ -111,7 +115,8 @@ pub async fn run() -> anyhow::Result<()> {
         );
     }
 
-    let server = MiniAppMcpServer::new_multi(Arc::new(registry));
+    let arc_config = Arc::new(config);
+    let server = MiniAppMcpServer::new_multi(registry, Arc::clone(&arc_config));
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -123,8 +128,10 @@ pub async fn run() -> anyhow::Result<()> {
 
 /// The MCP server for mini-app-mcp.
 ///
-/// Holds an `Arc<TableRegistry>` which is shared across clones.  The server is
-/// `Clone` because `rmcp` clones it per connection.
+/// Holds an `Arc<ArcSwap<TableRegistry>>` which allows atomic hot-reload of
+/// the registry via the `reload` tool while in-flight requests continue against
+/// their captured snapshot.  The server is `Clone` because `rmcp` clones it
+/// per connection.
 ///
 /// Use [`MiniAppMcpServer::new_multi`] for multi-table mode and
 /// [`MiniAppMcpServer::new_single`] for the legacy single-table adapter (also
@@ -133,8 +140,10 @@ pub async fn run() -> anyhow::Result<()> {
 pub struct MiniAppMcpServer {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
-    /// Registry of all mounted tables.
-    tables: Arc<TableRegistry>,
+    /// Registry of all mounted tables — atomically swappable via `reload`.
+    tables: Arc<ArcSwap<TableRegistry>>,
+    /// Mount configuration retained for `reload` re-scans.
+    mount_config: Arc<Config>,
 }
 
 impl MiniAppMcpServer {
@@ -143,10 +152,11 @@ impl MiniAppMcpServer {
     /// This is the primary constructor for multi-table mode.  The registry
     /// must be built (and validated for ≥1 table) by the caller before
     /// calling this method.
-    pub fn new_multi(tables: Arc<TableRegistry>) -> Self {
+    pub fn new_multi(registry: TableRegistry, config: Arc<Config>) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            tables,
+            tables: Arc::new(ArcSwap::from_pointee(registry)),
+            mount_config: config,
         }
     }
 
@@ -158,15 +168,25 @@ impl MiniAppMcpServer {
     pub fn new_single(store: Store, schema: SchemaConfig, schema_path: PathBuf) -> Self {
         let table_name = schema.table.clone();
         let registry = TableRegistry::from_single(store, schema, schema_path, table_name);
+        // Construct a minimal Config for legacy/test mode (no dir scanning).
+        let config = Arc::new(Config {
+            schema_path: None,
+            db_path: None,
+            user_dir: None,
+            project_dir: None,
+        });
         Self {
             tool_router: Self::tool_router(),
-            tables: Arc::new(registry),
+            tables: Arc::new(ArcSwap::from_pointee(registry)),
+            mount_config: config,
         }
     }
 
     /// Resolve a table, falling back to `default_table` when `table` is `None`.
     ///
     /// Returns a pair `(Arc<Store>, Arc<SchemaConfig>)` for the resolved table.
+    /// The `ArcSwap` Guard is dropped immediately after the clone, ensuring
+    /// it is not held across any `.await` point.
     ///
     /// # Errors
     ///
@@ -177,9 +197,37 @@ impl MiniAppMcpServer {
         &self,
         table: Option<&str>,
     ) -> Result<(Arc<Store>, Arc<SchemaConfig>), MiniAppError> {
-        let entry = self.tables.resolve(table)?;
-        Ok((Arc::clone(&entry.store), Arc::clone(&entry.schema)))
+        let entry_arc = {
+            let g = self.tables.load();
+            let entry = g.resolve(table)?;
+            (Arc::clone(&entry.store), Arc::clone(&entry.schema))
+        };
+        Ok(entry_arc)
     }
+}
+
+// =============================================================================
+// Reload helpers — private
+// =============================================================================
+
+/// Compute the diff between an old and new [`TableRegistry`].
+///
+/// Returns `(added, removed)` where `added` is the set of table names present
+/// in `new` but not in `old`, and `removed` is the set present in `old` but
+/// not in `new`.
+fn registry_diff(old: &TableRegistry, new: &TableRegistry) -> (Vec<String>, Vec<String>) {
+    let old_names: HashSet<&str> = old.table_names().collect();
+    let new_names: HashSet<&str> = new.table_names().collect();
+
+    let added: Vec<String> = new_names
+        .difference(&old_names)
+        .map(|s| s.to_string())
+        .collect();
+    let removed: Vec<String> = old_names
+        .difference(&new_names)
+        .map(|s| s.to_string())
+        .collect();
+    (added, removed)
 }
 
 // =============================================================================
@@ -223,10 +271,15 @@ impl MiniAppMcpServer {
     fn resource_list(&self) -> Vec<rmcp::model::Resource> {
         let mut resources = Vec::new();
 
+        // Take a snapshot of the registry for this call. The Guard is dropped
+        // before any allocations that could be considered an .await boundary
+        // (this is a sync method, so no await occurs anyway).
+        let registry = self.tables.load_full();
+
         // Schema resources — emitted once per mounted table when a default
         // table is set (legacy mode), otherwise emitted once with a
         // query-param description.
-        let default_table = self.tables.default_table();
+        let default_table = registry.default_table();
         if let Some(default) = default_table {
             // Legacy / single-table mode: emit concrete URIs for the default table.
             let yaml_uri = format!("{URI_SCHEMA_YAML}?table={default}");
@@ -257,7 +310,7 @@ impl MiniAppMcpServer {
             );
         } else {
             // Multi-table mode: emit one URI per table per schema resource type.
-            let mut table_names: Vec<&str> = self.tables.table_names().collect();
+            let mut table_names: Vec<&str> = registry.table_names().collect();
             table_names.sort(); // deterministic ordering for tests
             for table in &table_names {
                 let yaml_uri = format!("{URI_SCHEMA_YAML}?table={table}");
@@ -301,7 +354,7 @@ impl MiniAppMcpServer {
         resources.push(
             RawResource::new(URI_DOCS_TOOLS, "Tools Reference")
                 .with_description(
-                    "Cheat sheet listing all 6 tools with descriptions and input shapes.",
+                    "Cheat sheet listing all 7 tools with descriptions and input shapes.",
                 )
                 .with_mime_type("text/markdown")
                 .no_annotation(),
@@ -323,22 +376,26 @@ impl MiniAppMcpServer {
     async fn read_resource_impl(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
         let (base_uri, table_query) = parse_table_query(uri);
 
+        // Take a full Arc snapshot of the registry so we don't hold a Guard
+        // across any .await points (await-holding-lock prevention).
+        let registry = self.tables.load_full();
+
         let contents = match base_uri {
             URI_SCHEMA_YAML => {
-                let entry = self.tables.resolve(table_query).map_err(McpError::from)?;
+                let entry = registry.resolve(table_query).map_err(McpError::from)?;
                 let text = std::fs::read_to_string(entry.schema_path.as_ref()).map_err(|e| {
                     McpError::internal_error(format!("failed to read schema.yaml: {e}"), None)
                 })?;
                 ResourceContents::text(text, uri).with_mime_type("application/yaml")
             }
             URI_SCHEMA_JSON => {
-                let entry = self.tables.resolve(table_query).map_err(McpError::from)?;
+                let entry = registry.resolve(table_query).map_err(McpError::from)?;
                 let text = serde_json::to_string_pretty(entry.schema.as_ref())
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 ResourceContents::text(text, uri).with_mime_type("application/json")
             }
             URI_SCHEMA_JSON_SCHEMA => {
-                let entry = self.tables.resolve(table_query).map_err(McpError::from)?;
+                let entry = registry.resolve(table_query).map_err(McpError::from)?;
                 let js = res::derive_json_schema(entry.schema.as_ref());
                 let text = serde_json::to_string_pretty(&js)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -382,7 +439,7 @@ impl ServerHandler for MiniAppMcpServer {
         info.server_info.description = Some(
             "Agent-First CRUD store backed by SQLite. \
              Supports multiple tables via User→Project schema chain. \
-             6 tools: info, create, get, list, update, delete."
+             7 tools: info, create, get, list, update, delete, reload."
                 .to_string(),
         );
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
@@ -415,6 +472,7 @@ impl ServerHandler for MiniAppMcpServer {
              - `list`: List rows with optional limit/offset pagination.\n\
              - `update`: Replace the data of an existing row by id.\n\
              - `delete`: Delete a row by id.\n\
+             - `reload`: Reload all schemas from configured directories.\n\
              \n\
              All schema tools accept an optional `table` argument. Specify the \
              table name when running in multi-table mode."
@@ -446,14 +504,14 @@ impl ServerHandler for MiniAppMcpServer {
 
 /// Parameters for the `info` tool.
 #[derive(Deserialize, JsonSchema)]
-struct InfoParams {
+pub struct InfoParams {
     /// Name of the table to return schema for.
     ///
     /// In multi-table mode this argument is required; omitting it returns a
     /// TABLE_REQUIRED error. In legacy single-table mode (`MINI_APP_SCHEMA` +
     /// `MINI_APP_DB`) this may be omitted and the single configured table is
     /// used automatically.
-    table: Option<String>,
+    pub table: Option<String>,
 }
 
 /// Parameters for the `create` tool.
@@ -530,6 +588,20 @@ struct DeleteParams {
     table: Option<String>,
 }
 
+/// Result returned by the `reload` tool.
+///
+/// Reports the outcome of the registry reload: how many tables are now mounted,
+/// which table names were newly added, and which were removed.
+#[derive(Serialize, JsonSchema)]
+pub struct ReloadResult {
+    /// Total number of tables mounted after the reload.
+    pub mounted: usize,
+    /// Table names that were added (present in new registry, absent in old).
+    pub added: Vec<String>,
+    /// Table names that were removed (absent in new registry, present in old).
+    pub removed: Vec<String>,
+}
+
 // =============================================================================
 // Tool implementations
 // =============================================================================
@@ -554,7 +626,7 @@ impl MiniAppMcpServer {
             open_world_hint = false
         )
     )]
-    async fn tool_info(
+    pub async fn tool_info(
         &self,
         Parameters(params): Parameters<InfoParams>,
     ) -> Result<String, String> {
@@ -703,6 +775,122 @@ impl MiniAppMcpServer {
         serde_json::to_string(&serde_json::json!({ "deleted": params.id }))
             .map_err(|e| e.to_string())
     }
+
+    /// Reload all schemas from the configured directories.
+    ///
+    /// Re-scans `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and, if the legacy
+    /// `MINI_APP_SCHEMA` + `MINI_APP_DB` pair is set, re-mounts that single-table
+    /// entry as well.  The active registry is replaced atomically via `ArcSwap`;
+    /// in-flight requests continue against the old snapshot and complete
+    /// normally. No file watcher is used; this tool must be invoked explicitly.
+    ///
+    /// Concurrent `reload` calls use last-write-wins semantics (the last
+    /// `store()` call wins).
+    #[tool(
+        name = "reload",
+        description = "Reload all schemas from the configured directories. \
+                       Re-scans MINI_APP_USER_DIR / MINI_APP_PROJECT_DIR and re-mounts the \
+                       legacy MINI_APP_SCHEMA + MINI_APP_DB single-table entry if those env \
+                       vars are set. The active registry is replaced atomically; in-flight \
+                       requests continue against the old snapshot and complete normally. \
+                       No file watcher is used — explicit invocation only.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn tool_reload(&self) -> Result<String, McpError> {
+        // Early-reject: servers constructed via `new_single` (or any path that
+        // leaves all four mount-config fields as None) have no directory to
+        // re-scan.  Proceeding would call `mount_from_dirs(None, None)`, produce
+        // an empty registry, and atomically overwrite the original table — data
+        // loss without error.  Reject loudly instead.
+        let config = Arc::clone(&self.mount_config);
+        if config.user_dir.is_none()
+            && config.project_dir.is_none()
+            && config.schema_path.is_none()
+            && config.db_path.is_none()
+        {
+            return Err(McpError::from(MiniAppError::Config(
+                "reload not configured: server was constructed via new_single without a mount \
+                 config"
+                    .into(),
+            )));
+        }
+
+        // Run the synchronous std::fs I/O inside a blocking thread pool so we
+        // do not stall the async runtime workers (K-110 constraint).
+        let new_registry = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut registry = TableRegistry::mount_from_dirs(
+                    config.user_dir.as_deref(),
+                    config.project_dir.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "reload: mount_from_dirs failed");
+                    e
+                })?;
+
+                if config.has_legacy_env() {
+                    let schema_path = config.schema_path.as_ref().ok_or_else(|| {
+                        MiniAppError::Config(
+                            "MINI_APP_SCHEMA required when has_legacy_env is true".into(),
+                        )
+                    })?;
+                    let db_path = config.db_path.as_ref().ok_or_else(|| {
+                        MiniAppError::Config(
+                            "MINI_APP_DB required when has_legacy_env is true".into(),
+                        )
+                    })?;
+                    registry = TableRegistry::mount_legacy_into(registry, schema_path, db_path)
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(error = %e, "reload: mount_legacy_into failed");
+                            e
+                        })?;
+                }
+
+                Ok::<TableRegistry, MiniAppError>(registry)
+            })
+        })
+        .await
+        .map_err(|e| {
+            let msg = format!("reload: blocking task panicked: {e}");
+            tracing::error!(%msg);
+            McpError::from(MiniAppError::Schema(msg))
+        })?
+        .map_err(|e: MiniAppError| McpError::from(e))?;
+
+        // Capture old registry for diff computation before swapping.
+        let old_registry = self.tables.load_full();
+        let (mut added, mut removed) = registry_diff(&old_registry, &new_registry);
+        let mounted = new_registry.table_count();
+
+        // Atomic swap — last-write-wins when concurrent reloads race.
+        self.tables.store(Arc::new(new_registry));
+
+        // Sort for deterministic output.
+        added.sort();
+        removed.sort();
+
+        tracing::info!(
+            mounted,
+            added = ?added,
+            removed = ?removed,
+            "registry reloaded"
+        );
+
+        let result = ReloadResult {
+            mounted,
+            added,
+            removed,
+        };
+        serde_json::to_string(&result)
+            .map_err(|e| McpError::from(MiniAppError::Schema(e.to_string())))
+    }
 }
 
 // =============================================================================
@@ -829,22 +1017,24 @@ fields:\n\
     }
 
     // ---------------------------------------------------------------------------
-    // T1: list_tools — all 6 tools present with correct annotations.
+    // T1: list_tools — all 7 tools present with correct annotations.
     // Access via server.tool_router.list_all() to avoid RequestContext.
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn list_tools_contains_all_six() {
+    async fn list_tools_contains_all_seven() {
         let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-        for expected in &["info", "create", "get", "list", "update", "delete"] {
+        for expected in &[
+            "info", "create", "get", "list", "update", "delete", "reload",
+        ] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(tools.len(), 6, "expected exactly 6 tools");
+        assert_eq!(tools.len(), 7, "expected exactly 7 tools");
     }
 
     #[tokio::test]
@@ -910,6 +1100,35 @@ fields:\n\
                 "tool '{name}' must be read_only"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tool_annotations_reload() {
+        let (server, _tmp) = make_server().await;
+        let tools = server.tool_router.list_all();
+        let reload_tool = tools
+            .iter()
+            .find(|t| t.name == "reload")
+            .expect("reload tool must exist");
+        let ann = reload_tool
+            .annotations
+            .as_ref()
+            .expect("reload must have annotations");
+        assert_eq!(
+            ann.read_only_hint,
+            Some(false),
+            "reload must not be read_only"
+        );
+        assert_eq!(
+            ann.idempotent_hint,
+            Some(false),
+            "reload must not be idempotent"
+        );
+        assert_eq!(
+            ann.destructive_hint,
+            Some(false),
+            "reload must not be destructive"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1264,7 +1483,13 @@ fields:\n\
         );
 
         let registry = TableRegistry::from_entries(entries, None);
-        MiniAppMcpServer::new_multi(Arc::new(registry))
+        let config = Arc::new(Config {
+            schema_path: None,
+            db_path: None,
+            user_dir: None,
+            project_dir: None,
+        });
+        MiniAppMcpServer::new_multi(registry, config)
     }
 
     #[tokio::test]
@@ -1392,5 +1617,194 @@ fields:\n\
         let (base, table) = parse_table_query("schema://json?foo=bar");
         assert_eq!(base, "schema://json");
         assert_eq!(table, None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // T11: registry_diff helper
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn registry_diff_added_and_removed() {
+        use crate::mcp::registry::TableEntry;
+        use std::collections::HashMap;
+
+        let schema_a = SchemaConfig {
+            table: "table_a".to_string(),
+            fields: vec![],
+            dump: None,
+        };
+        let schema_b = SchemaConfig {
+            table: "table_b".to_string(),
+            fields: vec![],
+            dump: None,
+        };
+        let schema_c = SchemaConfig {
+            table: "table_c".to_string(),
+            fields: vec![],
+            dump: None,
+        };
+
+        // old registry: table_a, table_b
+        let mut old_entries: HashMap<String, TableEntry> = HashMap::new();
+        old_entries.insert(
+            "table_a".to_string(),
+            TableEntry {
+                store: Arc::new(
+                    Store::open(Path::new(":memory:"), schema_a.clone())
+                        .await
+                        .expect("store_a"),
+                ),
+                schema: Arc::new(schema_a.clone()),
+                schema_path: Arc::new(PathBuf::from("/fake/a/schema.yaml")),
+            },
+        );
+        old_entries.insert(
+            "table_b".to_string(),
+            TableEntry {
+                store: Arc::new(
+                    Store::open(Path::new(":memory:"), schema_b.clone())
+                        .await
+                        .expect("store_b"),
+                ),
+                schema: Arc::new(schema_b.clone()),
+                schema_path: Arc::new(PathBuf::from("/fake/b/schema.yaml")),
+            },
+        );
+        let old_registry = TableRegistry::from_entries(old_entries, None);
+
+        // new registry: table_a, table_c (b removed, c added)
+        let mut new_entries: HashMap<String, TableEntry> = HashMap::new();
+        new_entries.insert(
+            "table_a".to_string(),
+            TableEntry {
+                store: Arc::new(
+                    Store::open(Path::new(":memory:"), schema_a.clone())
+                        .await
+                        .expect("store_a2"),
+                ),
+                schema: Arc::new(schema_a),
+                schema_path: Arc::new(PathBuf::from("/fake/a/schema.yaml")),
+            },
+        );
+        new_entries.insert(
+            "table_c".to_string(),
+            TableEntry {
+                store: Arc::new(
+                    Store::open(Path::new(":memory:"), schema_c.clone())
+                        .await
+                        .expect("store_c"),
+                ),
+                schema: Arc::new(schema_c),
+                schema_path: Arc::new(PathBuf::from("/fake/c/schema.yaml")),
+            },
+        );
+        let new_registry = TableRegistry::from_entries(new_entries, None);
+
+        let (mut added, mut removed) = registry_diff(&old_registry, &new_registry);
+        added.sort();
+        removed.sort();
+        assert_eq!(added, vec!["table_c"]);
+        assert_eq!(removed, vec!["table_b"]);
+    }
+
+    // ---------------------------------------------------------------------------
+    // T12: reload round-trip integration test
+    // Acceptance Criteria #8: mount → schema add → reload → diff verify
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reload_round_trip_with_new_directory() {
+        // Create a temp directory to act as the user_dir.
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let user_dir = tmp_dir.path();
+
+        // Initial state: table_alpha exists.
+        let alpha_dir = user_dir.join("table_alpha");
+        std::fs::create_dir_all(&alpha_dir).expect("create table_alpha dir");
+        let alpha_schema = alpha_dir.join("schema.yaml");
+        std::fs::write(
+            &alpha_schema,
+            b"table: table_alpha\nfields:\n  - name: x\n    type: string\n    required: false\n",
+        )
+        .expect("write alpha schema");
+
+        // Mount initial registry.
+        let registry = TableRegistry::mount_from_dirs(Some(user_dir), None)
+            .await
+            .expect("initial mount");
+        assert_eq!(registry.table_count(), 1, "should have table_alpha");
+
+        let config = Arc::new(Config {
+            schema_path: None,
+            db_path: None,
+            user_dir: Some(user_dir.to_path_buf()),
+            project_dir: None,
+        });
+        let server = MiniAppMcpServer::new_multi(registry, Arc::clone(&config));
+
+        // Add a second table: table_beta
+        let beta_dir = user_dir.join("table_beta");
+        std::fs::create_dir_all(&beta_dir).expect("create table_beta dir");
+        let beta_schema = beta_dir.join("schema.yaml");
+        std::fs::write(
+            &beta_schema,
+            b"table: table_beta\nfields:\n  - name: y\n    type: string\n    required: false\n",
+        )
+        .expect("write beta schema");
+
+        // Call reload.
+        let reload_json = server.tool_reload().await.expect("reload must succeed");
+        let result: serde_json::Value =
+            serde_json::from_str(&reload_json).expect("reload must return valid JSON");
+
+        // After reload: 2 tables mounted.
+        assert_eq!(
+            result["mounted"],
+            serde_json::json!(2),
+            "reload must report 2 mounted tables"
+        );
+        let added = result["added"].as_array().expect("added must be array");
+        assert_eq!(added.len(), 1, "one table was added");
+        assert!(
+            added.contains(&serde_json::json!("table_beta")),
+            "table_beta must be in added"
+        );
+        let removed = result["removed"].as_array().expect("removed must be array");
+        assert_eq!(removed.len(), 0, "no tables were removed");
+
+        // Verify the new registry is visible via info tool.
+        let info_json = server
+            .tool_info(Parameters(InfoParams {
+                table: Some("table_beta".to_string()),
+            }))
+            .await
+            .expect("info for table_beta must succeed after reload");
+        let info: serde_json::Value =
+            serde_json::from_str(&info_json).expect("info must be valid JSON");
+        assert_eq!(info["table"], "table_beta");
+    }
+
+    // ---------------------------------------------------------------------------
+    // T13: reload returns CONFIG_ERROR when server was constructed via new_single
+    // (all mount_config fields are None — no directory to re-scan).
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reload_returns_config_error_on_legacy_server() {
+        // `make_server()` uses `new_single` which sets all Config fields to None.
+        let (server, _tmp) = make_server().await;
+
+        let result = server.tool_reload().await;
+        assert!(
+            result.is_err(),
+            "reload on a new_single server must return Err"
+        );
+        // The error string must carry CONFIG_ERROR so callers can identify the
+        // rejection without parsing the human-readable message.
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("CONFIG_ERROR") || err_str.contains("reload not configured"),
+            "error must indicate CONFIG_ERROR or 'reload not configured', got: {err_str}"
+        );
     }
 }
