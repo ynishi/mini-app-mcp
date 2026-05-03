@@ -63,8 +63,10 @@ use crate::store::Store;
 /// # Errors
 ///
 /// Returns an error if:
-/// - No tables were mounted (both dir scans yielded nothing and no legacy env).
 /// - The transport setup fails.
+///
+/// Zero-table start is **not** an error: the server logs a warning and starts
+/// in empty mode, returning `TABLE_REQUIRED` on tool calls.
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
 

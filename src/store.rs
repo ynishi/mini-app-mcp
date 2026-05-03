@@ -93,6 +93,14 @@ fn parse_data(json_str: &str) -> Result<serde_json::Value, MiniAppError> {
 impl Store {
     /// Open the SQLite database at `db_path` and run `CREATE TABLE IF NOT EXISTS rows`.
     ///
+    /// # WAL journal mode
+    /// The connection is opened with `PRAGMA journal_mode = WAL` to enable safe
+    /// coexistence of old and new [`Store`] instances during schema hot-reload
+    /// (see `crux-card.md` Crux #1). WAL mode allows one writer and many readers
+    /// concurrently, preventing lock conflicts when dual registries are held.
+    /// Sidecar files `<db>.db-wal` and `<db>.db-shm` are created next to the
+    /// main DB file; this is expected and safe.
+    ///
     /// # Concurrency
     /// Returns a [`Store`] that wraps `Arc<Mutex<rusqlite::Connection>>` and is
     /// `Send + Sync`. [`rusqlite::Connection`] is `Send` but `!Sync`; the
@@ -110,7 +118,7 @@ impl Store {
     /// `Future` has no effect — the DDL completes on the blocking thread pool.
     ///
     /// # Errors
-    /// - [`MiniAppError::Storage`] — `Connection::open` or DDL execute failure.
+    /// - [`MiniAppError::Storage`] — `Connection::open`, WAL pragma, or DDL execute failure.
     /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
     ///
     /// # Panic
@@ -130,6 +138,9 @@ impl Store {
         let conn =
             tokio::task::spawn_blocking(move || -> Result<rusqlite::Connection, MiniAppError> {
                 let c = rusqlite::Connection::open(&db_path)?;
+                // Enable WAL journal mode before DDL. WAL allows concurrent readers
+                // and one writer, which is essential for Crux #1 dual-registry safety.
+                c.pragma_update(None, "journal_mode", "WAL")?;
                 c.execute_batch(CREATE_TABLE_SQL)?;
                 Ok(c)
             })
@@ -851,6 +862,40 @@ mod tests {
         assert!(
             store.is_ok(),
             "Store::open must succeed even with bidirectional sync configured"
+        );
+    }
+
+    /// Crux #1 verification: Store::open must set journal_mode to WAL on a real
+    /// file-based database. `:memory:` databases do not support WAL; this test
+    /// uses a tempdir to open an actual file and asserts the pragma value.
+    #[tokio::test]
+    async fn store_open_sets_wal_journal_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+
+        let schema = SchemaConfig {
+            table: "test".into(),
+            fields: vec![FieldDef {
+                name: "title".into(),
+                ty: FieldType::String,
+                required: false,
+            }],
+            dump: None,
+        };
+        let store = Store::open(&db_path, schema)
+            .await
+            .expect("Store::open should succeed");
+
+        // Query journal_mode through the Store connection to verify WAL was set.
+        let mode = {
+            let conn = store.conn.lock().expect("lock");
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .expect("PRAGMA journal_mode query")
+        };
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "Store::open must set journal_mode = WAL for dual-registry safety (Crux #1)"
         );
     }
 }
