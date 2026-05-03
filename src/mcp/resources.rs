@@ -14,40 +14,49 @@ pub const README: &str = include_str!("../../README.md");
 /// Hand-written cheat sheet listing all 6 tools with descriptions / shapes.
 pub const TOOLS_DOC: &str = r#"# mini-app-mcp — Tools Reference
 
+## `table` argument (all tools)
+
+All 6 tools accept an optional `table` argument:
+- **Multi-table mode** (`MINI_APP_USER_DIR`/`MINI_APP_PROJECT_DIR` set): `table` is **required**.
+  Omitting it returns a `TABLE_REQUIRED` error (`data.code="TABLE_REQUIRED"`).
+- **Legacy single-table mode** (`MINI_APP_SCHEMA`+`MINI_APP_DB` set): `table` may be **omitted**.
+  The single configured table is used automatically.
+- Specifying an unknown table name returns `TABLE_NOT_FOUND` (`data.code="TABLE_NOT_FOUND"`).
+
 ## `info`
-Return the parsed schema (table name and field definitions).
-- **Input**: *(no parameters)*
+Return the parsed schema (table name and field definitions) for the given `table`.
+- **Input**: `{ "table": "<name>" }` (table optional in legacy mode)
 - **Output**: JSON object `{ "table": "...", "fields": [...] }`
 - Annotations: `readOnlyHint=true`, `idempotentHint=true`
 
 ## `create`
-Create a new row in the table.
-- **Input**: `{ "data": { ... } }` — JSON object matching `schema.yaml`
+Create a new row in the given `table`.
+- **Input**: `{ "data": { ... }, "table": "<name>" }` — `data` must match `schema.yaml`; `table` optional in legacy mode
 - **Output**: created record `{ "id": "...", "data": {...}, "created_at": "...", "updated_at": "..." }`
 - Annotations: `readOnlyHint=false`, `idempotentHint=false`
 
 ## `get`
-Fetch a single row by UUID.
-- **Input**: `{ "id": "<uuid>" }`
+Fetch a single row by UUID from the given `table`.
+- **Input**: `{ "id": "<uuid>", "table": "<name>" }` (table optional in legacy mode)
 - **Output**: record `{ "id": "...", "data": {...}, ... }`
 - Annotations: `readOnlyHint=true`, `idempotentHint=true`
 
 ## `list`
-List rows with optional pagination (ordered by `created_at` descending).
-- **Input**: `{ "limit": <u32 optional>, "offset": <u32 optional> }`
-  - `limit` default 100, max 1000
+List rows with optional pagination (ordered by `created_at` descending) from the given `table`.
+- **Input**: `{ "limit": <u32 optional>, "offset": <u32 optional>, "table": "<name>" }`
+  - `limit` default 100, max 1000; `table` optional in legacy mode
 - **Output**: array of records `[{ "id": "...", ... }, ...]`
 - Annotations: `readOnlyHint=true`, `idempotentHint=true`
 
 ## `update`
-Replace the `data` of an existing row by UUID.
-- **Input**: `{ "id": "<uuid>", "data": { ... } }` — `data` must match `schema.yaml`
+Replace the `data` of an existing row by UUID in the given `table`.
+- **Input**: `{ "id": "<uuid>", "data": { ... }, "table": "<name>" }` — `data` must match `schema.yaml`; `table` optional in legacy mode
 - **Output**: updated record `{ "id": "...", "data": {...}, ... }`
 - Annotations: `readOnlyHint=false`, `idempotentHint=true`
 
 ## `delete`
-Delete the row with the given UUID. Returns an error if the row does not exist.
-- **Input**: `{ "id": "<uuid>" }`
+Delete the row with the given UUID from the given `table`. Returns an error if the row does not exist.
+- **Input**: `{ "id": "<uuid>", "table": "<name>" }` (table optional in legacy mode)
 - **Output**: `{ "deleted": "<uuid>" }`
 - Annotations: `readOnlyHint=false`, `destructiveHint=true`, `idempotentHint=true`
 "#;
@@ -70,6 +79,8 @@ All MCP errors carry a structured JSON `data` object with at minimum:
 | `STORAGE_ERROR` | 500 | Underlying SQLite operation failed. |
 | `IO_ERROR` | 500 | File open / read failed (startup error). |
 | `CONFIG_ERROR` | 500 | Environment-variable or `.env` configuration is invalid (startup error). |
+| `TABLE_NOT_FOUND` | 404 | The specified `table` name is not mounted in the server. Also includes `"table": "<name>"` in `data`. |
+| `TABLE_REQUIRED` | 422 | Multi-table mode requires a `table` argument but it was omitted. |
 
 ## Validation Error Example
 ```json
@@ -86,6 +97,23 @@ All MCP errors carry a structured JSON `data` object with at minimum:
   "code": "NOT_FOUND",
   "message": "row not found: abc-123",
   "id": "abc-123"
+}
+```
+
+## Table-Not-Found Error Example
+```json
+{
+  "code": "TABLE_NOT_FOUND",
+  "message": "table not found: my_table",
+  "table": "my_table"
+}
+```
+
+## Table-Required Error Example
+```json
+{
+  "code": "TABLE_REQUIRED",
+  "message": "table argument is required in multi-table mode"
 }
 ```
 "#;
@@ -241,6 +269,8 @@ mod tests {
             "STORAGE_ERROR",
             "IO_ERROR",
             "CONFIG_ERROR",
+            "TABLE_NOT_FOUND",
+            "TABLE_REQUIRED",
         ] {
             assert!(
                 ERRORS_DOC.contains(code),

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-table support** (`mcp/registry.rs`, `mcp/server.rs`, `config.rs`) — a single `mini-app-mcp` daemon can now mount and serve multiple SQLite tables. Tables are discovered automatically from two directory layers: User scope (`~/.mini-app/<table>/`) as the base and Project scope (`{project_root}/.mini-app/<table>/`) as an override. A Project-level `schema.yaml` for a given table name fully replaces the User-level one (file-level swap, no field merging). The new `TableRegistry` struct (`mcp/registry.rs`) manages the `HashMap<String, Arc<Store>>` backing this.
+- **`table` argument on all tools** (`mcp/server.rs`) — `info`, `create`, `get`, `list`, `update`, and `delete` now accept an optional `table: Option<String>` argument. In multi-table mode the argument is required; omitting it returns `MiniAppError::TableRequired` (`code: "TABLE_REQUIRED"`). Supplying an unknown name returns `MiniAppError::TableNotFound` (`code: "TABLE_NOT_FOUND"`). Tool descriptions and `server_info.instructions` have been updated to document the new semantics (§K-49 / §1-8-1).
+- **New error variants** (`error.rs`) — `MiniAppError::TableNotFound { table: String }` and `MiniAppError::TableRequired`; both carry structured `code` fields through `From<MiniAppError> for McpError` so agents can handle them programmatically.
+- **New environment variables** (`config.rs`) — `MINI_APP_USER_DIR` (default `~/.mini-app/`) and `MINI_APP_PROJECT_DIR` (default `./.mini-app/`) control the two directory layers. Both are optional; omitting them falls back to the defaults.
+
+### Changed
+
+- **`Config` struct** (`config.rs`) — extended with `user_dir: Option<PathBuf>` and `project_dir: Option<PathBuf>` alongside the existing `schema_path` / `db_path` fields. Legacy single-table mode (`MINI_APP_SCHEMA` + `MINI_APP_DB`) is fully preserved; when those variables are set the server behaves exactly as before with the specified table loaded as the default.
+- **`MiniAppMcpServer`** (`mcp/server.rs`) — internal fields replaced by a `TableRegistry`. Legacy single-table startup mounts the one table under `default_table`, preserving all existing tool call semantics for callers that do not pass a `table` argument.
+
 ## [0.2.0] - 2026-05-03
 
 ### Added

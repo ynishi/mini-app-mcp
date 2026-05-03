@@ -28,6 +28,13 @@ pub mod codes {
     pub const IO_ERROR: &str = "IO_ERROR";
     /// Returned when environment-variable or `.env` configuration is invalid.
     pub const CONFIG_ERROR: &str = "CONFIG_ERROR";
+    /// Returned when the requested table is not mounted in the registry.
+    pub const TABLE_NOT_FOUND: &str = "TABLE_NOT_FOUND";
+    /// Returned when `table` argument is required but was omitted.
+    ///
+    /// This occurs in multi-table mode when more than one table is mounted and
+    /// no default table is configured.
+    pub const TABLE_REQUIRED: &str = "TABLE_REQUIRED";
 }
 
 /// All errors that can arise inside mini-app-mcp.
@@ -41,6 +48,9 @@ pub mod codes {
 /// - `Storage` — an underlying SQLite error (auto-converted via `#[from]`).
 /// - `Io` — a filesystem / I/O error (auto-converted via `#[from]`).
 /// - `Config` — an environment-variable or `.env` configuration error.
+/// - `TableNotFound` — the requested table is not mounted in the registry.
+/// - `TableRequired` — multi-table mode requires a `table` argument that was
+///   omitted.
 #[derive(Error, Debug)]
 pub enum MiniAppError {
     /// Validation failed for a specific field.
@@ -79,6 +89,23 @@ pub enum MiniAppError {
     /// The inner `String` carries a description of what is missing or invalid.
     #[error("config error: {0}")]
     Config(String),
+
+    /// The requested table is not mounted in the registry.
+    ///
+    /// Returned when a tool call specifies a `table` argument that does not
+    /// correspond to any table discovered during startup.
+    ///
+    /// # Fields
+    /// - `table`: the name of the table that was not found.
+    #[error("table not found: {table}")]
+    TableNotFound { table: String },
+
+    /// Multi-table mode requires a `table` argument that was omitted.
+    ///
+    /// Returned when the registry contains more than one table and no default
+    /// table is configured, but the caller omitted the `table` argument.
+    #[error("table argument is required in multi-table mode")]
+    TableRequired,
 }
 
 impl MiniAppError {
@@ -86,6 +113,10 @@ impl MiniAppError {
     ///
     /// The returned value is always one of the constants in [`codes`] and is
     /// safe to embed in JSON responses for Agent-side parsing.
+    ///
+    /// # Returns
+    ///
+    /// A `&'static str` code constant from [`codes`].
     pub fn code(&self) -> &'static str {
         match self {
             MiniAppError::Validation { .. } => codes::VALIDATION_ERROR,
@@ -94,6 +125,8 @@ impl MiniAppError {
             MiniAppError::Storage(_) => codes::STORAGE_ERROR,
             MiniAppError::Io(_) => codes::IO_ERROR,
             MiniAppError::Config(_) => codes::CONFIG_ERROR,
+            MiniAppError::TableNotFound { .. } => codes::TABLE_NOT_FOUND,
+            MiniAppError::TableRequired => codes::TABLE_REQUIRED,
         }
     }
 }
@@ -107,6 +140,9 @@ impl MiniAppError {
 ///
 /// Validation errors also include a `"field"` key so Agents can identify which
 /// field caused the failure without parsing the message string.
+///
+/// `TableNotFound` errors include a `"table"` key so Agents can identify which
+/// table name caused the failure.
 impl From<MiniAppError> for McpError {
     fn from(e: MiniAppError) -> Self {
         let code = e.code();
@@ -125,6 +161,13 @@ impl From<MiniAppError> for McpError {
                     "code": code,
                     "message": message,
                     "id": id,
+                })
+            }
+            MiniAppError::TableNotFound { table } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "table": table,
                 })
             }
             _ => {
@@ -185,6 +228,28 @@ mod tests {
         assert_eq!(data["code"], Value::String("CONFIG_ERROR".to_string()));
     }
 
+    // T1: new variants — TableNotFound and TableRequired have structured data
+    #[test]
+    fn table_not_found_error_has_structured_data_with_table_field() {
+        let err = MiniAppError::TableNotFound {
+            table: "my_table".to_string(),
+        };
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for TableNotFound");
+        assert_eq!(data["code"], Value::String("TABLE_NOT_FOUND".to_string()));
+        assert_eq!(data["table"], Value::String("my_table".to_string()));
+        assert!(data["message"].is_string());
+    }
+
+    #[test]
+    fn table_required_error_has_structured_data() {
+        let err = MiniAppError::TableRequired;
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for TableRequired");
+        assert_eq!(data["code"], Value::String("TABLE_REQUIRED".to_string()));
+        assert!(data["message"].is_string());
+    }
+
     // T2: edge case — empty strings are still valid structured errors
     #[test]
     fn validation_error_empty_field_name() {
@@ -199,7 +264,21 @@ mod tests {
         assert!(data.get("field").is_some());
     }
 
-    // T3: error path — code() returns the right constant for all 6 variants
+    // T2: edge case — empty table name in TableNotFound
+    #[test]
+    fn table_not_found_empty_table_name() {
+        let err = MiniAppError::TableNotFound {
+            table: String::new(),
+        };
+        let mcp: McpError = err.into();
+        let data = mcp
+            .data
+            .expect("data must be Some even for empty table name");
+        assert_eq!(data["code"], "TABLE_NOT_FOUND");
+        assert!(data.get("table").is_some());
+    }
+
+    // T3: error path — code() returns the right constant for all variants
     #[test]
     fn error_code_all_variants() {
         let cases: Vec<(&str, MiniAppError)> = vec![
@@ -217,6 +296,11 @@ mod tests {
                 MiniAppError::Io(std::io::Error::other("e")),
             ),
             (codes::CONFIG_ERROR, MiniAppError::Config("c".into())),
+            (
+                codes::TABLE_NOT_FOUND,
+                MiniAppError::TableNotFound { table: "t".into() },
+            ),
+            (codes::TABLE_REQUIRED, MiniAppError::TableRequired),
         ];
         for (expected_code, err) in cases {
             assert_eq!(
@@ -240,6 +324,8 @@ mod tests {
             MiniAppError::Schema("s".into()),
             MiniAppError::Io(std::io::Error::other("io")),
             MiniAppError::Config("c".into()),
+            MiniAppError::TableNotFound { table: "t".into() },
+            MiniAppError::TableRequired,
         ];
         for err in errs {
             let mcp: McpError = err.into();
