@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-03
+
+### Changed
+
+- **Empty-registry start is no longer fatal** (`mcp/server.rs`) — when 0 tables resolve from `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and no legacy `MINI_APP_SCHEMA` + `MINI_APP_DB` is set, the server now logs a `tracing::warn!` and proceeds to serve `info` and resources instead of erroring out. Tool calls return `TABLE_REQUIRED` on a per-call basis. This lets `mini-app-mcp` be deployed once into a user-global MCP registry (e.g. `~/.claude.json`) and have table directories added later without restarting the host.
+- **Auto-create `MINI_APP_USER_DIR`** (`mcp/server.rs`) — at startup the server runs `tokio::fs::create_dir_all` on the resolved User-scope directory (default `~/.mini-app/`). Failures are logged as a warning, not propagated. Project-scope directory is intentionally left untouched to avoid polluting arbitrary CWDs.
+
 ## [0.3.0] - 2026-05-03
 
 ### Added

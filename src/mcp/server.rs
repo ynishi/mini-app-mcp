@@ -68,6 +68,17 @@ use crate::store::Store;
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
 
+    // Ensure the User-scope dir physically exists so first-time deployments
+    // (user-global MCP registry without any pre-seeded tables) don't fail
+    // before `mount_from_dirs` even runs. Project-scope dir is left alone
+    // because it lives under the caller's CWD and creating it implicitly
+    // would pollute arbitrary working directories.
+    if let Some(dir) = config.user_dir.as_deref() {
+        if let Err(e) = tokio::fs::create_dir_all(dir).await {
+            tracing::warn!(dir = %dir.display(), error = %e, "failed to ensure MINI_APP_USER_DIR exists");
+        }
+    }
+
     // Phase 1 + 2: User → Project dir scan (crux #1: both paths are always
     // passed, even when one is None — the registry treats None as "0 tables
     // from that scope", not as "skip").
@@ -86,14 +97,18 @@ pub async fn run() -> anyhow::Result<()> {
         registry = TableRegistry::mount_legacy_into(registry, schema_path, db_path).await?;
     }
 
-    // Fatal if no tables are configured at all.
+    // 0 tables is no longer fatal: the server still serves `info` / resources
+    // and surfaces TableRequired on tool calls. This lets users deploy
+    // mini-app-mcp into a user-global MCP registry once and add table dirs
+    // later without restarting the registry.
     if registry.table_count() == 0 {
-        return Err(MiniAppError::Config(
-            "no tables configured: set MINI_APP_SCHEMA+MINI_APP_DB or create \
-             table subdirectories in MINI_APP_USER_DIR / MINI_APP_PROJECT_DIR"
-                .into(),
-        )
-        .into());
+        tracing::warn!(
+            "no tables mounted yet — server will start empty. Add \
+             <table>/schema.yaml under MINI_APP_USER_DIR ({:?}) or \
+             MINI_APP_PROJECT_DIR ({:?}), or set MINI_APP_SCHEMA+MINI_APP_DB.",
+            config.user_dir,
+            config.project_dir,
+        );
     }
 
     let server = MiniAppMcpServer::new_multi(Arc::new(registry));
