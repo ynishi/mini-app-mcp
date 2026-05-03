@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-03
+
 ### Added
 
 - **MCP Resources** (`mcp/resources.rs`, `mcp/server.rs`) — six read-only Resources exposed alongside the existing tools: `schema://yaml` (raw schema file), `schema://json` (parsed `SchemaConfig` as JSON), `schema://json-schema` (draft-07 JSON Schema derived from `fields[]`, usable for client-side validation of `create` / `update` arguments), `docs://readme` (this README, embedded via `include_str!`), `docs://tools` (tool cheat sheet), and `docs://errors` (error code reference). `ServerCapabilities` now declares `resources` capability.
