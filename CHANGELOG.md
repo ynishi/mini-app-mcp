@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-03
+
 ### Added
 
 - **Multi-table support** (`mcp/registry.rs`, `mcp/server.rs`, `config.rs`) — a single `mini-app-mcp` daemon can now mount and serve multiple SQLite tables. Tables are discovered automatically from two directory layers: User scope (`~/.mini-app/<table>/`) as the base and Project scope (`{project_root}/.mini-app/<table>/`) as an override. A Project-level `schema.yaml` for a given table name fully replaces the User-level one (file-level swap, no field merging). The new `TableRegistry` struct (`mcp/registry.rs`) manages the `HashMap<String, Arc<Store>>` backing this.
