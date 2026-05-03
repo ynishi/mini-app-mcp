@@ -117,10 +117,7 @@ pub fn derive_json_schema(schema: &SchemaConfig) -> serde_json::Value {
             FieldType::Array => "array",
             FieldType::Object => "object",
         };
-        properties.insert(
-            field.name.clone(),
-            serde_json::json!({ "type": type_str }),
-        );
+        properties.insert(field.name.clone(), serde_json::json!({ "type": type_str }));
         if field.required {
             required.push(serde_json::Value::String(field.name.clone()));
         }
@@ -181,11 +178,31 @@ mod tests {
         let schema = SchemaConfig {
             table: "t".to_string(),
             fields: vec![
-                FieldDef { name: "s".to_string(), ty: FieldType::String, required: false },
-                FieldDef { name: "n".to_string(), ty: FieldType::Number, required: false },
-                FieldDef { name: "b".to_string(), ty: FieldType::Boolean, required: false },
-                FieldDef { name: "a".to_string(), ty: FieldType::Array, required: false },
-                FieldDef { name: "o".to_string(), ty: FieldType::Object, required: false },
+                FieldDef {
+                    name: "s".to_string(),
+                    ty: FieldType::String,
+                    required: false,
+                },
+                FieldDef {
+                    name: "n".to_string(),
+                    ty: FieldType::Number,
+                    required: false,
+                },
+                FieldDef {
+                    name: "b".to_string(),
+                    ty: FieldType::Boolean,
+                    required: false,
+                },
+                FieldDef {
+                    name: "a".to_string(),
+                    ty: FieldType::Array,
+                    required: false,
+                },
+                FieldDef {
+                    name: "o".to_string(),
+                    ty: FieldType::Object,
+                    required: false,
+                },
             ],
             dump: None,
         };

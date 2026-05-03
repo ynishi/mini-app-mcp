@@ -9,17 +9,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::{
-    ServerHandler, ServiceExt,
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        AnnotateAble, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
-        RawResource, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
-        ServerCapabilities, ServerInfo,
+        AnnotateAble, ListResourcesResult, PaginatedRequestParams, ProtocolVersion, RawResource,
+        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+        ServerInfo,
     },
     service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
-    ErrorData as McpError, RoleServer,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -800,7 +799,10 @@ fields:\n\
             "docs://tools",
             "docs://errors",
         ] {
-            assert!(uris.contains(expected), "URI '{expected}' missing from list");
+            assert!(
+                uris.contains(expected),
+                "URI '{expected}' missing from list"
+            );
         }
     }
 
