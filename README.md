@@ -65,7 +65,7 @@ All tools accept an optional `table` argument that selects the target table. In 
 | `list` | Returns rows with optional `limit` / `offset` pagination |
 | `update` | Replaces the `data` of an existing row by `id` |
 | `delete` | Removes a row by `id` |
-| `reload` | Re-scan `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and atomically replace the table registry. Legacy `MINI_APP_SCHEMA` + `MINI_APP_DB` are re-applied if set. Returns `{ mounted, added, removed }`. Limitations: no file watcher (explicit invocation only); whole-registry replace (no per-table partial reload); no schema migration for existing rows. |
+| `reload` | Re-scan `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and atomically replace the table registry. Legacy `MINI_APP_SCHEMA` + `MINI_APP_DB` are re-applied if set. Returns `{ mounted, added, removed }`. Limitations: no file watcher (explicit invocation only); whole-registry replace (no per-table partial reload); no schema migration for existing rows; concurrent `reload` calls are last-write-wins. |
 
 ## MCP resources
 
