@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-04
+
 ### Added
 
 - **`reload` MCP tool** (`mcp/server.rs`) — new tool that re-scans `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` (and re-applies `MINI_APP_SCHEMA` + `MINI_APP_DB` if set) and atomically replaces the live table registry without restarting the server. Returns `{ mounted: usize, added: Vec<String>, removed: Vec<String> }` so callers can observe which tables changed. The swap is performed via `ArcSwap::store()` — in-flight tool calls running against the previous registry complete normally; subsequent calls see the new registry. Limitations: no file-system watcher (explicit invocation only); whole-registry replacement (no per-table partial reload); no schema migration for existing rows; concurrent `reload` calls are last-write-wins.
@@ -16,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WAL journal mode on all SQLite connections** (`store.rs`) — `Store::open` now executes `PRAGMA journal_mode = WAL` immediately after opening every connection. WAL mode is persistent (SQLite retains it across close/reopen) and enables one writer + many concurrent readers, which is required for safe operation during the dual-registry window that exists while `reload` replaces the table registry. Existing `.db` files are migrated transparently on next open. Sidecar files `<db>.db-wal` and `<db>.db-shm` are created alongside each `.db` file; these are managed by SQLite and must not be deleted manually.
 - **`MiniAppMcpServer` internals** (`mcp/server.rs`) — `tables` field changed from `Arc<TableRegistry>` to `Arc<ArcSwap<TableRegistry>>` to support atomic hot-reload. `Config` is now retained on the server struct (`Arc<Config>`) so the `reload` tool can re-scan the same directories that were used at startup. All existing tool implementations (`info`, `create`, `get`, `list`, `update`, `delete`) load a snapshot of the registry via `ArcSwap::load()` at the start of each call and release the guard before any `await` point. `TableRegistry` doc comment updated from "immutable, no interior mutability" to "snapshot is immutable; replaced via ArcSwap on reload".
 - **`arc-swap` dependency added** (`Cargo.toml`) — `arc-swap = "1"` added to support the wait-free atomic swap of `TableRegistry`.
+
+### Fixed
+
+- **`reload` early-reject on legacy single-table servers** (`mcp/server.rs`) — when `MiniAppMcpServer` is constructed via `new_single` (legacy adapter path), all four `mount_config` fields are `None`. Calling the `reload` tool on such a server previously would re-mount an empty registry and atomically swap out the originally-mounted table, leaving the server inaccessible until restart. `tool_reload` now detects this all-`None` configuration up front and returns `MiniAppError::Config("reload not configured: server was constructed via new_single without a mount config")` without touching the registry.
+- **`PRAGMA journal_mode = WAL` read-back warning** (`store.rs`) — SQLite silently falls back to a non-WAL mode (memory / delete) on filesystems that do not support WAL (notably `:memory:` databases, some network filesystems). `Store::open` now reads back the resulting `journal_mode` after issuing the WAL pragma and emits `tracing::warn!(actual_mode = ..., "PRAGMA journal_mode=WAL fell back to non-WAL mode; concurrent reload may hit SQLITE_BUSY")` when the actual mode is not `wal`. The fallback is observable instead of silent; behaviour is unchanged otherwise (no error returned).
 
 ## [0.3.1] - 2026-05-03
 
