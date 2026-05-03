@@ -225,6 +225,102 @@ impl TableRegistry {
     pub fn table_names(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(|k| k.as_str())
     }
+
+    /// Build a registry from a pre-constructed entry map and optional default.
+    ///
+    /// This constructor is intended for use in tests where stores are created
+    /// directly (e.g. in-memory SQLite) without going through the directory
+    /// scan path.
+    ///
+    /// # Arguments
+    ///
+    /// - `entries`: map of table names to [`TableEntry`] values.
+    /// - `default_table`: optional default table name (set for legacy compat).
+    pub fn from_entries(
+        entries: HashMap<String, TableEntry>,
+        default_table: Option<String>,
+    ) -> Self {
+        TableRegistry {
+            entries,
+            default_table,
+        }
+    }
+
+    /// Build a single-entry registry from a pre-opened [`Store`] and schema.
+    ///
+    /// Sets `default_table` to `table_name` so callers can omit the `table`
+    /// argument (crux #2 legacy adapter).
+    ///
+    /// # Arguments
+    ///
+    /// - `store`: the already-opened [`Store`].
+    /// - `schema`: the parsed [`SchemaConfig`].
+    /// - `schema_path`: filesystem path to `schema.yaml`.
+    /// - `table_name`: the name to register this table under and set as default.
+    pub fn from_single(
+        store: Store,
+        schema: SchemaConfig,
+        schema_path: PathBuf,
+        table_name: String,
+    ) -> Self {
+        let entry = TableEntry {
+            store: Arc::new(store),
+            schema: Arc::new(schema),
+            schema_path: Arc::new(schema_path),
+        };
+        let mut entries = HashMap::new();
+        entries.insert(table_name.clone(), entry);
+        TableRegistry {
+            entries,
+            default_table: Some(table_name),
+        }
+    }
+
+    /// Merge a legacy single-table configuration into an existing registry.
+    ///
+    /// Loads the schema from `schema_path`, opens the SQLite database at
+    /// `db_path`, and inserts the resulting entry into `self`. If the table
+    /// name is already present in the registry it is **replaced** (legacy
+    /// env takes precedence) and a `tracing::warn!` is emitted.  Also sets
+    /// `default_table` to the legacy table name so callers can omit the
+    /// `table` argument (crux #2 legacy adapter).
+    ///
+    /// # Arguments
+    ///
+    /// - `registry`: the registry to merge into (consumed and returned).
+    /// - `schema_path`: path to the `schema.yaml` file.
+    /// - `db_path`: path to the SQLite database file.
+    ///
+    /// # Errors
+    ///
+    /// - [`MiniAppError::Io`] — if `schema_path` cannot be read.
+    /// - [`MiniAppError::Schema`] — if `schema.yaml` is malformed.
+    /// - [`MiniAppError::Storage`] — if the SQLite database cannot be opened.
+    pub async fn mount_legacy_into(
+        mut registry: TableRegistry,
+        schema_path: &Path,
+        db_path: &Path,
+    ) -> Result<TableRegistry, MiniAppError> {
+        let schema = schema::load_from_path(schema_path)?;
+        let table_name = schema.table.clone();
+
+        if registry.entries.contains_key(&table_name) {
+            tracing::warn!(
+                table = %table_name,
+                "legacy table name conflicts with a dir-scanned table; legacy env takes precedence"
+            );
+        }
+
+        let store = Store::open(db_path, schema.clone()).await?;
+        let entry = TableEntry {
+            store: Arc::new(store),
+            schema: Arc::new(schema),
+            schema_path: Arc::new(schema_path.to_path_buf()),
+        };
+        registry.entries.insert(table_name.clone(), entry);
+        registry.default_table = Some(table_name);
+        Ok(registry)
+    }
 }
 
 // =============================================================================
