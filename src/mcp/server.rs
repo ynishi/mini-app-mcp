@@ -51,9 +51,17 @@ use crate::store::Store;
 /// `anyhow::Error`.
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
-    let schema = schema::load_from_path(&config.schema_path)?;
-    let store = Store::open(&config.db_path, schema.clone()).await?;
-    let server = MiniAppMcpServer::new(store, schema, config.schema_path);
+    // Legacy single-table path: require both MINI_APP_SCHEMA and MINI_APP_DB.
+    // Subtask 2 will replace this with TableRegistry-based multi-table mount.
+    let schema_path = config.schema_path.ok_or_else(|| {
+        crate::error::MiniAppError::Config("MINI_APP_SCHEMA env var required".into())
+    })?;
+    let db_path = config
+        .db_path
+        .ok_or_else(|| crate::error::MiniAppError::Config("MINI_APP_DB env var required".into()))?;
+    let schema = schema::load_from_path(&schema_path)?;
+    let store = Store::open(&db_path, schema.clone()).await?;
+    let server = MiniAppMcpServer::new(store, schema, schema_path);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
