@@ -51,6 +51,21 @@ Both variables can also be placed in a `.mini-app-mcp.env` file in the working d
 | `update` | Replaces the `data` of an existing row by `id` |
 | `delete` | Removes a row by `id` |
 
+## MCP resources
+
+In addition to the 6 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
+
+| URI | MIME | Content |
+|---|---|---|
+| `schema://yaml` | `application/yaml` | Raw `schema.yaml` file content (read from disk on each request) |
+| `schema://json` | `application/json` | Parsed `SchemaConfig` as JSON (same shape the `info` tool returns) |
+| `schema://json-schema` | `application/schema+json` | JSON Schema (draft-07) derived from the schema's fields. Use this to validate `data` arguments before calling `create` / `update` |
+| `docs://readme` | `text/markdown` | This README, compiled into the binary |
+| `docs://tools` | `text/markdown` | Cheat sheet of the 6 MCP tools and their input shapes |
+| `docs://errors` | `text/markdown` | Reference table of error codes returned by the server |
+
+The `info` tool and `schema://json` resource return equivalent content but serve different purposes: `info` is a callable tool (good for one-off introspection in a conversation), while resources are URI-addressable and can be subscribed to or cached by the client.
+
 ## Usage
 
 Start the server via the `--mcp` flag (required; the binary has no other entry point):
