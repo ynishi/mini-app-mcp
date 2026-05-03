@@ -141,6 +141,17 @@ impl Store {
                 // Enable WAL journal mode before DDL. WAL allows concurrent readers
                 // and one writer, which is essential for Crux #1 dual-registry safety.
                 c.pragma_update(None, "journal_mode", "WAL")?;
+                // Read back the actual mode: SQLite silently falls back to non-WAL
+                // on `:memory:`, NFS, or read-only filesystems.  A mismatch does not
+                // prevent startup but means concurrent reload may hit SQLITE_BUSY.
+                let actual_mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+                if actual_mode.to_lowercase() != "wal" {
+                    tracing::warn!(
+                        actual_mode = %actual_mode,
+                        "PRAGMA journal_mode=WAL fell back to non-WAL mode; \
+                         concurrent reload may hit SQLITE_BUSY"
+                    );
+                }
                 c.execute_batch(CREATE_TABLE_SQL)?;
                 Ok(c)
             })

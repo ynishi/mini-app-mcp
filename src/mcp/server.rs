@@ -802,7 +802,23 @@ impl MiniAppMcpServer {
         )
     )]
     pub async fn tool_reload(&self) -> Result<String, McpError> {
+        // Early-reject: servers constructed via `new_single` (or any path that
+        // leaves all four mount-config fields as None) have no directory to
+        // re-scan.  Proceeding would call `mount_from_dirs(None, None)`, produce
+        // an empty registry, and atomically overwrite the original table — data
+        // loss without error.  Reject loudly instead.
         let config = Arc::clone(&self.mount_config);
+        if config.user_dir.is_none()
+            && config.project_dir.is_none()
+            && config.schema_path.is_none()
+            && config.db_path.is_none()
+        {
+            return Err(McpError::from(MiniAppError::Config(
+                "reload not configured: server was constructed via new_single without a mount \
+                 config"
+                    .into(),
+            )));
+        }
 
         // Run the synchronous std::fs I/O inside a blocking thread pool so we
         // do not stall the async runtime workers (K-110 constraint).
@@ -1766,5 +1782,29 @@ fields:\n\
         let info: serde_json::Value =
             serde_json::from_str(&info_json).expect("info must be valid JSON");
         assert_eq!(info["table"], "table_beta");
+    }
+
+    // ---------------------------------------------------------------------------
+    // T13: reload returns CONFIG_ERROR when server was constructed via new_single
+    // (all mount_config fields are None — no directory to re-scan).
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reload_returns_config_error_on_legacy_server() {
+        // `make_server()` uses `new_single` which sets all Config fields to None.
+        let (server, _tmp) = make_server().await;
+
+        let result = server.tool_reload().await;
+        assert!(
+            result.is_err(),
+            "reload on a new_single server must return Err"
+        );
+        // The error string must carry CONFIG_ERROR so callers can identify the
+        // rejection without parsing the human-readable message.
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("CONFIG_ERROR") || err_str.contains("reload not configured"),
+            "error must indicate CONFIG_ERROR or 'reload not configured', got: {err_str}"
+        );
     }
 }
