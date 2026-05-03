@@ -1,15 +1,15 @@
 # mini-app-mcp
 
-Agent-First CRUD store MCP server — 1 daemon per table, `schema.yaml` driven, SQLite backend.
+Agent-First CRUD store MCP server — `schema.yaml` driven, SQLite backend, multi-table in a single daemon.
 
 ## What it does
 
-`mini-app-mcp` is a lightweight MCP server where each running daemon owns exactly one SQLite table. The table shape is defined entirely by a `schema.yaml` file; no migrations, no REST API, no GUI. CRUD is exposed exclusively as MCP tools, making it a natural backend for agents that need structured persistent storage.
+`mini-app-mcp` is a lightweight MCP server that manages one or more SQLite tables in a single running process. The shape of each table is defined entirely by a `schema.yaml` file; no migrations, no REST API, no GUI. CRUD is exposed exclusively as MCP tools, making it a natural backend for agents that need structured persistent storage.
 
 ## Design principles
 
-- **1 daemon = 1 table** — start one process per data type (issues, tasks, notes, …).
-- **`schema.yaml` as sole schema authority** — field names, types, and required constraints are read from the YAML file at startup. No field is hard-coded in application code.
+- **`schema.yaml` as sole schema authority** — field names, types, and required constraints are read from YAML at startup. No field is hard-coded in application code.
+- **Multi-table in one daemon** — a single server process discovers and mounts all tables found under the configured User and Project scope directories. A dedicated legacy mode (`MINI_APP_SCHEMA` + `MINI_APP_DB`) preserves the original single-table behaviour.
 - **MCP-only entry point** — there is no HTTP/REST/CLI CRUD interface. All reads and writes go through MCP tools.
 - **Structured JSON errors** — every error response carries a machine-readable `code` field so agents can handle failures programmatically.
 
@@ -33,14 +33,29 @@ Supported types: `string`, `number`, `boolean`, `array`, `object`.
 
 ## Configuration
 
+### Multi-table mode (recommended)
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `MINI_APP_USER_DIR` | `~/.mini-app/` | Base directory for User-scope tables. Each subdirectory is treated as a table name and must contain `schema.yaml` and `<table>.db`. |
+| `MINI_APP_PROJECT_DIR` | `./.mini-app/` | Project-scope override directory. A table present here fully replaces the User-scope definition of the same name. |
+
+Tables are discovered at startup by scanning both directories. Project-scope definitions take precedence over User-scope definitions for the same table name.
+
+### Legacy single-table mode
+
 | Environment variable | Default | Description |
 |---|---|---|
 | `MINI_APP_SCHEMA` | `./schema.yaml` | Path to the schema definition file |
 | `MINI_APP_DB` | *(none — must be set)* | Path to the SQLite database file |
 
-Both variables can also be placed in a `.mini-app-mcp.env` file in the working directory.
+When `MINI_APP_SCHEMA` and `MINI_APP_DB` are set the server starts in legacy mode, mounting exactly one table. The `table` argument on all tools may be omitted in this mode.
+
+All variables can also be placed in a `.mini-app-mcp.env` file in the working directory.
 
 ## MCP tools
+
+All tools accept an optional `table` argument that selects the target table. In multi-table mode the argument is required; omitting it returns error code `TABLE_REQUIRED`. Supplying an unknown table name returns error code `TABLE_NOT_FOUND`. In legacy single-table mode the argument may be omitted.
 
 | Tool | Description |
 |---|---|
@@ -68,7 +83,30 @@ The `info` tool and `schema://json` resource return equivalent content but serve
 
 ## Usage
 
-Start the server via the `--mcp` flag (required; the binary has no other entry point):
+Start the server via the `--mcp` flag (required; the binary has no other entry point).
+
+### Multi-table mode
+
+Place each table's `schema.yaml` and `<table>.db` under `~/.mini-app/<table>/` (User scope) or `./.mini-app/<table>/` (Project scope), then start without any extra environment variables:
+
+```sh
+mini-app-mcp --mcp
+```
+
+Register it once in `.mcp.json` to serve all mounted tables:
+
+```json
+{
+  "mcpServers": {
+    "mini-app": {
+      "command": "mini-app-mcp",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+### Legacy single-table mode
 
 ```sh
 MINI_APP_SCHEMA=./schema.yaml MINI_APP_DB=./issues.db mini-app-mcp --mcp
@@ -79,19 +117,6 @@ Or configure via `.mini-app-mcp.env`:
 ```
 MINI_APP_SCHEMA=./schema.yaml
 MINI_APP_DB=./issues.db
-```
-
-Then register it as an MCP server in `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "issues": {
-      "command": "mini-app-mcp",
-      "args": ["--mcp"]
-    }
-  }
-}
 ```
 
 ## Dump / file materialization
