@@ -4,3 +4,4 @@
 pub use server::{MiniAppMcpServer, run};
 
 mod server;
+pub(crate) mod resources;

@@ -1,21 +1,31 @@
 /// MCP server implementation for mini-app-mcp.
 ///
-/// Exposes 6 tools (`info`, `create`, `get`, `list`, `update`, `delete`) as
-/// MCP tools over stdio transport.  No HTTP / REST / CLI-CRUD entry points are
-/// provided (Crux "MCP-only entry point" constraint).
+/// Exposes 6 tools (`info`, `create`, `get`, `list`, `update`, `delete`) and
+/// 6 resources (`schema://yaml`, `schema://json`, `schema://json-schema`,
+/// `docs://readme`, `docs://tools`, `docs://errors`) as MCP capabilities over
+/// stdio transport.  No HTTP / REST / CLI-CRUD entry points are provided
+/// (Crux "MCP-only entry point" constraint).
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ProtocolVersion, ServerCapabilities, ServerInfo},
+    model::{
+        AnnotateAble, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
+        RawResource, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+        ServerCapabilities, ServerInfo,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
+    ErrorData as McpError, RoleServer,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::config::Config;
+use crate::mcp::resources as res;
 use crate::schema::{self, SchemaConfig};
 use crate::store::Store;
 
@@ -44,7 +54,7 @@ pub async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
     let schema = schema::load_from_path(&config.schema_path)?;
     let store = Store::open(&config.db_path, schema.clone()).await?;
-    let server = MiniAppMcpServer::new(store, schema);
+    let server = MiniAppMcpServer::new(store, schema, config.schema_path);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -56,7 +66,11 @@ pub async fn run() -> anyhow::Result<()> {
 
 /// The MCP server for mini-app-mcp.
 ///
-/// Holds a reference-counted [`Store`] and the parsed [`SchemaConfig`].
+/// Holds a reference-counted [`Store`], the parsed [`SchemaConfig`], and
+/// the path to `schema.yaml` so the `schema://yaml` resource can lazily read
+/// the file on every request (keeping `schema.yaml` as the true source of
+/// truth rather than a snapshot captured at startup).
+///
 /// The server is `Clone` because `rmcp` clones it per connection.
 #[derive(Clone)]
 pub struct MiniAppMcpServer {
@@ -64,15 +78,18 @@ pub struct MiniAppMcpServer {
     tool_router: ToolRouter<Self>,
     store: Arc<Store>,
     schema: Arc<SchemaConfig>,
+    /// Path to `schema.yaml`, stored so `schema://yaml` can read it lazily.
+    schema_path: Arc<PathBuf>,
 }
 
 impl MiniAppMcpServer {
     /// Create a new [`MiniAppMcpServer`].
-    pub fn new(store: Store, schema: SchemaConfig) -> Self {
+    pub fn new(store: Store, schema: SchemaConfig, schema_path: PathBuf) -> Self {
         Self {
             tool_router: Self::tool_router(),
             store: Arc::new(store),
             schema: Arc::new(schema),
+            schema_path: Arc::new(schema_path),
         }
     }
 }
@@ -81,12 +98,112 @@ impl MiniAppMcpServer {
 // ServerHandler
 // =============================================================================
 
+// =============================================================================
+// Resource support — private helpers
+// =============================================================================
+
+/// URIs for all 6 advertised resources.
+const URI_SCHEMA_YAML: &str = "schema://yaml";
+const URI_SCHEMA_JSON: &str = "schema://json";
+const URI_SCHEMA_JSON_SCHEMA: &str = "schema://json-schema";
+const URI_DOCS_README: &str = "docs://readme";
+const URI_DOCS_TOOLS: &str = "docs://tools";
+const URI_DOCS_ERRORS: &str = "docs://errors";
+
+impl MiniAppMcpServer {
+    /// Build the static list of advertised resources.
+    fn resource_list() -> Vec<rmcp::model::Resource> {
+        vec![
+            RawResource::new(URI_SCHEMA_YAML, "Schema YAML")
+                .with_description("Raw schema.yaml file content (read at request time).")
+                .with_mime_type("application/yaml")
+                .no_annotation(),
+            RawResource::new(URI_SCHEMA_JSON, "Schema JSON")
+                .with_description(
+                    "SchemaConfig serialised as JSON — same content as the `info` tool.",
+                )
+                .with_mime_type("application/json")
+                .no_annotation(),
+            RawResource::new(URI_SCHEMA_JSON_SCHEMA, "JSON Schema")
+                .with_description(
+                    "JSON Schema (draft-07) derived from SchemaConfig.fields — \
+                     use this to validate `data` arguments before calling `create`/`update`.",
+                )
+                .with_mime_type("application/schema+json")
+                .no_annotation(),
+            RawResource::new(URI_DOCS_README, "README")
+                .with_description("README.md — embedded in the binary at compile time.")
+                .with_mime_type("text/markdown")
+                .no_annotation(),
+            RawResource::new(URI_DOCS_TOOLS, "Tools Reference")
+                .with_description(
+                    "Cheat sheet listing all 6 tools with descriptions and input shapes.",
+                )
+                .with_mime_type("text/markdown")
+                .no_annotation(),
+            RawResource::new(URI_DOCS_ERRORS, "Error Code Reference")
+                .with_description("Reference table of all error codes returned by this server.")
+                .with_mime_type("text/markdown")
+                .no_annotation(),
+        ]
+    }
+
+    /// Inner implementation of `read_resource` — tested directly to avoid
+    /// `RequestContext` construction issues in tests (rmcp 1.5 makes
+    /// `RequestContext` `#[non_exhaustive]` so it cannot be built in external
+    /// crates).
+    async fn read_resource_impl(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
+        let contents = match uri {
+            URI_SCHEMA_YAML => {
+                let text = std::fs::read_to_string(self.schema_path.as_ref()).map_err(|e| {
+                    McpError::internal_error(format!("failed to read schema.yaml: {e}"), None)
+                })?;
+                ResourceContents::text(text, uri).with_mime_type("application/yaml")
+            }
+            URI_SCHEMA_JSON => {
+                let text = serde_json::to_string_pretty(&*self.schema)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                ResourceContents::text(text, uri).with_mime_type("application/json")
+            }
+            URI_SCHEMA_JSON_SCHEMA => {
+                let js = res::derive_json_schema(&self.schema);
+                let text = serde_json::to_string_pretty(&js)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                ResourceContents::text(text, uri).with_mime_type("application/schema+json")
+            }
+            URI_DOCS_README => {
+                ResourceContents::text(res::README, uri).with_mime_type("text/markdown")
+            }
+            URI_DOCS_TOOLS => {
+                ResourceContents::text(res::TOOLS_DOC, uri).with_mime_type("text/markdown")
+            }
+            URI_DOCS_ERRORS => {
+                ResourceContents::text(res::ERRORS_DOC, uri).with_mime_type("text/markdown")
+            }
+            _ => {
+                return Err(McpError::resource_not_found(
+                    format!("unknown resource URI: {uri}"),
+                    None,
+                ));
+            }
+        };
+        Ok(ReadResourceResult::new(vec![contents]))
+    }
+}
+
+// =============================================================================
+// ServerHandler — get_info + resource dispatch
+// =============================================================================
+
 #[tool_handler]
 impl ServerHandler for MiniAppMcpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::V_2025_03_26;
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
         info.server_info.name = "mini-app-mcp".to_string();
         info.server_info.title = Some("Mini App MCP — Agent-First CRUD Store".to_string());
         info.server_info.description = Some(
@@ -111,6 +228,22 @@ impl ServerHandler for MiniAppMcpServer {
                 .to_string(),
         );
         info
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(Self::resource_list()))
+    }
+
+    async fn read_resource(
+        &self,
+        req: ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        self.read_resource_impl(&req.uri).await
     }
 }
 
@@ -315,7 +448,21 @@ mod tests {
     // Helpers
     // ---------------------------------------------------------------------------
 
-    async fn make_server() -> MiniAppMcpServer {
+    async fn make_server() -> (MiniAppMcpServer, tempfile::NamedTempFile) {
+        use std::io::Write as _;
+        let schema_yaml = b"\
+table: test_table\n\
+fields:\n\
+  - name: title\n\
+    type: string\n\
+    required: true\n\
+  - name: state\n\
+    type: string\n\
+    required: false\n";
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+        tmp.write_all(schema_yaml).expect("write schema yaml");
+
         let schema = SchemaConfig {
             table: "test_table".to_string(),
             fields: vec![
@@ -335,7 +482,8 @@ mod tests {
         let store = Store::open(Path::new(":memory:"), schema.clone())
             .await
             .expect("in-memory store must open");
-        MiniAppMcpServer::new(store, schema)
+        let schema_path = tmp.path().to_path_buf();
+        (MiniAppMcpServer::new(store, schema, schema_path), tmp)
     }
 
     /// In rmcp 1.5, `RequestContext` and `CallToolRequestParams` are
@@ -399,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_tools_contains_all_six() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for expected in &["info", "create", "get", "list", "update", "delete"] {
@@ -413,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_annotations_delete_is_destructive() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         let delete_tool = tools
             .iter()
@@ -433,7 +581,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_annotations_create_is_not_idempotent() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         let create_tool = tools
             .iter()
@@ -457,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_annotations_read_only_tools() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         for name in &["info", "get", "list"] {
             let tool = tools
@@ -482,7 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn info_tool_returns_schema_json() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let json = server.tool_info().await.expect("info must succeed");
         let parsed: serde_json::Value =
             serde_json::from_str(&json).expect("info must return valid JSON");
@@ -505,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get_roundtrip() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
 
         let created = do_create(
             &server,
@@ -526,7 +674,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_tool_returns_array() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
 
         do_create(&server, serde_json::json!({ "title": "row1" }))
             .await
@@ -544,7 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_tool_with_limit_and_offset() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         for i in 0..5 {
             do_create(&server, serde_json::json!({ "title": format!("item-{i}") }))
                 .await
@@ -562,7 +710,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_tool_success() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let created = do_create(&server, serde_json::json!({ "title": "original" }))
             .await
             .unwrap();
@@ -580,7 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_tool_success() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let created = do_create(&server, serde_json::json!({ "title": "to-delete" }))
             .await
             .unwrap();
@@ -596,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_missing_required_field_returns_err() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         // `title` is required; passing empty object must fail.
         let result = do_create(&server, serde_json::json!({})).await;
         assert!(result.is_err(), "validation failure must return Err");
@@ -604,21 +752,21 @@ mod tests {
 
     #[tokio::test]
     async fn get_not_found_returns_err() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let result = do_get(&server, "nonexistent-id").await;
         assert!(result.is_err(), "not-found must return Err");
     }
 
     #[tokio::test]
     async fn delete_not_found_returns_err() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let result = do_delete(&server, "nonexistent-id").await;
         assert!(result.is_err(), "not-found must return Err");
     }
 
     #[tokio::test]
     async fn update_not_found_returns_err() {
-        let server = make_server().await;
+        let (server, _tmp) = make_server().await;
         let result = do_update(
             &server,
             "nonexistent-id",
@@ -626,5 +774,98 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "not-found must return Err");
+    }
+
+    // ---------------------------------------------------------------------------
+    // T8: Resources
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_resources_returns_six() {
+        // MiniAppMcpServer::resource_list() is the pure static list; testing
+        // it directly avoids the non-constructible RequestContext.
+        let resources = MiniAppMcpServer::resource_list();
+        assert_eq!(
+            resources.len(),
+            6,
+            "expected exactly 6 resources, got: {:?}",
+            resources.iter().map(|r| &r.uri).collect::<Vec<_>>()
+        );
+        let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
+        for expected in &[
+            "schema://yaml",
+            "schema://json",
+            "schema://json-schema",
+            "docs://readme",
+            "docs://tools",
+            "docs://errors",
+        ] {
+            assert!(uris.contains(expected), "URI '{expected}' missing from list");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_resource_schema_json_returns_schema() {
+        let (server, _tmp) = make_server().await;
+        let result = server
+            .read_resource_impl("schema://json")
+            .await
+            .expect("schema://json must succeed");
+        assert_eq!(result.contents.len(), 1);
+        let text = match &result.contents[0] {
+            rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+            _ => panic!("expected text contents"),
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("schema://json must be valid JSON");
+        assert_eq!(parsed["table"], "test_table", "table field must match");
+        assert!(parsed["fields"].is_array(), "fields must be an array");
+    }
+
+    #[tokio::test]
+    async fn read_resource_json_schema_has_required_array() {
+        let (server, _tmp) = make_server().await;
+        let result = server
+            .read_resource_impl("schema://json-schema")
+            .await
+            .expect("schema://json-schema must succeed");
+        let text = match &result.contents[0] {
+            rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+            _ => panic!("expected text contents"),
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("json-schema must be valid JSON");
+        let required = parsed["required"]
+            .as_array()
+            .expect("required must be an array");
+        assert!(
+            required.contains(&serde_json::Value::String("title".to_string())),
+            "required must contain 'title' (marked required: true in test schema)"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_resource_readme_starts_with_heading() {
+        let (server, _tmp) = make_server().await;
+        let result = server
+            .read_resource_impl("docs://readme")
+            .await
+            .expect("docs://readme must succeed");
+        let text = match &result.contents[0] {
+            rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+            _ => panic!("expected text contents"),
+        };
+        assert!(
+            text.starts_with("# mini-app-mcp"),
+            "README must start with '# mini-app-mcp', got: {:?}",
+            &text[..text.len().min(40)]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_resource_unknown_uri_returns_err() {
+        let (server, _tmp) = make_server().await;
+        let result = server.read_resource_impl("unknown://nope").await;
+        assert!(result.is_err(), "unknown URI must return Err");
     }
 }
