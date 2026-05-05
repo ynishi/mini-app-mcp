@@ -39,6 +39,7 @@ Supported types: `string`, `number`, `boolean`, `array`, `object`.
 |---|---|---|
 | `MINI_APP_USER_DIR` | `~/.mini-app/` | Base directory for User-scope tables. Each subdirectory is treated as a table name and must contain `schema.yaml` and `<table>.db`. |
 | `MINI_APP_PROJECT_DIR` | `./.mini-app/` | Project-scope override directory. A table present here fully replaces the User-scope definition of the same name. |
+| `MINI_APP_BACKUP_RETENTION` | `10` | Maximum number of backup copies (YAML + DB snapshot pairs) to retain per table under `_backup/`. Older copies beyond this limit are deleted immediately after each backup write. |
 
 Tables are discovered at startup by scanning both directories. Project-scope definitions take precedence over User-scope definitions for the same table name.
 
@@ -66,10 +67,14 @@ All tools accept an optional `table` argument that selects the target table. In 
 | `update` | Replaces the `data` of an existing row by `id` |
 | `delete` | Removes a row by `id` |
 | `reload` | Re-scan `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and atomically replace the table registry. Legacy `MINI_APP_SCHEMA` + `MINI_APP_DB` are re-applied if set. Returns `{ mounted, added, removed }`. Limitations: no file watcher (explicit invocation only); whole-registry replace (no per-table partial reload); no schema migration for existing rows; concurrent `reload` calls are last-write-wins. |
+| `schema_create` | Create a new `schema.yaml` under the specified `scope` (`project` or `user`) and register the table live. Pass `dry_run: true` to preview without writing. Fails with `SCHEMA_EXISTS` if the table already exists. |
+| `schema_update` | Replace an existing table's `schema.yaml` with a new definition (full overwrite). Backs up the previous YAML and a SQLite snapshot to `_backup/` before writing. Pass `dry_run: true` to preview field changes without touching disk. |
+| `schema_delete` | Remove a table's `schema.yaml` (moved to `_backup/`) and unregister it from the live registry. **Does not alter or drop the SQLite table** — DDL changes remain the operator's responsibility. Pass `dry_run: true` to preview. |
+| `schema_batch` | Execute an array of `ops[]` atomically under a single SQLite SAVEPOINT. Any op failure rolls back all preceding ops, leaving YAML and DB untouched. All ops must target the same table. Returns per-op results or a `BATCH_ABORTED` error with the index of the failing op. |
 
 ## MCP resources
 
-In addition to the 7 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
+In addition to the 11 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
 
 | URI | MIME | Content |
 |---|---|---|
@@ -77,7 +82,7 @@ In addition to the 7 tools above, the server exposes 6 read-only **Resources** a
 | `schema://json` | `application/json` | Parsed `SchemaConfig` as JSON (same shape the `info` tool returns) |
 | `schema://json-schema` | `application/schema+json` | JSON Schema (draft-07) derived from the schema's fields. Use this to validate `data` arguments before calling `create` / `update` |
 | `docs://readme` | `text/markdown` | This README, compiled into the binary |
-| `docs://tools` | `text/markdown` | Cheat sheet of the 7 MCP tools and their input shapes |
+| `docs://tools` | `text/markdown` | Cheat sheet of the 11 MCP tools and their input shapes |
 | `docs://errors` | `text/markdown` | Reference table of error codes returned by the server |
 
 The `info` tool and `schema://json` resource return equivalent content but serve different purposes: `info` is a callable tool (good for one-off introspection in a conversation), while resources are URI-addressable and can be subscribed to or cached by the client.
@@ -168,6 +173,53 @@ dump:
 | `dump.title_field` | `title` | Field name in the stored JSON row to use as the Markdown heading. |
 | `dump.body_field` | `body` | Field name in the stored JSON row to use as the Markdown body. |
 | `dump.sync` | `write-only` | Sync direction. Only `write-only` is implemented. Setting `bidirectional` is accepted without error but logs a warning and behaves as `write-only`. |
+
+## Schema management
+
+`mini-app-mcp` exposes four tools for managing table schemas at runtime without restarting the server.
+
+### Creating a table
+
+```
+schema_create(scope="project", table="notes", fields=[...])
+```
+
+The tool writes `<scope_dir>/notes/schema.yaml` and immediately registers the new table in the live registry. Calling it again for the same table name returns `SCHEMA_EXISTS`.
+
+### Updating a schema
+
+```
+schema_update(scope="project", table="notes", fields=[...])
+```
+
+Before overwriting, the server backs up the existing `schema.yaml` and a point-in-time SQLite snapshot to `<scope_dir>/_backup/notes.<timestamp>.yaml` and `<scope_dir>/_backup/notes.<timestamp>.db`. The live registry is refreshed after the write. No DDL migration is applied — the underlying table structure is unchanged.
+
+### Deleting a schema
+
+```
+schema_delete(scope="project", table="notes")
+```
+
+The `schema.yaml` is moved to `_backup/` and the table is unregistered from the live registry. **The SQLite database file is not modified.** Dropping or altering the table remains the operator's responsibility.
+
+### Atomic batch operations
+
+```
+schema_batch(ops=[
+  { "op": "create", "table": "notes", "scope": "project", "fields": [...] },
+  { "op": "data_insert", "table": "notes", "data": { "title": "first note" } }
+])
+```
+
+All ops execute under a single SQLite SAVEPOINT. If any op fails the entire batch rolls back — YAML files are not written and the registry is not changed. All ops in one batch must target the same table.
+
+### dry_run preview
+
+All four schema tools accept `dry_run: true`. In dry-run mode the tool computes and returns affect counts (`rows`, `fields_added`, `fields_removed`) without writing to any YAML file, SQLite table, or backup directory.
+
+### Backup retention
+
+Backup files accumulate in `<scope_dir>/_backup/`. The server automatically deletes the oldest copies beyond the retention limit (default 10 pairs per table). Override the limit with `MINI_APP_BACKUP_RETENTION`.
 
 ### Ignoring dump files in git
 

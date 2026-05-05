@@ -1,10 +1,11 @@
 /// MCP server implementation for mini-app-mcp.
 ///
-/// Exposes 7 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
-/// `reload`) and resources (`schema://yaml`, `schema://json`,
-/// `schema://json-schema`, `docs://readme`, `docs://tools`, `docs://errors`)
-/// as MCP capabilities over stdio transport.  No HTTP / REST / CLI-CRUD entry
-/// points are provided (Crux "MCP-only entry point" constraint).
+/// Exposes 10 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
+/// `reload`, `schema_create`, `schema_update`, `schema_delete`) and resources
+/// (`schema://yaml`, `schema://json`, `schema://json-schema`, `docs://readme`,
+/// `docs://tools`, `docs://errors`) as MCP capabilities over stdio transport.
+/// No HTTP / REST / CLI-CRUD entry points are provided (Crux "MCP-only entry
+/// point" constraint).
 ///
 /// # Multi-table mode
 ///
@@ -42,6 +43,9 @@ use crate::config::Config;
 use crate::error::MiniAppError;
 use crate::mcp::registry::TableRegistry;
 use crate::mcp::resources as res;
+use crate::mcp::schema_tools::{
+    self, SchemaBatchParams, SchemaCreateParams, SchemaDeleteParams, SchemaUpdateParams,
+};
 use crate::schema::SchemaConfig;
 use crate::store::Store;
 
@@ -174,6 +178,7 @@ impl MiniAppMcpServer {
             db_path: None,
             user_dir: None,
             project_dir: None,
+            backup_retention: None,
         });
         Self {
             tool_router: Self::tool_router(),
@@ -820,57 +825,23 @@ impl MiniAppMcpServer {
             )));
         }
 
-        // Run the synchronous std::fs I/O inside a blocking thread pool so we
-        // do not stall the async runtime workers (K-110 constraint).
-        let new_registry = tokio::task::spawn_blocking(move || {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut registry = TableRegistry::mount_from_dirs(
-                    config.user_dir.as_deref(),
-                    config.project_dir.as_deref(),
-                )
-                .await
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "reload: mount_from_dirs failed");
-                    e
-                })?;
-
-                if config.has_legacy_env() {
-                    let schema_path = config.schema_path.as_ref().ok_or_else(|| {
-                        MiniAppError::Config(
-                            "MINI_APP_SCHEMA required when has_legacy_env is true".into(),
-                        )
-                    })?;
-                    let db_path = config.db_path.as_ref().ok_or_else(|| {
-                        MiniAppError::Config(
-                            "MINI_APP_DB required when has_legacy_env is true".into(),
-                        )
-                    })?;
-                    registry = TableRegistry::mount_legacy_into(registry, schema_path, db_path)
-                        .await
-                        .map_err(|e| {
-                            tracing::warn!(error = %e, "reload: mount_legacy_into failed");
-                            e
-                        })?;
-                }
-
-                Ok::<TableRegistry, MiniAppError>(registry)
-            })
-        })
-        .await
-        .map_err(|e| {
-            let msg = format!("reload: blocking task panicked: {e}");
-            tracing::error!(%msg);
-            McpError::from(MiniAppError::Schema(msg))
-        })?
-        .map_err(|e: MiniAppError| McpError::from(e))?;
-
-        // Capture old registry for diff computation before swapping.
+        // Capture old registry for diff computation before the swap.
         let old_registry = self.tables.load_full();
+
+        // Rebuild the registry via the shared helper.  This handles the
+        // spawn_blocking + block_on + ArcSwap.store() sequence (design Y1).
+        schema_tools::rebuild_registry(&config, &self.tables)
+            .await
+            .map_err(|e| {
+                let msg = format!("reload: {e}");
+                tracing::error!(%msg);
+                McpError::from(e)
+            })?;
+
+        // Compute diff against the new registry snapshot.
+        let new_registry = self.tables.load_full();
         let (mut added, mut removed) = registry_diff(&old_registry, &new_registry);
         let mounted = new_registry.table_count();
-
-        // Atomic swap — last-write-wins when concurrent reloads race.
-        self.tables.store(Arc::new(new_registry));
 
         // Sort for deterministic output.
         added.sort();
@@ -890,6 +861,183 @@ impl MiniAppMcpServer {
         };
         serde_json::to_string(&result)
             .map_err(|e| McpError::from(MiniAppError::Schema(e.to_string())))
+    }
+
+    /// Create a new schema (schema.yaml + DB directory) in the given scope.
+    ///
+    /// Writes `{scope_root}/{table}/schema.yaml` via atomic tmp+rename and
+    /// opens (creates) the backing SQLite database.  The registry is rebuilt
+    /// atomically via ArcSwap after a successful write.
+    ///
+    /// # scope
+    /// `"project"` → `MINI_APP_PROJECT_DIR` (default `./.mini-app/`).
+    /// `"user"` → `MINI_APP_USER_DIR` (default `~/.mini-app/`).
+    ///
+    /// # dry_run
+    /// When `dry_run=true`, checks whether the schema path is absent and returns
+    /// an `affects` object without writing any file or modifying the registry.
+    ///
+    /// # Backup
+    /// No backup is written for `schema_create` (no prior YAML to back up).
+    ///
+    /// Returns `SCHEMA_EXISTS` (`data.code`) if the schema already exists.
+    #[tool(
+        name = "schema_create",
+        description = "Create a new table schema (schema.yaml + DB) in the given scope. \
+                       scope: 'project' (MINI_APP_PROJECT_DIR) or 'user' (MINI_APP_USER_DIR). \
+                       fields: list of {name, type, required} field definitions. \
+                       dry_run=true: verify path is absent and return affects without writing. \
+                       Returns SCHEMA_EXISTS (data.code) when schema already exists. \
+                       No automatic DDL migrations are applied — the DB is created empty. \
+                       Triggers an atomic registry rebuild after successful write.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn tool_schema_create(
+        &self,
+        Parameters(params): Parameters<SchemaCreateParams>,
+    ) -> Result<String, String> {
+        schema_tools::do_schema_create(&self.mount_config, &self.tables, params)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Overwrite an existing schema.yaml with new field definitions.
+    ///
+    /// Backs up the current YAML and DB to `{scope_root}/_backup/` before
+    /// writing.  Rebuilds the registry atomically.  **No DDL is applied** to
+    /// the existing SQLite table (Crux: no automatic DDL migration).
+    ///
+    /// # dry_run
+    /// When `dry_run=true`, computes the field diff (added / removed /
+    /// type-changed) and reports `rows_unchanged` without touching any file.
+    ///
+    /// # Backup retention
+    /// After a successful write, backup pairs beyond the retention limit
+    /// (`MINI_APP_BACKUP_RETENTION`, default 10) are purged.
+    ///
+    /// Returns `TABLE_NOT_FOUND` (`data.code`) when `table` is not mounted.
+    #[tool(
+        name = "schema_update",
+        description = "Overwrite an existing table schema with new field definitions. \
+                       scope: 'project' or 'user'. fields: full replacement field list. \
+                       dry_run=true: return field diff (fields_added/removed/type_changed) \
+                       without writing. \
+                       NO DDL is applied to the existing SQLite table — column structure \
+                       change is the operator's responsibility. \
+                       Backs up {table}.{ts}.yaml + {table}.{ts}.db to {scope_root}/_backup/ \
+                       before writing. Retention default: 10 pairs (MINI_APP_BACKUP_RETENTION). \
+                       Returns TABLE_NOT_FOUND (data.code) when table is not mounted.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn tool_schema_update(
+        &self,
+        Parameters(params): Parameters<SchemaUpdateParams>,
+    ) -> Result<String, String> {
+        schema_tools::do_schema_update(&self.mount_config, &self.tables, params)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove a schema.yaml and unmount the table from the registry.
+    ///
+    /// Backs up the YAML and DB pair to `{scope_root}/_backup/` before
+    /// removal.  **The DB file is NOT deleted** — the operator must remove
+    /// `{scope_root}/{table}/{table}.db` explicitly (Crux: no automatic DDL
+    /// migration).  Rebuilds the registry atomically after removal.
+    ///
+    /// # dry_run
+    /// When `dry_run=true`, counts orphaned rows and reports `would_remove_yaml`
+    /// without removing any file.
+    ///
+    /// Use `dry_run=true` first to preview the number of rows that will become
+    /// inaccessible after schema removal.
+    ///
+    /// Returns `TABLE_NOT_FOUND` (`data.code`) when `table` is not mounted.
+    #[tool(
+        name = "schema_delete",
+        description = "Remove a table schema (schema.yaml) and unmount it from the registry. \
+                       scope: 'project' or 'user'. \
+                       dry_run=true: return rows_orphaned + would_remove_yaml without deleting. \
+                       Use dry_run=true first — rows become inaccessible after deletion. \
+                       THE DB FILE IS NOT DELETED — remove {scope_root}/{table}/{table}.db \
+                       manually if needed (Crux: no automatic DDL migration). \
+                       Backs up {table}.{ts}.yaml + {table}.{ts}.db to {scope_root}/_backup/ \
+                       before removing. Retention default: 10 pairs (MINI_APP_BACKUP_RETENTION). \
+                       Returns TABLE_NOT_FOUND (data.code) when table is not mounted.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn tool_schema_delete(
+        &self,
+        Parameters(params): Parameters<SchemaDeleteParams>,
+    ) -> Result<String, String> {
+        schema_tools::do_schema_delete(&self.mount_config, &self.tables, params)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Execute a list of ops atomically under a single SQLite SAVEPOINT.
+    ///
+    /// All ops must target the **same table** (architecture constraint: SQLite
+    /// SAVEPOINT is per-connection and each table has its own connection).
+    /// A multi-table batch returns `VALIDATION_ERROR` without entering a SAVEPOINT.
+    ///
+    /// # Op types
+    /// - `query`: raw SQL executed inside SAVEPOINT (schema validation bypassed).
+    /// - `schema_create / schema_update / schema_delete`: YAML writes deferred
+    ///   until SAVEPOINT commit; no YAML change occurs on rollback.
+    ///
+    /// # Atomicity (Crux: schema_batch SAVEPOINT atomicity)
+    /// Any op failure rolls back all preceding ops, including schema mutations.
+    /// YAML is only written after SAVEPOINT commit succeeds.
+    ///
+    /// # dry_run (Crux: dry_run side-effect-free guarantee)
+    /// When `dry_run=true`, per-op affects are computed without any FS or DB writes.
+    ///
+    /// # No DDL migration (Crux: no automatic DDL migration)
+    /// `schema_update` / `schema_delete` inside a batch only rewrite the YAML and
+    /// rebuild the registry — no `ALTER TABLE` or `DROP TABLE` is ever issued.
+    #[tool(
+        name = "schema_batch",
+        description = "Execute ops[] atomically under a single SQLite SAVEPOINT. \
+                       All ops must target the same table (single-table constraint). \
+                       Op types: query (raw SQL inside SAVEPOINT — schema validation bypassed), \
+                       schema_create, schema_update, schema_delete (YAML writes deferred to commit). \
+                       On any op failure: SAVEPOINT rolled back, all preceding ops reverted, \
+                       YAML never written (all-or-nothing). \
+                       dry_run=true: compute affects per op without any FS or DB write. \
+                       No DDL migration: schema_update/delete only rewrites YAML + rebuilds registry. \
+                       Registry is rebuilt once at batch end (not per op). \
+                       Returns BATCH_ABORTED (data.code) with op_index on failure. \
+                       Returns VALIDATION_ERROR when ops[] target multiple tables.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn tool_schema_batch(
+        &self,
+        Parameters(params): Parameters<SchemaBatchParams>,
+    ) -> Result<String, String> {
+        schema_tools::execute_batch(&self.mount_config, &self.tables, params)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1022,19 +1170,29 @@ fields:\n\
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn list_tools_contains_all_seven() {
+    async fn list_tools_contains_all_eleven() {
         let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for expected in &[
-            "info", "create", "get", "list", "update", "delete", "reload",
+            "info",
+            "create",
+            "get",
+            "list",
+            "update",
+            "delete",
+            "reload",
+            "schema_create",
+            "schema_update",
+            "schema_delete",
+            "schema_batch",
         ] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(tools.len(), 7, "expected exactly 7 tools");
+        assert_eq!(tools.len(), 11, "expected exactly 11 tools");
     }
 
     #[tokio::test]
@@ -1488,6 +1646,7 @@ fields:\n\
             db_path: None,
             user_dir: None,
             project_dir: None,
+            backup_retention: None,
         });
         MiniAppMcpServer::new_multi(registry, config)
     }
@@ -1739,6 +1898,7 @@ fields:\n\
             db_path: None,
             user_dir: Some(user_dir.to_path_buf()),
             project_dir: None,
+            backup_retention: None,
         });
         let server = MiniAppMcpServer::new_multi(registry, Arc::clone(&config));
 

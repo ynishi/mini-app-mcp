@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`schema_create` MCP tool** (`mcp/schema_tools.rs`, `mcp/server.rs`) — creates a new `schema.yaml` under the specified scope (`project` or `user`) directory and atomically rebuilds the live table registry. Accepts the full schema definition (table name, fields) as a JSON argument. Returns the path where the schema was written. Fails with `SCHEMA_EXISTS` if a schema for that table name already exists. Supports `dry_run=true` to preview the operation without writing any files. Path-traversal characters in the table name are rejected up front.
+- **`schema_update` MCP tool** (`mcp/schema_tools.rs`, `mcp/server.rs`) — replaces an existing `schema.yaml` with a new definition (full overwrite). Backs up the previous YAML and a point-in-time SQLite snapshot to `<scope_root>/_backup/<table>.<unix_secs>.{yaml,db}` before writing. Rebuilds the table registry after the write. Supports `dry_run=true` (returns `{ fields_added, fields_removed }` without touching disk). Idempotent: calling twice with identical args produces the same observable state.
+- **`schema_delete` MCP tool** (`mcp/schema_tools.rs`, `mcp/server.rs`) — removes a table's `schema.yaml` by moving it to the `_backup/` directory and removes the table from the live registry. **Does not touch the SQLite database file** — altering or dropping the underlying table remains the operator's explicit responsibility (no automatic DDL migration). Supports `dry_run=true`. Marked `destructive_hint=true`.
+- **`schema_batch` MCP tool** (`mcp/schema_tools.rs`, `mcp/server.rs`) — executes an array of operations (`ops[]`) atomically under a single SQLite SAVEPOINT: any op failure rolls back all preceding ops including schema mutations, leaving YAML and DB in the exact state they were before the batch started. All ops must target the same table (cross-table batches are rejected with `VALIDATION` error). YAML writes within a batch are deferred; rename is applied only on SAVEPOINT commit, and tmp files are removed on rollback. Registry is rebuilt once after all ops succeed.
+- **Backup module** (`src/backup.rs`) — `write_yaml_backup` / `write_db_backup` functions that write point-in-time copies of a table's schema file and SQLite database to `<scope_root>/_backup/<table>.<unix_secs>.yaml` and `<table>.<unix_secs>.db`. A retention sweep runs immediately after each backup write and deletes the oldest copies beyond the configured limit (default 10, overridable via `MINI_APP_BACKUP_RETENTION`). Backup I/O runs inside `tokio::task::spawn_blocking`.
+- **New error variants** (`src/error.rs`) — `SchemaExists { table }` (code: `SCHEMA_EXISTS`), `Backup(String)` (code: `BACKUP_ERROR`), and `BatchAborted { op_index, reason }` (code: `BATCH_ABORTED`). All three carry structured fields through `From<MiniAppError> for McpError` so agents can handle them programmatically.
+
+### Fixed
+
+- **Path-traversal rejection in schema CRUD tools** (`mcp/schema_tools.rs`) — table names containing `/`, `\`, or `..` components are rejected with `MiniAppError::Validation` before any filesystem operation is attempted. This prevents a caller from escaping the configured scope directory by supplying a crafted table name.
+
 ## [0.4.0] - 2026-05-04
 
 ### Added
