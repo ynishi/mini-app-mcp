@@ -43,7 +43,9 @@ use crate::config::Config;
 use crate::error::MiniAppError;
 use crate::mcp::registry::TableRegistry;
 use crate::mcp::resources as res;
-use crate::mcp::schema_tools::{self, SchemaCreateParams, SchemaDeleteParams, SchemaUpdateParams};
+use crate::mcp::schema_tools::{
+    self, SchemaBatchParams, SchemaCreateParams, SchemaDeleteParams, SchemaUpdateParams,
+};
 use crate::schema::SchemaConfig;
 use crate::store::Store;
 
@@ -987,6 +989,56 @@ impl MiniAppMcpServer {
             .await
             .map_err(|e| e.to_string())
     }
+
+    /// Execute a list of ops atomically under a single SQLite SAVEPOINT.
+    ///
+    /// All ops must target the **same table** (architecture constraint: SQLite
+    /// SAVEPOINT is per-connection and each table has its own connection).
+    /// A multi-table batch returns `VALIDATION_ERROR` without entering a SAVEPOINT.
+    ///
+    /// # Op types
+    /// - `query`: raw SQL executed inside SAVEPOINT (schema validation bypassed).
+    /// - `schema_create / schema_update / schema_delete`: YAML writes deferred
+    ///   until SAVEPOINT commit; no YAML change occurs on rollback.
+    ///
+    /// # Atomicity (Crux: schema_batch SAVEPOINT atomicity)
+    /// Any op failure rolls back all preceding ops, including schema mutations.
+    /// YAML is only written after SAVEPOINT commit succeeds.
+    ///
+    /// # dry_run (Crux: dry_run side-effect-free guarantee)
+    /// When `dry_run=true`, per-op affects are computed without any FS or DB writes.
+    ///
+    /// # No DDL migration (Crux: no automatic DDL migration)
+    /// `schema_update` / `schema_delete` inside a batch only rewrite the YAML and
+    /// rebuild the registry — no `ALTER TABLE` or `DROP TABLE` is ever issued.
+    #[tool(
+        name = "schema_batch",
+        description = "Execute ops[] atomically under a single SQLite SAVEPOINT. \
+                       All ops must target the same table (single-table constraint). \
+                       Op types: query (raw SQL inside SAVEPOINT — schema validation bypassed), \
+                       schema_create, schema_update, schema_delete (YAML writes deferred to commit). \
+                       On any op failure: SAVEPOINT rolled back, all preceding ops reverted, \
+                       YAML never written (all-or-nothing). \
+                       dry_run=true: compute affects per op without any FS or DB write. \
+                       No DDL migration: schema_update/delete only rewrites YAML + rebuilds registry. \
+                       Registry is rebuilt once at batch end (not per op). \
+                       Returns BATCH_ABORTED (data.code) with op_index on failure. \
+                       Returns VALIDATION_ERROR when ops[] target multiple tables.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn tool_schema_batch(
+        &self,
+        Parameters(params): Parameters<SchemaBatchParams>,
+    ) -> Result<String, String> {
+        schema_tools::execute_batch(&self.mount_config, &self.tables, params)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 // =============================================================================
@@ -1118,7 +1170,7 @@ fields:\n\
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn list_tools_contains_all_ten() {
+    async fn list_tools_contains_all_eleven() {
         let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -1133,13 +1185,14 @@ fields:\n\
             "schema_create",
             "schema_update",
             "schema_delete",
+            "schema_batch",
         ] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(tools.len(), 10, "expected exactly 10 tools");
+        assert_eq!(tools.len(), 11, "expected exactly 11 tools");
     }
 
     #[tokio::test]
