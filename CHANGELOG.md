@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-05
+
 ### Added
 
 - **`data_snapshot` MCP tool** (`src/snapshot.rs`, `mcp/server.rs`) — creates per-table SQLite-only snapshot dumps via `rusqlite::Connection::backup` (hot backup API) to `<scope_root>/_snapshots/<table>.<unix_secs>.db`. Works in three modes: `table=Some` targets one table; `table=None + scope=Some` fan-outs over all mounted tables in the given scope; `table=None + scope=None` snapshots all mounted tables. Supports `dry_run=true` to return `{ affects: { target_tables, row_counts, would_purge_generations } }` with zero FS/DB writes guaranteed. Retention is controlled exclusively by `MINI_APP_SNAPSHOT_RETENTION` (default 10) and is strictly separate from the backup retention used by schema tools. Snapshot I/O runs inside `tokio::task::spawn_blocking` with a fresh `Connection::open` per snapshot so the source database remains open and writable throughout. Marked `read_only_hint=false`, `idempotent_hint=false` (successive calls produce distinct timestamped files), `destructive_hint=false` (purge is bounded by retention).
