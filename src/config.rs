@@ -69,6 +69,19 @@ pub struct Config {
     /// (must be a positive integer; non-parsable values are silently ignored
     /// and the default of `10` is used).
     pub backup_retention: Option<usize>,
+
+    /// Number of snapshot files (`{table}.{ts}.db`) to retain in `_snapshots/`
+    /// before the oldest are purged.
+    ///
+    /// Defaults to `10` when `MINI_APP_SNAPSHOT_RETENTION` is not set.
+    /// Set via the `MINI_APP_SNAPSHOT_RETENTION` environment variable
+    /// (must be a positive integer; non-parsable values are silently ignored
+    /// and the default of `10` is used).
+    ///
+    /// This field is intentionally separate from `backup_retention` to enforce
+    /// the snapshot retention isolation Crux constraint: snapshot and backup
+    /// lifecycles are managed independently.
+    pub snapshot_retention: Option<usize>,
 }
 
 impl Config {
@@ -87,6 +100,7 @@ impl Config {
     /// | `MINI_APP_USER_DIR` | Optional | User-scope table directory (default `~/.mini-app/`) |
     /// | `MINI_APP_PROJECT_DIR` | Optional | Project-scope table directory (default `./.mini-app/`) |
     /// | `MINI_APP_BACKUP_RETENTION` | Optional | Number of backup pairs to keep (default `10`) |
+    /// | `MINI_APP_SNAPSHOT_RETENTION` | Optional | Number of snapshot files to keep (default `10`) |
     ///
     /// At least one of the legacy pair (`MINI_APP_SCHEMA` + `MINI_APP_DB`) or
     /// a directory env must resolve to a usable table configuration. When
@@ -131,12 +145,19 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
 
+        // Snapshot retention: explicit env or default to None (caller uses 10).
+        // Intentionally separate from backup_retention (Crux: retention isolation).
+        let snapshot_retention = env::var("MINI_APP_SNAPSHOT_RETENTION")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+
         Ok(Config {
             schema_path,
             db_path,
             user_dir,
             project_dir,
             backup_retention,
+            snapshot_retention,
         })
     }
 
@@ -161,6 +182,26 @@ impl Config {
     /// would delete all backups on every write).
     pub fn backup_retention(&self) -> usize {
         self.backup_retention.unwrap_or(10)
+    }
+
+    /// Returns the number of snapshot files to keep per table.
+    ///
+    /// Uses the value of `snapshot_retention` when set, otherwise defaults to
+    /// `10`.  This default is documented in `MINI_APP_SNAPSHOT_RETENTION`.
+    ///
+    /// This getter is intentionally separate from [`backup_retention`] to
+    /// enforce snapshot retention isolation: snapshot and backup lifecycles are
+    /// managed via independent environment variables and independent retention
+    /// counters (Crux: snapshot retention isolation).
+    ///
+    /// # Returns
+    ///
+    /// The retention limit as a `usize`.  Always at least `1` (a value of `0`
+    /// would delete all snapshots on every write).
+    ///
+    /// [`backup_retention`]: Config::backup_retention
+    pub fn snapshot_retention(&self) -> usize {
+        self.snapshot_retention.unwrap_or(10)
     }
 }
 
@@ -416,7 +457,74 @@ mod tests {
             user_dir: None,
             project_dir: None,
             backup_retention: None,
+            snapshot_retention: None,
         };
         assert!(cfg.backup_retention() >= 1);
+    }
+
+    // T1: snapshot_retention defaults to 10 when env var is absent
+    #[test]
+    fn snapshot_retention_defaults_to_10() {
+        with_env(&[("MINI_APP_SNAPSHOT_RETENTION", None)], || {
+            let cfg = Config::load().expect("load must succeed");
+            assert_eq!(cfg.snapshot_retention(), 10);
+            assert_eq!(cfg.snapshot_retention, None);
+        });
+    }
+
+    // T1: snapshot_retention reads from env var when set
+    #[test]
+    fn snapshot_retention_reads_from_env() {
+        with_env(&[("MINI_APP_SNAPSHOT_RETENTION", Some("5"))], || {
+            let cfg = Config::load().expect("load must succeed");
+            assert_eq!(cfg.snapshot_retention, Some(5));
+            assert_eq!(cfg.snapshot_retention(), 5);
+        });
+    }
+
+    // T2: snapshot_retention with non-parsable env var falls back to None / default 10
+    #[test]
+    fn snapshot_retention_non_parsable_env_falls_back_to_default() {
+        with_env(
+            &[("MINI_APP_SNAPSHOT_RETENTION", Some("not-a-number"))],
+            || {
+                let cfg = Config::load().expect("load must succeed even with bad retention value");
+                assert_eq!(cfg.snapshot_retention, None);
+                assert_eq!(cfg.snapshot_retention(), 10);
+            },
+        );
+    }
+
+    // T3: snapshot_retention getter always returns value >= 1 even when field is None
+    #[test]
+    fn snapshot_retention_getter_never_zero() {
+        let cfg = Config {
+            schema_path: None,
+            db_path: None,
+            user_dir: None,
+            project_dir: None,
+            backup_retention: None,
+            snapshot_retention: None,
+        };
+        assert!(cfg.snapshot_retention() >= 1);
+    }
+
+    // T3: snapshot_retention and backup_retention are independent — setting one
+    // does not affect the other (retention isolation).
+    #[test]
+    fn snapshot_retention_independent_from_backup_retention() {
+        with_env(
+            &[
+                ("MINI_APP_BACKUP_RETENTION", Some("3")),
+                ("MINI_APP_SNAPSHOT_RETENTION", Some("7")),
+            ],
+            || {
+                let cfg = Config::load().expect("load must succeed");
+                assert_eq!(cfg.backup_retention(), 3);
+                assert_eq!(cfg.snapshot_retention(), 7);
+                // The two getters must return different values to confirm isolation.
+                assert_ne!(cfg.backup_retention(), cfg.snapshot_retention());
+            },
+        );
     }
 }

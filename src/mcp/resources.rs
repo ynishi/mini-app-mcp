@@ -11,7 +11,7 @@ use crate::schema::{FieldType, SchemaConfig};
 /// README.md embedded at compile time so it ships in the binary.
 pub const README: &str = include_str!("../../README.md");
 
-/// Hand-written cheat sheet listing all 7 tools with descriptions / shapes.
+/// Hand-written cheat sheet listing all 11 tools with descriptions / shapes.
 pub const TOOLS_DOC: &str = r#"# mini-app-mcp — Tools Reference
 
 ## `table` argument (all tools)
