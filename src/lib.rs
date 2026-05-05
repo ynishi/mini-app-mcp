@@ -49,3 +49,12 @@ pub mod dump;
 /// [`backup::purge_old_backups`] (retention-based cleanup). All I/O runs
 /// inside `tokio::task::spawn_blocking` (K-110).
 pub mod backup;
+
+/// Snapshot utilities for the `data_snapshot` MCP tool.
+///
+/// Provides [`snapshot::write_snapshot_db`] (SQLite-only online snapshot) and
+/// [`snapshot::purge_old_snapshots`] (retention-based cleanup). All I/O runs
+/// inside `tokio::task::spawn_blocking` (K-110). Retention is controlled
+/// exclusively by `MINI_APP_SNAPSHOT_RETENTION` (separate from backup
+/// retention).
+pub mod snapshot;

@@ -40,6 +40,7 @@ Supported types: `string`, `number`, `boolean`, `array`, `object`.
 | `MINI_APP_USER_DIR` | `~/.mini-app/` | Base directory for User-scope tables. Each subdirectory is treated as a table name and must contain `schema.yaml` and `<table>.db`. |
 | `MINI_APP_PROJECT_DIR` | `./.mini-app/` | Project-scope override directory. A table present here fully replaces the User-scope definition of the same name. |
 | `MINI_APP_BACKUP_RETENTION` | `10` | Maximum number of backup copies (YAML + DB snapshot pairs) to retain per table under `_backup/`. Older copies beyond this limit are deleted immediately after each backup write. |
+| `MINI_APP_SNAPSHOT_RETENTION` | `10` | Maximum number of snapshot generations to retain per table under `_snapshots/`. Strictly separate from `MINI_APP_BACKUP_RETENTION`; purges only `_snapshots/` files and never touches `_backup/`. |
 
 Tables are discovered at startup by scanning both directories. Project-scope definitions take precedence over User-scope definitions for the same table name.
 
@@ -71,10 +72,11 @@ All tools accept an optional `table` argument that selects the target table. In 
 | `schema_update` | Replace an existing table's `schema.yaml` with a new definition (full overwrite). Backs up the previous YAML and a SQLite snapshot to `_backup/` before writing. Pass `dry_run: true` to preview field changes without touching disk. |
 | `schema_delete` | Remove a table's `schema.yaml` (moved to `_backup/`) and unregister it from the live registry. **Does not alter or drop the SQLite table** — DDL changes remain the operator's responsibility. Pass `dry_run: true` to preview. |
 | `schema_batch` | Execute an array of `ops[]` atomically under a single SQLite SAVEPOINT. Any op failure rolls back all preceding ops, leaving YAML and DB untouched. All ops must target the same table. Returns per-op results or a `BATCH_ABORTED` error with the index of the failing op. |
+| `data_snapshot` | Create a point-in-time SQLite snapshot of one or all mounted tables using the SQLite hot backup API. Snapshots are written to `<scope_root>/_snapshots/<table>.<unix_secs>.db`. Pass `table` and/or `scope` to limit the target set; omit both to snapshot all mounted tables. Pass `dry_run: true` to preview the operation (target tables, row counts, would-purge count) without creating any files. Retention is controlled by `MINI_APP_SNAPSHOT_RETENTION` (default 10), independent of `MINI_APP_BACKUP_RETENTION`. |
 
 ## MCP resources
 
-In addition to the 11 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
+In addition to the 12 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
 
 | URI | MIME | Content |
 |---|---|---|
@@ -82,7 +84,7 @@ In addition to the 11 tools above, the server exposes 6 read-only **Resources** 
 | `schema://json` | `application/json` | Parsed `SchemaConfig` as JSON (same shape the `info` tool returns) |
 | `schema://json-schema` | `application/schema+json` | JSON Schema (draft-07) derived from the schema's fields. Use this to validate `data` arguments before calling `create` / `update` |
 | `docs://readme` | `text/markdown` | This README, compiled into the binary |
-| `docs://tools` | `text/markdown` | Cheat sheet of the 11 MCP tools and their input shapes |
+| `docs://tools` | `text/markdown` | Cheat sheet of the 12 MCP tools and their input shapes |
 | `docs://errors` | `text/markdown` | Reference table of error codes returned by the server |
 
 The `info` tool and `schema://json` resource return equivalent content but serve different purposes: `info` is a callable tool (good for one-off introspection in a conversation), while resources are URI-addressable and can be subscribed to or cached by the client.
@@ -220,6 +222,18 @@ All four schema tools accept `dry_run: true`. In dry-run mode the tool computes 
 ### Backup retention
 
 Backup files accumulate in `<scope_dir>/_backup/`. The server automatically deletes the oldest copies beyond the retention limit (default 10 pairs per table). Override the limit with `MINI_APP_BACKUP_RETENTION`.
+
+### Data snapshots
+
+`data_snapshot` creates a standalone SQLite snapshot of one or more mounted tables without touching any YAML file or altering the schema:
+
+```
+data_snapshot(table="notes", scope="project")
+data_snapshot()                       # snapshot all mounted tables
+data_snapshot(dry_run=true)           # preview without writing
+```
+
+Snapshots are written to `<scope_root>/_snapshots/<table>.<unix_secs>.db` using the SQLite hot backup API (`rusqlite::Connection::backup`), so the source database remains open and writable during the operation. The retention limit (default 10) is controlled independently via `MINI_APP_SNAPSHOT_RETENTION` and never interacts with `_backup/`.
 
 ### Ignoring dump files in git
 

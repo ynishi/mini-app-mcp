@@ -1191,6 +1191,7 @@ mod tests {
             user_dir,
             project_dir,
             backup_retention: Some(10),
+            snapshot_retention: None,
         }
     }
 

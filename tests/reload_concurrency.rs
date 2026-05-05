@@ -177,6 +177,7 @@ async fn test_spawn_blocking_in_reload_does_not_block_runtime() {
         user_dir: Some(user_dir.to_path_buf()),
         project_dir: None,
         backup_retention: None,
+        snapshot_retention: None,
     });
 
     let registry = TableRegistry::mount_from_dirs(Some(user_dir), None)
@@ -254,6 +255,7 @@ async fn test_arcswap_guard_drop_before_await_in_resolve_table() {
         user_dir: Some(user_dir.to_path_buf()),
         project_dir: None,
         backup_retention: None,
+        snapshot_retention: None,
     });
 
     let registry = TableRegistry::mount_from_dirs(Some(user_dir), None)
@@ -393,6 +395,7 @@ async fn test_arc_config_clone_send_across_tasks() {
         user_dir: Some(PathBuf::from("/fake/user")),
         project_dir: Some(PathBuf::from("/fake/project")),
         backup_retention: None,
+        snapshot_retention: None,
     });
 
     let tasks: Vec<_> = (0..4)
