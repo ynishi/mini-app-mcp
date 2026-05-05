@@ -1,7 +1,7 @@
 /// MCP server implementation for mini-app-mcp.
 ///
-/// Exposes 10 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
-/// `reload`, `schema_create`, `schema_update`, `schema_delete`) and resources
+/// Exposes 11 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
+/// `reload`, `schema_create`, `schema_update`, `schema_delete`, `data_snapshot`) and resources
 /// (`schema://yaml`, `schema://json`, `schema://json-schema`, `docs://readme`,
 /// `docs://tools`, `docs://errors`) as MCP capabilities over stdio transport.
 /// No HTTP / REST / CLI-CRUD entry points are provided (Crux "MCP-only entry
@@ -179,6 +179,7 @@ impl MiniAppMcpServer {
             user_dir: None,
             project_dir: None,
             backup_retention: None,
+            snapshot_retention: None,
         });
         Self {
             tool_router: Self::tool_router(),
@@ -359,7 +360,7 @@ impl MiniAppMcpServer {
         resources.push(
             RawResource::new(URI_DOCS_TOOLS, "Tools Reference")
                 .with_description(
-                    "Cheat sheet listing all 7 tools with descriptions and input shapes.",
+                    "Cheat sheet listing all 11 tools with descriptions and input shapes.",
                 )
                 .with_mime_type("text/markdown")
                 .no_annotation(),
@@ -444,7 +445,7 @@ impl ServerHandler for MiniAppMcpServer {
         info.server_info.description = Some(
             "Agent-First CRUD store backed by SQLite. \
              Supports multiple tables via User→Project schema chain. \
-             7 tools: info, create, get, list, update, delete, reload."
+             11 tools: info, create, get, list, update, delete, reload, schema_create, schema_update, schema_delete, data_snapshot."
                 .to_string(),
         );
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
@@ -478,6 +479,12 @@ impl ServerHandler for MiniAppMcpServer {
              - `update`: Replace the data of an existing row by id.\n\
              - `delete`: Delete a row by id.\n\
              - `reload`: Reload all schemas from configured directories.\n\
+             - `schema_create`: Create a new table schema and register it.\n\
+             - `schema_update`: Update an existing table schema.\n\
+             - `schema_delete`: Delete a table schema (DB file is preserved).\n\
+             - `schema_batch`: Batch schema operations with SAVEPOINT atomicity.\n\
+             - `data_snapshot`: Create per-table SQLite snapshot dumps in \
+             `_snapshots/`. Supports `table`, `scope`, and `dry_run` parameters.\n\
              \n\
              All schema tools accept an optional `table` argument. Specify the \
              table name when running in multi-table mode."
@@ -1647,6 +1654,7 @@ fields:\n\
             user_dir: None,
             project_dir: None,
             backup_retention: None,
+            snapshot_retention: None,
         });
         MiniAppMcpServer::new_multi(registry, config)
     }
@@ -1899,6 +1907,7 @@ fields:\n\
             user_dir: Some(user_dir.to_path_buf()),
             project_dir: None,
             backup_retention: None,
+            snapshot_retention: None,
         });
         let server = MiniAppMcpServer::new_multi(registry, Arc::clone(&config));
 

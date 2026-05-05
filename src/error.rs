@@ -42,6 +42,8 @@ pub mod codes {
     pub const BACKUP_ERROR: &str = "BACKUP_ERROR";
     /// Returned when `schema_batch` is aborted because one of its ops fails.
     pub const BATCH_ABORTED: &str = "BATCH_ABORTED";
+    /// Returned when a snapshot I/O or SQLite snapshot operation fails.
+    pub const SNAPSHOT_ERROR: &str = "SNAPSHOT_ERROR";
 }
 
 /// All errors that can arise inside mini-app-mcp.
@@ -66,6 +68,10 @@ pub mod codes {
 ///   `Storage` and `Io` variants).
 /// - `BatchAborted` — `schema_batch` was aborted because op `op_index`
 ///   failed with the given `reason`.
+/// - `Snapshot` — a snapshot I/O or SQLite snapshot operation failed.  The
+///   inner `String` unifies errors from both `rusqlite::Error` and `io::Error`
+///   origins (K-79: avoids multiple `#[from]` conflict with existing
+///   `Storage` and `Io` variants).
 #[derive(Error, Debug)]
 pub enum MiniAppError {
     /// Validation failed for a specific field.
@@ -141,6 +147,15 @@ pub enum MiniAppError {
     #[error("backup error: {0}")]
     Backup(String),
 
+    /// A snapshot I/O or SQLite snapshot operation failed.
+    ///
+    /// The inner `String` unifies error messages from both `rusqlite::Error`
+    /// and `std::io::Error` origins.  A dedicated string-tuple variant (rather
+    /// than `#[from]` conversions) is used to avoid conflict with the existing
+    /// `Storage` and `Io` variants (K-79).
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
+
     /// `schema_batch` was aborted because one of its ops failed.
     ///
     /// # Fields
@@ -171,6 +186,7 @@ impl MiniAppError {
             MiniAppError::TableRequired => codes::TABLE_REQUIRED,
             MiniAppError::SchemaExists { .. } => codes::SCHEMA_EXISTS,
             MiniAppError::Backup(_) => codes::BACKUP_ERROR,
+            MiniAppError::Snapshot(_) => codes::SNAPSHOT_ERROR,
             MiniAppError::BatchAborted { .. } => codes::BATCH_ABORTED,
         }
     }
@@ -372,6 +388,10 @@ mod tests {
                 MiniAppError::Backup("disk full".into()),
             ),
             (
+                codes::SNAPSHOT_ERROR,
+                MiniAppError::Snapshot("snapshot failed".into()),
+            ),
+            (
                 codes::BATCH_ABORTED,
                 MiniAppError::BatchAborted {
                     op_index: 2,
@@ -407,6 +427,7 @@ mod tests {
                 table: "tbl".into(),
             },
             MiniAppError::Backup("err".into()),
+            MiniAppError::Snapshot("err".into()),
             MiniAppError::BatchAborted {
                 op_index: 0,
                 reason: "reason".into(),
