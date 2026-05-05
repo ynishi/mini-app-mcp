@@ -342,6 +342,31 @@ impl Store {
         .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
     }
 
+    /// Count all rows in the table.
+    ///
+    /// Used by `schema_delete` in `dry_run` mode to report how many rows
+    /// would be orphaned when the schema is removed.
+    ///
+    /// # Returns
+    /// The total row count as `u64`.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::Schema`] — if the mutex is poisoned or the blocking
+    ///   task panics.
+    /// - [`MiniAppError::Storage`] — if the SQL query fails.
+    pub async fn row_count(&self) -> Result<u64, MiniAppError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64, MiniAppError> {
+            let conn = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))?;
+            Ok(count.max(0) as u64)
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
+    }
+
     /// Validate `value` and update the row identified by `id`.
     /// `updated_at` is refreshed; `created_at` is unchanged.
     ///

@@ -5,4 +5,5 @@ pub use server::{MiniAppMcpServer, ReloadResult, run};
 
 pub mod registry;
 pub(crate) mod resources;
+pub mod schema_tools;
 pub mod server;
