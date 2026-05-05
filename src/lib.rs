@@ -42,3 +42,10 @@ pub mod mcp;
 /// calls after successful CRUD operations.  Defined here — not in `store.rs` —
 /// so any future mini-app can reuse them directly (Crux #1 compliance).
 pub mod dump;
+
+/// Backup utilities for schema CRUD tools.
+///
+/// Provides [`backup::write_backup_pair`] (YAML + SQLite online backup) and
+/// [`backup::purge_old_backups`] (retention-based cleanup). All I/O runs
+/// inside `tokio::task::spawn_blocking` (K-110).
+pub mod backup;
