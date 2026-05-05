@@ -460,6 +460,62 @@ impl Store {
         Ok(record)
     }
 
+    /// Execute a closure under a SQLite SAVEPOINT for all-or-nothing semantics.
+    ///
+    /// The closure receives `&mut rusqlite::Savepoint<'_>` and may run arbitrary
+    /// SQL inside the SAVEPOINT.  On success, the SAVEPOINT is committed.  On
+    /// failure, the SAVEPOINT is rolled back automatically when it is dropped
+    /// (enforced via `set_drop_behavior(DropBehavior::Rollback)`).
+    ///
+    /// # Crux compliance
+    /// This method is the implementation backing `schema_batch`'s
+    /// `schema_batch SAVEPOINT atomicity` Crux constraint.  All ops inside a
+    /// batch share the same SAVEPOINT; any failure causes the SAVEPOINT to
+    /// roll back, leaving the DB unchanged.
+    ///
+    /// # Concurrency
+    /// The Mutex is acquired and the entire SAVEPOINT + ops execute inside a
+    /// single `tokio::task::spawn_blocking` closure.  `Savepoint<'_>` borrows
+    /// the `Connection`, so both must remain in the same closure scope — they
+    /// cannot straddle an `.await` point (K-103, K-110).
+    ///
+    /// # Cancel Safety
+    /// Not cancel-safe.  Once the `spawn_blocking` closure has started, the
+    /// SAVEPOINT runs to completion (commit or rollback) regardless of `Future`
+    /// cancellation.
+    ///
+    /// # Type Parameters
+    /// - `F`: closure `FnOnce(&mut rusqlite::Savepoint<'_>) -> Result<R, MiniAppError> + Send + 'static`.
+    /// - `R`: return value, must be `Send + 'static`.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::Schema`] — Mutex poisoned or blocking thread panicked.
+    /// - [`MiniAppError::Storage`] — rusqlite SAVEPOINT creation or commit failed.
+    /// - Any error returned by the closure `f`.
+    ///
+    /// # Panic
+    /// Does not panic.
+    pub async fn execute_under_savepoint<F, R>(&self, f: F) -> Result<R, MiniAppError>
+    where
+        F: FnOnce(&mut rusqlite::Savepoint<'_>) -> Result<R, MiniAppError> + Send + 'static,
+        R: Send + 'static,
+    {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<R, MiniAppError> {
+            let mut guard = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let mut sp = guard.savepoint()?;
+            // Ensure rollback on Drop so any early-return via `?` cleans up.
+            sp.set_drop_behavior(rusqlite::DropBehavior::Rollback);
+            let result = f(&mut sp)?;
+            sp.commit()?;
+            Ok(result)
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
+    }
+
     /// Delete the row identified by `id`.
     ///
     /// # Concurrency
@@ -898,6 +954,189 @@ mod tests {
         assert!(
             store.is_ok(),
             "Store::open must succeed even with bidirectional sync configured"
+        );
+    }
+
+    // --- SAVEPOINT / concurrency tests (ST3 additions) ---
+
+    /// Test that execute_under_savepoint rolls back all ops on failure.
+    /// Crux must_not_simplify 1: single SAVEPOINT, all-or-nothing semantics.
+    ///
+    /// Sequence: INSERT via SAVEPOINT → force error inside SAVEPOINT →
+    /// assert SAVEPOINT rolled back → DB row count = 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_savepoint_atomic_rollback_on_op_failure() {
+        let store = make_test_store().await;
+
+        // A closure that does one INSERT then returns an error.
+        let result: Result<(), MiniAppError> = store
+            .execute_under_savepoint(|sp| {
+                sp.execute(
+                    "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["sp-test-id", r#"{"title":"t"}"#, 1000_i64, 1000_i64],
+                )?;
+                // Force failure after the INSERT — SAVEPOINT must roll back.
+                Err(MiniAppError::Validation {
+                    field: "test".into(),
+                    reason: "forced rollback".into(),
+                })
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "execute_under_savepoint must propagate the closure error"
+        );
+        assert!(
+            matches!(result.unwrap_err(), MiniAppError::Validation { .. }),
+            "error variant must be preserved"
+        );
+
+        // After rollback: the row must not exist.
+        let rows = store.list(Some(1000), None).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "SAVEPOINT rollback must revert the INSERT (Crux: SAVEPOINT atomicity)"
+        );
+
+        // Verify the SAVEPOINT is gone and normal ops still work.
+        store
+            .create(serde_json::json!({"title": "after-rollback"}))
+            .await
+            .expect("store must be usable after SAVEPOINT rollback");
+        assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+    }
+
+    /// Test that execute_under_savepoint commits on success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_savepoint_commit_on_success() {
+        let store = make_test_store().await;
+
+        let result = store
+            .execute_under_savepoint(|sp| {
+                sp.execute(
+                    "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["sp-ok-id", r#"{"title":"committed"}"#, 1000_i64, 1000_i64],
+                )?;
+                Ok(42_u32)
+            })
+            .await;
+
+        assert_eq!(
+            result.unwrap(),
+            42_u32,
+            "successful SAVEPOINT must return value"
+        );
+
+        // The INSERT must be committed.
+        let rows = store.list(Some(10), None).await.unwrap();
+        assert_eq!(rows.len(), 1, "committed INSERT must persist");
+    }
+
+    /// Concurrency regression: 8 tasks × 100 creates on same Store,
+    /// total 800 rows expected, no deadlock or panic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_store_concurrent_create() {
+        let store = Arc::new(make_test_store().await);
+        let task_count = 8_usize;
+        let rows_per_task = 100_usize;
+
+        let handles: Vec<_> = (0..task_count)
+            .map(|task_id| {
+                let s = Arc::clone(&store);
+                tokio::spawn(async move {
+                    for i in 0..rows_per_task {
+                        s.create(serde_json::json!({"title": format!("task-{task_id}-row-{i}")}))
+                            .await
+                            .expect("concurrent create must succeed");
+                    }
+                })
+            })
+            .collect();
+
+        futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .for_each(|r| r.expect("task must not panic"));
+
+        let total = store.list(Some(1000), None).await.unwrap().len();
+        assert_eq!(
+            total,
+            task_count * rows_per_task,
+            "all {total} rows must be present; expected {}",
+            task_count * rows_per_task
+        );
+    }
+
+    /// Concurrency regression: 4 tasks × 50 same-id updates, no deadlock.
+    /// Final DB row must be one of the valid values; no Mutex poison.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_store_concurrent_update_same_id() {
+        let store = Arc::new(make_test_store().await);
+
+        // Insert the row to update.
+        let row = store
+            .create(serde_json::json!({"title": "initial"}))
+            .await
+            .unwrap();
+        let id = row.id.clone();
+
+        let task_count = 4_usize;
+        let updates_per_task = 50_usize;
+
+        let handles: Vec<_> = (0..task_count)
+            .map(|task_id| {
+                let s = Arc::clone(&store);
+                let row_id = id.clone();
+                tokio::spawn(async move {
+                    for i in 0..updates_per_task {
+                        s.update(
+                            &row_id,
+                            serde_json::json!({"title": format!("task-{task_id}-update-{i}")}),
+                        )
+                        .await
+                        .expect("concurrent update must succeed");
+                    }
+                })
+            })
+            .collect();
+
+        futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .for_each(|r| r.expect("task must not panic"));
+
+        // Final state: exactly 1 row, title is one of the last writes.
+        let rows = store.list(None, None).await.unwrap();
+        assert_eq!(rows.len(), 1, "update must not insert extra rows");
+        assert!(
+            rows[0].data["title"].is_string(),
+            "title must be a string after concurrent updates"
+        );
+    }
+
+    /// Concurrency: Mutex poison propagated as MiniAppError::Schema("mutex poisoned").
+    ///
+    /// Spawns a blocking task that acquires the Mutex and panics (poisoning it),
+    /// then asserts that the next store.get() call returns Schema("mutex poisoned").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_store_mutex_poison_propagated_as_error() {
+        let store = Arc::new(make_test_store().await);
+
+        // Poison the Mutex by panicking inside spawn_blocking while holding the lock.
+        let conn = store.conn.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _guard = conn.lock().unwrap(); // acquire lock
+            panic!("intentional poison"); // poison the Mutex
+        })
+        .await; // JoinError expected — ignore it
+
+        // The Mutex is now poisoned. Any Store operation must return Schema("mutex poisoned").
+        let err = store.get("any-id").await.unwrap_err();
+        assert!(
+            matches!(&err, MiniAppError::Schema(msg) if msg.contains("mutex poisoned")),
+            "expected Schema(\"mutex poisoned\"), got: {err:?}"
         );
     }
 
