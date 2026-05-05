@@ -11,7 +11,7 @@ use crate::schema::{FieldType, SchemaConfig};
 /// README.md embedded at compile time so it ships in the binary.
 pub const README: &str = include_str!("../../README.md");
 
-/// Hand-written cheat sheet listing all 11 tools with descriptions / shapes.
+/// Hand-written cheat sheet listing all 12 tools with descriptions / shapes.
 pub const TOOLS_DOC: &str = r#"# mini-app-mcp — Tools Reference
 
 ## `table` argument (all tools)
@@ -66,6 +66,17 @@ Re-scan `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and atomically replace the 
 - **Output**: `{ "mounted": N, "added": ["table1", ...], "removed": ["table2", ...] }`
 - **Limitations**: no file watcher (explicit invocation only); whole-registry replace (no per-table partial reload); no schema migration for existing rows.
 - Annotations: `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=false`
+
+## `data_snapshot`
+Create per-table SQLite snapshot dump(s) under `{scope_root}/_snapshots/`. Uses the rusqlite hot backup API so the source DB remains open and writable during the operation. Schema is not modified.
+- **Input**: `{ "table": "<name>" (optional), "scope": "project"|"user" (optional), "dry_run": true|false (optional) }`
+  - `table`: target a single table; omit to snapshot all tables in the given scope.
+  - `scope`: restrict to `"project"` (`MINI_APP_PROJECT_DIR`) or `"user"` (`MINI_APP_USER_DIR`); omit for all scopes.
+  - `dry_run=true`: return `affects` (target tables, row counts, would-purge counts) **without** any FS or DB write.
+- **Output (dry_run=false)**: `{ "snapshotted": [{"table": "...", "scope": "...", "snapshot_path": "...", "unix_secs": N}, ...], "purged": [{"table": "...", "generations_removed": N}, ...] }`
+- **Output (dry_run=true)**: `{ "dry_run": true, "affects": { "target_tables": [...], "row_counts": {"table": N}, "would_purge_generations": {"table": N} } }`
+- **Retention**: controlled by `MINI_APP_SNAPSHOT_RETENTION` (default 10); strictly separate from `MINI_APP_BACKUP_RETENTION`.
+- Annotations: `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=false`
 "#;
 
 /// Hand-written reference table of all error codes from `src/error.rs`.
@@ -88,6 +99,7 @@ All MCP errors carry a structured JSON `data` object with at minimum:
 | `CONFIG_ERROR` | 500 | Environment-variable or `.env` configuration is invalid (startup error). |
 | `TABLE_NOT_FOUND` | 404 | The specified `table` name is not mounted in the server. Also includes `"table": "<name>"` in `data`. |
 | `TABLE_REQUIRED` | 422 | Multi-table mode requires a `table` argument but it was omitted. |
+| `SNAPSHOT_ERROR` | 500 | SQLite snapshot creation or purge failed. |
 
 ## Validation Error Example
 ```json
@@ -280,11 +292,20 @@ mod tests {
             "CONFIG_ERROR",
             "TABLE_NOT_FOUND",
             "TABLE_REQUIRED",
+            "SNAPSHOT_ERROR",
         ] {
             assert!(
                 ERRORS_DOC.contains(code),
                 "ERRORS_DOC must contain code '{code}'"
             );
         }
+    }
+
+    #[test]
+    fn tools_doc_contains_data_snapshot() {
+        assert!(
+            TOOLS_DOC.contains("## `data_snapshot`"),
+            "TOOLS_DOC must contain section for 'data_snapshot'"
+        );
     }
 }

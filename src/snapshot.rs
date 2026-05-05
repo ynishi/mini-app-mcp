@@ -27,12 +27,19 @@
 /// (default `10`).  The `_backup/` directory and `MINI_APP_BACKUP_RETENTION` are
 /// never read, written, or purged by this module (Crux: snapshot retention
 /// isolation).
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use rusqlite::Connection;
+use schemars::JsonSchema;
+use serde::Deserialize;
 
+use crate::config::Config;
 use crate::error::MiniAppError;
+use crate::mcp::registry::TableRegistry;
 
 /// Creates a SQLite snapshot for a table using the hot backup API.
 ///
@@ -218,7 +225,7 @@ fn purge_old_snapshots_sync(
 /// - `filename`: the bare filename string to parse.
 /// - `table`: the expected table name prefix.
 /// - `ext`: the expected extension (without leading dot), e.g. `"db"`.
-fn parse_snapshot_timestamp(filename: &str, table: &str, ext: &str) -> Option<u64> {
+pub(crate) fn parse_snapshot_timestamp(filename: &str, table: &str, ext: &str) -> Option<u64> {
     // Expected format: "{table}.{ts}.{ext}"
     let prefix = format!("{}.", table);
     let suffix = format!(".{}", ext);
@@ -226,6 +233,385 @@ fn parse_snapshot_timestamp(filename: &str, table: &str, ext: &str) -> Option<u6
     let without_prefix = filename.strip_prefix(&prefix)?;
     let ts_str = without_prefix.strip_suffix(&suffix)?;
     ts_str.parse::<u64>().ok()
+}
+
+// =============================================================================
+// MCP tool: data_snapshot
+// =============================================================================
+
+/// Parameters for the `data_snapshot` MCP tool.
+///
+/// All fields are optional; `None` means "all" (tables / scopes).  The
+/// `dry_run` flag, when `true`, returns inspection metadata without touching
+/// any file or database state (Crux: dry_run zero-write guarantee).
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct DataSnapshotParams {
+    /// Target a single table by name.  When `None`, all mounted tables in the
+    /// given `scope` (or all scopes) are snapshotted.
+    pub table: Option<String>,
+    /// Restrict operation to `"project"` or `"user"` scope.  When `None`,
+    /// all scopes are considered.
+    pub scope: Option<String>,
+    /// When `true`, returns `affects` metadata (target tables, row counts,
+    /// would-purge counts) **without** creating, modifying, or deleting any
+    /// file or database state (Crux: dry_run zero-write guarantee).
+    pub dry_run: Option<bool>,
+}
+
+/// A single entry resolved for snapshotting.
+///
+/// Holds clones of the Arc pointers extracted from the registry so the
+/// ArcSwap Guard can be dropped before any `.await` (K-110 / no
+/// await-holding-lock).
+struct SnapshotTarget {
+    table_name: String,
+    scope_root: PathBuf,
+    db_path: PathBuf,
+    store: Arc<crate::store::Store>,
+}
+
+/// Executes the `data_snapshot` MCP tool.
+///
+/// Fan-out logic:
+/// - `table=Some + scope=Some` → 1 matching entry (scope-filtered).
+/// - `table=Some + scope=None` → 1 entry via `registry.resolve`.
+/// - `table=None + scope=Some("project")` → all entries whose `schema_path`
+///   starts with `config.project_dir`.
+/// - `table=None + scope=Some("user")` → same with `config.user_dir`.
+/// - `table=None + scope=None` → all mounted entries.
+///
+/// When `dry_run=true` (Crux: dry_run zero-write guarantee):
+/// - Returns `{ "dry_run": true, "affects": { "target_tables": [...],
+///   "row_counts": {...}, "would_purge_generations": {...} } }`.
+/// - **No file or database state is created, modified, or deleted.**
+///
+/// When `dry_run=false` (or omitted):
+/// - Calls [`write_snapshot_db`] then [`purge_old_snapshots`] per entry.
+/// - Returns `{ "snapshotted": [...], "purged": [...] }`.
+///
+/// # Arguments
+/// - `config`: server mount configuration (dirs + retention).
+/// - `tables`: the live `ArcSwap`-wrapped table registry.
+/// - `params`: tool parameters.
+///
+/// # Returns
+/// JSON string with operation results.
+///
+/// # Errors
+/// - [`MiniAppError::Snapshot`] if any snapshot or purge operation fails, or
+///   if the scope argument is unrecognised.
+pub async fn do_data_snapshot(
+    config: &Config,
+    tables: &Arc<ArcSwap<TableRegistry>>,
+    params: DataSnapshotParams,
+) -> Result<String, MiniAppError> {
+    let dry_run = params.dry_run.unwrap_or(false);
+
+    // Resolve the target entries from the registry.  The ArcSwap Guard is
+    // dropped immediately after the clone loop (no Guard across .await).
+    let targets: Vec<SnapshotTarget> = {
+        let registry = tables.load_full();
+        resolve_targets(
+            &registry,
+            config,
+            params.table.as_deref(),
+            params.scope.as_deref(),
+        )?
+    };
+
+    if dry_run {
+        // Crux: dry_run zero-write guarantee — read-only path only.
+        let mut target_tables: Vec<String> = targets.iter().map(|t| t.table_name.clone()).collect();
+        target_tables.sort();
+
+        let mut row_counts: HashMap<String, u64> = HashMap::new();
+        let mut would_purge: HashMap<String, usize> = HashMap::new();
+
+        for target in &targets {
+            // row_count uses Store::row_count() which is read-only (SELECT COUNT(*)).
+            let count = target.store.row_count().await.map_err(|e| {
+                MiniAppError::Snapshot(format!(
+                    "row_count failed for table '{}': {e}",
+                    target.table_name
+                ))
+            })?;
+            row_counts.insert(target.table_name.clone(), count);
+
+            // Compute would-purge count by scanning _snapshots/ read-only.
+            // No write occurs here (Crux: dry_run zero-write guarantee).
+            let purge_count = count_would_purge(
+                &target.scope_root,
+                &target.table_name,
+                config.snapshot_retention(),
+            );
+            would_purge.insert(target.table_name.clone(), purge_count);
+        }
+
+        let result = serde_json::json!({
+            "dry_run": true,
+            "affects": {
+                "target_tables": target_tables,
+                "row_counts": row_counts,
+                "would_purge_generations": would_purge,
+            }
+        });
+        return serde_json::to_string(&result)
+            .map_err(|e| MiniAppError::Snapshot(format!("json serialization error: {e}")));
+    }
+
+    // Real path: write snapshots and purge old generations.
+    let mut snapshotted: Vec<serde_json::Value> = Vec::new();
+    let mut purged: Vec<serde_json::Value> = Vec::new();
+
+    let retention = config.snapshot_retention();
+
+    for target in &targets {
+        // Write the snapshot using the hot backup API (Crux: rusqlite hot backup API).
+        write_snapshot_db(&target.scope_root, &target.table_name, &target.db_path).await?;
+
+        // Determine the timestamp of the snapshot just written (newest file).
+        let snapshot_path = newest_snapshot_path(&target.scope_root, &target.table_name);
+        let unix_secs = snapshot_path.as_ref().and_then(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| parse_snapshot_timestamp(n, &target.table_name, "db"))
+        });
+
+        let scope_label = scope_label_for(&target.scope_root, config);
+        snapshotted.push(serde_json::json!({
+            "table": target.table_name,
+            "scope": scope_label,
+            "snapshot_path": snapshot_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            "unix_secs": unix_secs,
+        }));
+
+        // Purge old generations (Crux: snapshot retention isolation — only
+        // calls config.snapshot_retention(), never backup_retention()).
+        let snapshot_dir = target.scope_root.join("_snapshots");
+        let before_count = count_snapshots_in_dir(&snapshot_dir, &target.table_name);
+        purge_old_snapshots(&target.scope_root, &target.table_name, retention).await?;
+        let after_count = count_snapshots_in_dir(&snapshot_dir, &target.table_name);
+        let removed = before_count.saturating_sub(after_count);
+
+        if removed > 0 {
+            purged.push(serde_json::json!({
+                "table": target.table_name,
+                "generations_removed": removed,
+            }));
+        }
+    }
+
+    let result = serde_json::json!({
+        "snapshotted": snapshotted,
+        "purged": purged,
+    });
+    serde_json::to_string(&result)
+        .map_err(|e| MiniAppError::Snapshot(format!("json serialization error: {e}")))
+}
+
+/// Resolves the list of snapshot targets from the registry according to
+/// `table` and `scope` filter parameters.
+///
+/// # Arguments
+/// - `registry`: the current table registry snapshot.
+/// - `config`: mount config (for scope dir resolution).
+/// - `table`: optional table name filter.
+/// - `scope`: optional scope string (`"project"` or `"user"`).
+///
+/// # Returns
+/// A `Vec<SnapshotTarget>` sorted by table name for deterministic output.
+///
+/// # Errors
+/// - [`MiniAppError::Snapshot`] if the scope is unrecognised or if a
+///   `schema_path` has no parent directory.
+/// - [`MiniAppError::TableNotFound`] / [`MiniAppError::TableRequired`] from
+///   `registry.resolve` when `table=Some`.
+fn resolve_targets(
+    registry: &TableRegistry,
+    config: &Config,
+    table: Option<&str>,
+    scope: Option<&str>,
+) -> Result<Vec<SnapshotTarget>, MiniAppError> {
+    let is_legacy = registry.default_table().is_some();
+
+    if let Some(table_name) = table {
+        // Single-table path: resolve via registry.
+        let entry = registry.resolve(Some(table_name))?;
+        let scope_root = derive_scope_root(&entry.schema_path, is_legacy)?;
+        let db_path = entry
+            .schema_path
+            .parent()
+            .ok_or_else(|| MiniAppError::Snapshot("schema_path has no parent dir".into()))?
+            .join(format!("{}.db", table_name));
+
+        // Verify scope filter if provided.
+        if let Some(scope_str) = scope {
+            let expected_dir = resolve_scope_dir(config, scope_str)?;
+            if let Some(expected) = expected_dir {
+                if !scope_root.starts_with(&expected) {
+                    return Ok(Vec::new()); // No match.
+                }
+            }
+        }
+
+        return Ok(vec![SnapshotTarget {
+            table_name: table_name.to_string(),
+            scope_root,
+            db_path,
+            store: Arc::clone(&entry.store),
+        }]);
+    }
+
+    // Multi-table path: iterate entries with optional scope filter.
+    let scope_filter: Option<PathBuf> = match scope {
+        Some(s) => resolve_scope_dir(config, s)?,
+        None => None,
+    };
+
+    let mut targets: Vec<SnapshotTarget> = registry
+        .entries()
+        .iter()
+        .filter_map(|(name, entry)| {
+            let scope_root = derive_scope_root(&entry.schema_path, is_legacy).ok()?;
+            // Apply scope filter if present.
+            if let Some(ref expected) = scope_filter {
+                if !scope_root.starts_with(expected) {
+                    return None;
+                }
+            }
+            let db_path = entry.schema_path.parent()?.join(format!("{}.db", name));
+            Some(SnapshotTarget {
+                table_name: name.clone(),
+                scope_root,
+                db_path,
+                store: Arc::clone(&entry.store),
+            })
+        })
+        .collect();
+
+    // Sort by table name for deterministic output (HashMap is unordered).
+    targets.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+    Ok(targets)
+}
+
+/// Derives the `scope_root` path from a `schema_path`.
+///
+/// In **multi-table mode** (`is_legacy = false`), `schema_path` follows
+/// `{scope_root}/{table}/schema.yaml`, so the scope root is 2 levels up.
+///
+/// In **legacy mode** (`is_legacy = true`), `schema_path` is an arbitrary
+/// path provided via `MINI_APP_SCHEMA`, so the scope root is 1 level up
+/// (same directory as the schema file).
+///
+/// # Errors
+/// - [`MiniAppError::Snapshot`] if a required parent directory cannot be
+///   determined.
+fn derive_scope_root(schema_path: &Path, is_legacy: bool) -> Result<PathBuf, MiniAppError> {
+    if is_legacy {
+        schema_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| MiniAppError::Snapshot("schema_path has no parent dir".into()))
+    } else {
+        schema_path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| MiniAppError::Snapshot("schema_path has no grandparent dir".into()))
+    }
+}
+
+/// Resolves the filesystem path for a scope string (`"project"` or `"user"`).
+///
+/// Returns `Ok(None)` if the corresponding directory is not configured.
+///
+/// # Errors
+/// - [`MiniAppError::Snapshot`] if `scope` is not `"project"` or `"user"`.
+fn resolve_scope_dir(config: &Config, scope: &str) -> Result<Option<PathBuf>, MiniAppError> {
+    match scope {
+        "project" => Ok(config.project_dir.as_deref().map(|p| p.to_path_buf())),
+        "user" => Ok(config.user_dir.as_deref().map(|p| p.to_path_buf())),
+        other => Err(MiniAppError::Snapshot(format!(
+            "unrecognised scope '{other}': expected 'project' or 'user'"
+        ))),
+    }
+}
+
+/// Returns a human-readable scope label (`"project"`, `"user"`, or `"unknown"`)
+/// by comparing `scope_root` against the configured dirs.
+fn scope_label_for(scope_root: &Path, config: &Config) -> &'static str {
+    if let Some(pd) = config.project_dir.as_deref() {
+        if scope_root.starts_with(pd) {
+            return "project";
+        }
+    }
+    if let Some(ud) = config.user_dir.as_deref() {
+        if scope_root.starts_with(ud) {
+            return "user";
+        }
+    }
+    "unknown"
+}
+
+/// Counts how many snapshot generations would be purged for a given table
+/// given the current retention setting.
+///
+/// Reads the `_snapshots/` directory but never writes, modifies, or deletes
+/// anything (Crux: dry_run zero-write guarantee).
+///
+/// Returns `0` if the `_snapshots/` directory does not exist.
+fn count_would_purge(scope_root: &Path, table: &str, retention: usize) -> usize {
+    let snapshot_dir = scope_root.join("_snapshots");
+    if !snapshot_dir.exists() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(&snapshot_dir) else {
+        return 0;
+    };
+    let count = entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name();
+            parse_snapshot_timestamp(&name.to_string_lossy(), table, "db").map(|_| ())
+        })
+        .count();
+    count.saturating_sub(retention)
+}
+
+/// Counts the number of `.db` snapshot files for `table` in `snapshot_dir`.
+fn count_snapshots_in_dir(snapshot_dir: &Path, table: &str) -> usize {
+    if !snapshot_dir.exists() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(snapshot_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name();
+            parse_snapshot_timestamp(&name.to_string_lossy(), table, "db").map(|_| ())
+        })
+        .count()
+}
+
+/// Returns the path of the newest snapshot file for `table` in `scope_root/_snapshots/`,
+/// or `None` if none exist.
+fn newest_snapshot_path(scope_root: &Path, table: &str) -> Option<PathBuf> {
+    let snapshot_dir = scope_root.join("_snapshots");
+    let entries = std::fs::read_dir(&snapshot_dir).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if let Some(ts) = parse_snapshot_timestamp(&name_str, table, "db") {
+            if best.as_ref().is_none_or(|(best_ts, _)| ts > *best_ts) {
+                best = Some((ts, entry.path()));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 /// Returns the sorted list of snapshot timestamps (descending) for a given
@@ -520,5 +906,143 @@ mod tests {
             );
         }
         // Whether timed out or not, no panic occurred — the test passes.
+    }
+
+    // ── Integration: do_data_snapshot dry_run zero-write guarantee ────────
+
+    /// T1/Crux2: dry_run=true returns affects metadata without creating any
+    /// file or database state.
+    ///
+    /// Verifies the Crux "dry_run zero-write guarantee": after calling
+    /// `do_data_snapshot` with `dry_run=true`, the `_snapshots/` directory
+    /// must not exist (it was not present before the call).
+    #[tokio::test]
+    async fn test_do_data_snapshot_dry_run_zero_write() {
+        use crate::config::Config;
+        use crate::mcp::registry::{TableEntry, TableRegistry};
+        use crate::schema::{FieldDef, FieldType, SchemaConfig};
+        use crate::store::Store;
+        use arc_swap::ArcSwap;
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().expect("temp dir");
+        let table_name = "items";
+
+        // Create multi-table layout: scope_root/{table}/schema.yaml
+        // scope_root = dir.path()
+        // table_dir  = dir.path()/{table}/
+        // schema_path = dir.path()/{table}/schema.yaml
+        // db_path     = dir.path()/{table}/{table}.db
+        let table_dir = dir.path().join(table_name);
+        std::fs::create_dir_all(&table_dir).expect("create table dir");
+
+        let schema_path = table_dir.join("schema.yaml");
+        std::fs::write(
+            &schema_path,
+            "table: items\nfields:\n  - name: title\n    type: string\n    required: true\n",
+        )
+        .expect("write schema.yaml");
+
+        let db_path = table_dir.join(format!("{}.db", table_name));
+        // SAFETY: Connection::open and execute_batch are safe in test context.
+        let conn = Connection::open(&db_path).expect("open test db");
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             CREATE TABLE IF NOT EXISTS rows (id TEXT PRIMARY KEY, data TEXT, created_at TEXT, updated_at TEXT);",
+        )
+        .expect("setup test db");
+        drop(conn);
+
+        // Build Store and TableRegistry in multi-table mode (default_table = None).
+        let schema = SchemaConfig {
+            table: table_name.to_string(),
+            fields: vec![FieldDef {
+                name: "title".to_string(),
+                ty: FieldType::String,
+                required: true,
+            }],
+            dump: None,
+        };
+        let store = Store::open(&db_path, schema.clone())
+            .await
+            .expect("open store");
+
+        let entry = TableEntry {
+            store: Arc::new(store),
+            schema: Arc::new(schema),
+            schema_path: Arc::new(schema_path),
+        };
+        let mut entries = HashMap::new();
+        entries.insert(table_name.to_string(), entry);
+        // Multi-table mode: default_table = None — scope_root is 2 levels up from schema.yaml
+        let registry = TableRegistry::from_entries(entries, None);
+        let tables: Arc<ArcSwap<TableRegistry>> = Arc::new(ArcSwap::from_pointee(registry));
+
+        // Config: project_dir points to scope_root (dir.path()).
+        let config = Config {
+            schema_path: None,
+            db_path: None,
+            user_dir: None,
+            project_dir: Some(dir.path().to_path_buf()),
+            backup_retention: None,
+            snapshot_retention: None,
+        };
+
+        // _snapshots/ must NOT exist before the dry_run call.
+        // In multi-table mode scope_root = dir.path(), so _snapshots is at dir.path()/_snapshots/.
+        let snapshots_dir = dir.path().join("_snapshots");
+        assert!(
+            !snapshots_dir.exists(),
+            "_snapshots must not exist before dry_run call"
+        );
+
+        let params = DataSnapshotParams {
+            table: None,
+            scope: None,
+            dry_run: Some(true),
+        };
+
+        let result = do_data_snapshot(&config, &tables, params)
+            .await
+            .expect("do_data_snapshot dry_run must succeed");
+
+        // _snapshots/ must STILL not exist — zero-write guarantee (Crux 2).
+        assert!(
+            !snapshots_dir.exists(),
+            "_snapshots must not be created by dry_run=true (Crux: zero-write guarantee)"
+        );
+
+        // Response must carry dry_run: true and affects.target_tables.
+        // SAFETY: serde_json::from_str is safe to unwrap in test context.
+        let json: serde_json::Value =
+            serde_json::from_str(&result).expect("result must be valid JSON");
+        assert_eq!(
+            json["dry_run"],
+            serde_json::Value::Bool(true),
+            "response must contain dry_run: true"
+        );
+        let target_tables = json["affects"]["target_tables"]
+            .as_array()
+            .expect("affects.target_tables must be an array");
+        assert_eq!(
+            target_tables.len(),
+            1,
+            "exactly one table should be in target_tables"
+        );
+        assert_eq!(
+            target_tables[0],
+            serde_json::Value::String(table_name.to_string()),
+            "target table must be 'items'"
+        );
+
+        // row_counts and would_purge_generations must be present.
+        assert!(
+            json["affects"]["row_counts"].is_object(),
+            "row_counts must be an object"
+        );
+        assert!(
+            json["affects"]["would_purge_generations"].is_object(),
+            "would_purge_generations must be an object"
+        );
     }
 }
