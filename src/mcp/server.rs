@@ -1,7 +1,8 @@
 /// MCP server implementation for mini-app-mcp.
 ///
-/// Exposes 11 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
-/// `reload`, `schema_create`, `schema_update`, `schema_delete`, `data_snapshot`) and resources
+/// Exposes 12 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
+/// `reload`, `schema_create`, `schema_update`, `schema_delete`, `schema_batch`,
+/// `data_snapshot`) and resources
 /// (`schema://yaml`, `schema://json`, `schema://json-schema`, `docs://readme`,
 /// `docs://tools`, `docs://errors`) as MCP capabilities over stdio transport.
 /// No HTTP / REST / CLI-CRUD entry points are provided (Crux "MCP-only entry
@@ -47,6 +48,7 @@ use crate::mcp::schema_tools::{
     self, SchemaBatchParams, SchemaCreateParams, SchemaDeleteParams, SchemaUpdateParams,
 };
 use crate::schema::SchemaConfig;
+use crate::snapshot::{self, DataSnapshotParams};
 use crate::store::Store;
 
 // =============================================================================
@@ -360,7 +362,7 @@ impl MiniAppMcpServer {
         resources.push(
             RawResource::new(URI_DOCS_TOOLS, "Tools Reference")
                 .with_description(
-                    "Cheat sheet listing all 11 tools with descriptions and input shapes.",
+                    "Cheat sheet listing all 12 tools with descriptions and input shapes.",
                 )
                 .with_mime_type("text/markdown")
                 .no_annotation(),
@@ -445,7 +447,8 @@ impl ServerHandler for MiniAppMcpServer {
         info.server_info.description = Some(
             "Agent-First CRUD store backed by SQLite. \
              Supports multiple tables via User→Project schema chain. \
-             11 tools: info, create, get, list, update, delete, reload, schema_create, schema_update, schema_delete, data_snapshot."
+             12 tools: info, create, get, list, update, delete, reload, \
+             schema_create, schema_update, schema_delete, schema_batch, data_snapshot."
                 .to_string(),
         );
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
@@ -1046,6 +1049,58 @@ impl MiniAppMcpServer {
             .await
             .map_err(|e| e.to_string())
     }
+
+    /// Create per-table SQLite snapshot dumps in `{scope_root}/_snapshots/`.
+    ///
+    /// Uses `rusqlite::Connection::backup` (hot backup API) with a fresh
+    /// source connection — the source DB remains open and writable during the
+    /// snapshot (Crux: rusqlite hot backup API).
+    ///
+    /// Snapshot retention is controlled exclusively by `MINI_APP_SNAPSHOT_RETENTION`
+    /// (Crux: snapshot retention isolation); the `_backup/` directory and
+    /// `MINI_APP_BACKUP_RETENTION` are never touched.
+    ///
+    /// # dry_run
+    /// When `dry_run=true`, returns `affects` metadata (target tables, row
+    /// counts, would-purge counts) **without** creating, modifying, or
+    /// deleting any file or database state (Crux: dry_run zero-write
+    /// guarantee).
+    ///
+    /// # scope
+    /// `"project"` → tables mounted from `MINI_APP_PROJECT_DIR`.
+    /// `"user"` → tables mounted from `MINI_APP_USER_DIR`.
+    /// Omit to snapshot all mounted tables.
+    ///
+    /// # table
+    /// Name of a single table to snapshot.  Omit to snapshot all tables in
+    /// the given scope.
+    #[tool(
+        name = "data_snapshot",
+        description = "Create per-table SQLite snapshot dump(s) under {scope_root}/_snapshots/. \
+                       Schema is not modified. Snapshots use the rusqlite hot backup API so the \
+                       source DB stays open and writable during the operation. \
+                       scope: 'project' (MINI_APP_PROJECT_DIR) or 'user' (MINI_APP_USER_DIR); \
+                       omit to snapshot all mounted tables. \
+                       table: name of a single table to snapshot; omit for all tables in scope. \
+                       dry_run=true: return affects (target_tables, row_counts, \
+                       would_purge_generations) without any FS or DB write. \
+                       Retention controlled by MINI_APP_SNAPSHOT_RETENTION (default 10), \
+                       strictly separate from MINI_APP_BACKUP_RETENTION.",
+        annotations(
+            read_only_hint = false,
+            idempotent_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub async fn tool_data_snapshot(
+        &self,
+        Parameters(params): Parameters<DataSnapshotParams>,
+    ) -> Result<String, String> {
+        snapshot::do_data_snapshot(&self.mount_config, &self.tables, params)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 // =============================================================================
@@ -1172,12 +1227,12 @@ fields:\n\
     }
 
     // ---------------------------------------------------------------------------
-    // T1: list_tools — all 7 tools present with correct annotations.
+    // T1: list_tools — all 12 tools present with correct annotations.
     // Access via server.tool_router.list_all() to avoid RequestContext.
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn list_tools_contains_all_eleven() {
+    async fn list_tools_contains_all_twelve() {
         let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -1193,13 +1248,14 @@ fields:\n\
             "schema_update",
             "schema_delete",
             "schema_batch",
+            "data_snapshot",
         ] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(tools.len(), 11, "expected exactly 11 tools");
+        assert_eq!(tools.len(), 12, "expected exactly 12 tools");
     }
 
     #[tokio::test]
