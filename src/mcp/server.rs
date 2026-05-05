@@ -174,6 +174,7 @@ impl MiniAppMcpServer {
             db_path: None,
             user_dir: None,
             project_dir: None,
+            backup_retention: None,
         });
         Self {
             tool_router: Self::tool_router(),
@@ -1488,6 +1489,7 @@ fields:\n\
             db_path: None,
             user_dir: None,
             project_dir: None,
+            backup_retention: None,
         });
         MiniAppMcpServer::new_multi(registry, config)
     }
@@ -1739,6 +1741,7 @@ fields:\n\
             db_path: None,
             user_dir: Some(user_dir.to_path_buf()),
             project_dir: None,
+            backup_retention: None,
         });
         let server = MiniAppMcpServer::new_multi(registry, Arc::clone(&config));
 

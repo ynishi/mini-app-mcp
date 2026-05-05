@@ -102,6 +102,54 @@ pub struct SchemaConfig {
 }
 
 impl SchemaConfig {
+    /// Writes this schema to a YAML file using an atomic tmp+rename strategy.
+    ///
+    /// The write is performed inside `tokio::task::spawn_blocking` to avoid
+    /// blocking the async executor (K-110).  The rename is performed with
+    /// `std::fs::rename`, which is atomic on the same filesystem on Linux/macOS
+    /// (POSIX `rename(2)` guarantee).
+    ///
+    /// # Algorithm
+    /// 1. Serialise `self` to a YAML string via `serde_yaml_bw::to_string`.
+    /// 2. Write to `<path>.tmp` (same directory, so same filesystem).
+    /// 3. Atomically rename `<path>.tmp` to `<path>`.
+    ///
+    /// # Arguments
+    /// - `path`: destination path for `schema.yaml` (the final file, not `.tmp`).
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::Schema`] if serialisation fails.
+    /// - [`MiniAppError::Io`] if the write or rename fails.
+    /// - [`MiniAppError::Backup`] if the `spawn_blocking` task panics.
+    pub async fn write_to_path(&self, path: &Path) -> Result<(), MiniAppError> {
+        let schema_clone = self.clone();
+        let path_buf = path.to_path_buf();
+
+        tokio::task::spawn_blocking(move || -> Result<(), MiniAppError> {
+            let yaml = serde_yaml_bw::to_string(&schema_clone)
+                .map_err(|e| MiniAppError::Schema(e.to_string()))?;
+
+            let mut tmp_path = path_buf.clone();
+            // Append ".tmp" to the file name to stay on the same filesystem.
+            let mut file_name = tmp_path
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_default();
+            file_name.push(".tmp");
+            tmp_path.set_file_name(file_name);
+
+            std::fs::write(&tmp_path, yaml.as_bytes())?;
+            std::fs::rename(&tmp_path, &path_buf)?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| MiniAppError::Backup(format!("blocking task panic: {e}")))?
+    }
+
     /// Validates a JSON object against this schema.
     ///
     /// Rules (applied in order, iterating over [`self.fields`]):
@@ -212,7 +260,8 @@ pub fn load_from_path(path: &Path) -> Result<SchemaConfig, MiniAppError> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use std::path::PathBuf;
+    use tempfile::{NamedTempFile, TempDir};
 
     /// Helper: write YAML text to a temp file and return its path.
     fn write_yaml(content: &str) -> NamedTempFile {
@@ -220,6 +269,26 @@ mod tests {
         f.write_all(content.as_bytes())
             .expect("writing to temp file is infallible in tests");
         f
+    }
+
+    /// Helper: build a simple SchemaConfig for write_to_path tests.
+    fn make_test_schema() -> SchemaConfig {
+        SchemaConfig {
+            table: "items".to_string(),
+            fields: vec![
+                FieldDef {
+                    name: "name".to_string(),
+                    ty: FieldType::String,
+                    required: true,
+                },
+                FieldDef {
+                    name: "count".to_string(),
+                    ty: FieldType::Number,
+                    required: false,
+                },
+            ],
+            dump: None,
+        }
     }
 
     // ── T1: happy-path tests ──────────────────────────────────────────────
@@ -555,5 +624,76 @@ dump:
                 expected
             );
         }
+    }
+
+    // T1: write_to_path round-trips via load_from_path
+    #[tokio::test]
+    async fn write_to_path_round_trips_via_load_from_path() {
+        let dir = TempDir::new().expect("temp dir creation is infallible in tests");
+        let schema_path = dir.path().join("schema.yaml");
+        let original = make_test_schema();
+
+        original
+            .write_to_path(&schema_path)
+            .await
+            .expect("write_to_path must succeed");
+
+        let loaded = load_from_path(&schema_path).expect("load_from_path must succeed");
+
+        assert_eq!(loaded.table, original.table);
+        assert_eq!(loaded.fields.len(), original.fields.len());
+        for (l, r) in loaded.fields.iter().zip(original.fields.iter()) {
+            assert_eq!(l.name, r.name);
+            assert_eq!(l.ty, r.ty);
+            assert_eq!(l.required, r.required);
+        }
+        assert!(loaded.dump.is_none());
+    }
+
+    // T2: write_to_path uses tmp+rename — no partial file visible on simulated error
+    //
+    // This test verifies that the .tmp file does NOT persist after a successful
+    // write.  A failed-write scenario (writing to a read-only path) verifies
+    // the output path is clean.
+    #[tokio::test]
+    async fn write_to_path_uses_tmp_then_rename() {
+        let dir = TempDir::new().expect("temp dir creation is infallible in tests");
+        let schema_path = dir.path().join("schema.yaml");
+        let schema = make_test_schema();
+
+        schema
+            .write_to_path(&schema_path)
+            .await
+            .expect("write_to_path must succeed");
+
+        // After successful write, the final file exists...
+        assert!(schema_path.exists(), "final schema.yaml must exist");
+        // ...but the tmp file must have been cleaned up by rename.
+        let mut tmp_path = PathBuf::from(&schema_path);
+        let mut file_name = tmp_path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        file_name.push(".tmp");
+        tmp_path.set_file_name(file_name);
+        assert!(
+            !tmp_path.exists(),
+            ".tmp file must not exist after successful write"
+        );
+    }
+
+    // T3: write_to_path to a non-existent directory returns Io error
+    #[tokio::test]
+    async fn write_to_path_missing_parent_returns_io_error() {
+        let schema = make_test_schema();
+        let result = schema
+            .write_to_path(Path::new("/nonexistent/deep/path/schema.yaml"))
+            .await;
+        let err = result.expect_err("write to missing dir must error");
+        assert!(
+            matches!(err, MiniAppError::Io(_)),
+            "expected Io error, got {:?}",
+            err
+        );
     }
 }

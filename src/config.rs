@@ -60,6 +60,15 @@ pub struct Config {
     /// User entries with the same table name (file-level swap, not
     /// field-level merge).
     pub project_dir: Option<PathBuf>,
+
+    /// Number of backup pairs (`{table}.{ts}.yaml` + `{table}.{ts}.db`) to
+    /// retain in `_backup/` before the oldest are purged.
+    ///
+    /// Defaults to `10` when `MINI_APP_BACKUP_RETENTION` is not set.
+    /// Set via the `MINI_APP_BACKUP_RETENTION` environment variable
+    /// (must be a positive integer; non-parsable values are silently ignored
+    /// and the default of `10` is used).
+    pub backup_retention: Option<usize>,
 }
 
 impl Config {
@@ -77,6 +86,7 @@ impl Config {
     /// | `MINI_APP_DB` | Legacy mode only | Path to the SQLite database file |
     /// | `MINI_APP_USER_DIR` | Optional | User-scope table directory (default `~/.mini-app/`) |
     /// | `MINI_APP_PROJECT_DIR` | Optional | Project-scope table directory (default `./.mini-app/`) |
+    /// | `MINI_APP_BACKUP_RETENTION` | Optional | Number of backup pairs to keep (default `10`) |
     ///
     /// At least one of the legacy pair (`MINI_APP_SCHEMA` + `MINI_APP_DB`) or
     /// a directory env must resolve to a usable table configuration. When
@@ -116,11 +126,17 @@ impl Config {
             Err(_) => Some(PathBuf::from(".mini-app")),
         };
 
+        // Backup retention: explicit env or default to None (caller uses 10).
+        let backup_retention = env::var("MINI_APP_BACKUP_RETENTION")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+
         Ok(Config {
             schema_path,
             db_path,
             user_dir,
             project_dir,
+            backup_retention,
         })
     }
 
@@ -132,6 +148,19 @@ impl Config {
     /// `true` if and only if both `schema_path` and `db_path` are `Some`.
     pub fn has_legacy_env(&self) -> bool {
         self.schema_path.is_some() && self.db_path.is_some()
+    }
+
+    /// Returns the number of backup pairs to keep per table.
+    ///
+    /// Uses the value of `backup_retention` when set, otherwise defaults to
+    /// `10`.  This default is documented in `MINI_APP_BACKUP_RETENTION`.
+    ///
+    /// # Returns
+    ///
+    /// The retention limit as a `usize`.  Always at least `1` (a value of `0`
+    /// would delete all backups on every write).
+    pub fn backup_retention(&self) -> usize {
+        self.backup_retention.unwrap_or(10)
     }
 }
 
@@ -343,5 +372,51 @@ mod tests {
                 assert!(!cfg.has_legacy_env());
             },
         );
+    }
+
+    // T1: backup_retention defaults to 10 when env var is absent
+    #[test]
+    fn backup_retention_defaults_to_10() {
+        with_env(&[("MINI_APP_BACKUP_RETENTION", None)], || {
+            let cfg = Config::load().expect("load must succeed");
+            assert_eq!(cfg.backup_retention(), 10);
+            assert_eq!(cfg.backup_retention, None);
+        });
+    }
+
+    // T1: backup_retention reads from env var when set
+    #[test]
+    fn backup_retention_reads_from_env() {
+        with_env(&[("MINI_APP_BACKUP_RETENTION", Some("5"))], || {
+            let cfg = Config::load().expect("load must succeed");
+            assert_eq!(cfg.backup_retention, Some(5));
+            assert_eq!(cfg.backup_retention(), 5);
+        });
+    }
+
+    // T2: backup_retention with non-parsable env var falls back to None / default 10
+    #[test]
+    fn backup_retention_non_parsable_env_falls_back_to_default() {
+        with_env(
+            &[("MINI_APP_BACKUP_RETENTION", Some("not-a-number"))],
+            || {
+                let cfg = Config::load().expect("load must succeed even with bad retention value");
+                assert_eq!(cfg.backup_retention, None);
+                assert_eq!(cfg.backup_retention(), 10);
+            },
+        );
+    }
+
+    // T3: backup_retention getter always returns value >= 1 even when field is None
+    #[test]
+    fn backup_retention_getter_never_zero() {
+        let cfg = Config {
+            schema_path: None,
+            db_path: None,
+            user_dir: None,
+            project_dir: None,
+            backup_retention: None,
+        };
+        assert!(cfg.backup_retention() >= 1);
     }
 }

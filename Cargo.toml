@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_bw = "2.5.5"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 schemars = "1.2"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"

@@ -35,6 +35,13 @@ pub mod codes {
     /// This occurs in multi-table mode when more than one table is mounted and
     /// no default table is configured.
     pub const TABLE_REQUIRED: &str = "TABLE_REQUIRED";
+    /// Returned when a schema file already exists and `schema_create` would
+    /// overwrite it.
+    pub const SCHEMA_EXISTS: &str = "SCHEMA_EXISTS";
+    /// Returned when a backup I/O or SQLite backup operation fails.
+    pub const BACKUP_ERROR: &str = "BACKUP_ERROR";
+    /// Returned when `schema_batch` is aborted because one of its ops fails.
+    pub const BATCH_ABORTED: &str = "BATCH_ABORTED";
 }
 
 /// All errors that can arise inside mini-app-mcp.
@@ -51,6 +58,14 @@ pub mod codes {
 /// - `TableNotFound` — the requested table is not mounted in the registry.
 /// - `TableRequired` — multi-table mode requires a `table` argument that was
 ///   omitted.
+/// - `SchemaExists` — `schema_create` was called but the schema file already
+///   exists for the given table.
+/// - `Backup` — a backup I/O or SQLite backup operation failed.  The inner
+///   `String` unifies errors from both `rusqlite::Error` and `io::Error`
+///   origins (K-79: avoids multiple `#[from]` conflict with existing
+///   `Storage` and `Io` variants).
+/// - `BatchAborted` — `schema_batch` was aborted because op `op_index`
+///   failed with the given `reason`.
 #[derive(Error, Debug)]
 pub enum MiniAppError {
     /// Validation failed for a specific field.
@@ -106,6 +121,33 @@ pub enum MiniAppError {
     /// table is configured, but the caller omitted the `table` argument.
     #[error("table argument is required in multi-table mode")]
     TableRequired,
+
+    /// A schema file already exists for the given table.
+    ///
+    /// Returned by `schema_create` when calling it would overwrite an existing
+    /// `schema.yaml`.  Use `schema_update` to modify an existing schema.
+    ///
+    /// # Fields
+    /// - `table`: the table name whose schema already exists.
+    #[error("schema already exists: {table}")]
+    SchemaExists { table: String },
+
+    /// A backup I/O or SQLite backup operation failed.
+    ///
+    /// The inner `String` unifies error messages from both `rusqlite::Error`
+    /// and `std::io::Error` origins.  A dedicated string-tuple variant (rather
+    /// than `#[from]` conversions) is used to avoid conflict with the existing
+    /// `Storage` and `Io` variants (K-79).
+    #[error("backup error: {0}")]
+    Backup(String),
+
+    /// `schema_batch` was aborted because one of its ops failed.
+    ///
+    /// # Fields
+    /// - `op_index`: the zero-based index of the failing op inside `ops[]`.
+    /// - `reason`: human-readable description of why the op failed.
+    #[error("batch aborted at op #{op_index}: {reason}")]
+    BatchAborted { op_index: usize, reason: String },
 }
 
 impl MiniAppError {
@@ -127,6 +169,9 @@ impl MiniAppError {
             MiniAppError::Config(_) => codes::CONFIG_ERROR,
             MiniAppError::TableNotFound { .. } => codes::TABLE_NOT_FOUND,
             MiniAppError::TableRequired => codes::TABLE_REQUIRED,
+            MiniAppError::SchemaExists { .. } => codes::SCHEMA_EXISTS,
+            MiniAppError::Backup(_) => codes::BACKUP_ERROR,
+            MiniAppError::BatchAborted { .. } => codes::BATCH_ABORTED,
         }
     }
 }
@@ -168,6 +213,21 @@ impl From<MiniAppError> for McpError {
                     "code": code,
                     "message": message,
                     "table": table,
+                })
+            }
+            MiniAppError::SchemaExists { table } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "table": table,
+                })
+            }
+            MiniAppError::BatchAborted { op_index, reason } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "op_index": op_index,
+                    "reason": reason,
                 })
             }
             _ => {
@@ -301,6 +361,23 @@ mod tests {
                 MiniAppError::TableNotFound { table: "t".into() },
             ),
             (codes::TABLE_REQUIRED, MiniAppError::TableRequired),
+            (
+                codes::SCHEMA_EXISTS,
+                MiniAppError::SchemaExists {
+                    table: "my_table".into(),
+                },
+            ),
+            (
+                codes::BACKUP_ERROR,
+                MiniAppError::Backup("disk full".into()),
+            ),
+            (
+                codes::BATCH_ABORTED,
+                MiniAppError::BatchAborted {
+                    op_index: 2,
+                    reason: "schema not found".into(),
+                },
+            ),
         ];
         for (expected_code, err) in cases {
             assert_eq!(
@@ -326,6 +403,14 @@ mod tests {
             MiniAppError::Config("c".into()),
             MiniAppError::TableNotFound { table: "t".into() },
             MiniAppError::TableRequired,
+            MiniAppError::SchemaExists {
+                table: "tbl".into(),
+            },
+            MiniAppError::Backup("err".into()),
+            MiniAppError::BatchAborted {
+                op_index: 0,
+                reason: "reason".into(),
+            },
         ];
         for err in errs {
             let mcp: McpError = err.into();
@@ -333,6 +418,7 @@ mod tests {
                 mcp.data.is_some(),
                 "data field must be Some — plain-text-only errors violate Crux #3"
             );
+            // SAFETY: asserted is_some() above; unwrap is safe inside test.
             let data = mcp.data.unwrap();
             // Every structured error must carry a "code" key
             assert!(
@@ -340,5 +426,79 @@ mod tests {
                 "data.code must be present for Agent parsing"
             );
         }
+    }
+
+    // T1: SchemaExists variant produces structured data with table field
+    #[test]
+    fn schema_exists_error_has_structured_data() {
+        let err = MiniAppError::SchemaExists {
+            table: "orders".to_string(),
+        };
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for SchemaExists");
+        assert_eq!(data["code"], Value::String("SCHEMA_EXISTS".to_string()));
+        assert_eq!(data["table"], Value::String("orders".to_string()));
+        assert!(data["message"].is_string());
+    }
+
+    // T1: Backup variant produces structured data
+    #[test]
+    fn backup_error_has_structured_data() {
+        let err = MiniAppError::Backup("disk full while writing backup".to_string());
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for Backup");
+        assert_eq!(data["code"], Value::String("BACKUP_ERROR".to_string()));
+        assert!(data["message"].is_string());
+        // Backup uses the default arm: only code + message, no extra fields
+        assert!(data.get("table").is_none());
+    }
+
+    // T1: BatchAborted variant produces structured data with op_index and reason
+    #[test]
+    fn batch_aborted_error_has_structured_data() {
+        let err = MiniAppError::BatchAborted {
+            op_index: 3,
+            reason: "table not found".to_string(),
+        };
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for BatchAborted");
+        assert_eq!(data["code"], Value::String("BATCH_ABORTED".to_string()));
+        assert_eq!(data["op_index"], serde_json::json!(3_usize));
+        assert_eq!(data["reason"], Value::String("table not found".to_string()));
+        assert!(data["message"].is_string());
+    }
+
+    // T2: SchemaExists with empty table name still produces valid structured error
+    #[test]
+    fn schema_exists_empty_table_name() {
+        let err = MiniAppError::SchemaExists {
+            table: String::new(),
+        };
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some");
+        assert_eq!(data["code"], "SCHEMA_EXISTS");
+        assert!(data.get("table").is_some());
+    }
+
+    // T2: BatchAborted at op_index 0 (first op fails)
+    #[test]
+    fn batch_aborted_at_first_op() {
+        let err = MiniAppError::BatchAborted {
+            op_index: 0,
+            reason: "validation failed".to_string(),
+        };
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some");
+        assert_eq!(data["code"], "BATCH_ABORTED");
+        assert_eq!(data["op_index"], serde_json::json!(0_usize));
+    }
+
+    // T3: Backup error code is BACKUP_ERROR (not STORAGE_ERROR or IO_ERROR)
+    #[test]
+    fn backup_error_code_is_not_storage_or_io() {
+        let err = MiniAppError::Backup("some rusqlite error".to_string());
+        assert_eq!(err.code(), codes::BACKUP_ERROR);
+        assert_ne!(err.code(), codes::STORAGE_ERROR);
+        assert_ne!(err.code(), codes::IO_ERROR);
     }
 }
