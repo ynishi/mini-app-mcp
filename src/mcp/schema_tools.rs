@@ -44,6 +44,49 @@ use crate::store::Store;
 // Scope resolution helper
 // =============================================================================
 
+/// Validate a table name supplied via MCP tool input.
+///
+/// Rejects values that would escape the scope_root via path traversal,
+/// reference an absolute path, or contain platform-specific path separators
+/// or control characters.  Allowed character set: ASCII alphanumeric, `_`,
+/// `-`.  Empty / `.` / `..` / leading-`.` are rejected.
+///
+/// Called from `resolve_scope_paths` so all three CRUD tools (`do_schema_create`,
+/// `do_schema_update`, `do_schema_delete`) inherit the validation through a
+/// single chokepoint.
+fn validate_table_name(table: &str) -> Result<(), MiniAppError> {
+    if table.is_empty() {
+        return Err(MiniAppError::Validation {
+            field: "table".into(),
+            reason: "table name must not be empty".into(),
+        });
+    }
+    if table == "." || table == ".." {
+        return Err(MiniAppError::Validation {
+            field: "table".into(),
+            reason: format!("table name '{table}' is reserved"),
+        });
+    }
+    if table.starts_with('.') {
+        return Err(MiniAppError::Validation {
+            field: "table".into(),
+            reason: "table name must not start with '.'".into(),
+        });
+    }
+    for c in table.chars() {
+        let ok = c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        if !ok {
+            return Err(MiniAppError::Validation {
+                field: "table".into(),
+                reason: format!(
+                    "table name contains invalid character '{c}'; allowed: [A-Za-z0-9_-]"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Derive the scope root directory (user_dir or project_dir) and the full
 /// `schema.yaml` path for a given `scope` + `table` pair.
 ///
@@ -65,6 +108,7 @@ fn resolve_scope_paths(
     table: &str,
     config: &Config,
 ) -> Result<(PathBuf, PathBuf), MiniAppError> {
+    validate_table_name(table)?;
     let scope_root = match scope {
         "project" => config.project_dir.clone().ok_or_else(|| {
             MiniAppError::Config("project scope requires MINI_APP_PROJECT_DIR".into())
@@ -1251,5 +1295,103 @@ mod tests {
         let guard = tables.load_full();
         // No assertion on count — just that it resolves without panic.
         let _ = guard.table_count();
+    }
+
+    // ── Path-traversal validation tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn schema_create_rejects_path_traversal_in_table_name() {
+        let dir = TempDir::new().expect("tempdir");
+        let config = make_config(None, Some(dir.path().to_path_buf()));
+        let tables = Arc::new(ArcSwap::from_pointee(TableRegistry::from_entries(
+            HashMap::new(),
+            None,
+        )));
+        for bad in [
+            "../escape",
+            "../../etc/passwd",
+            "/abs/path",
+            ".",
+            "..",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "",
+        ] {
+            let params = SchemaCreateParams {
+                table: bad.into(),
+                scope: "project".into(),
+                fields: vec![FieldDefInput {
+                    name: "x".into(),
+                    ty: "string".into(),
+                    required: false,
+                }],
+                dry_run: false,
+            };
+            let err = do_schema_create(&config, &tables, params)
+                .await
+                .expect_err(&format!("must reject table='{bad}'"));
+            assert!(
+                matches!(err, MiniAppError::Validation { .. }),
+                "expected Validation, got {err:?} for '{bad}'"
+            );
+        }
+        // Defence-in-depth: ensure the would-be escape directory was NOT created.
+        let parent = dir.path().parent().expect("tempdir parent");
+        assert!(
+            !parent.join("escape").exists(),
+            "../escape must not have been created"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_update_and_delete_also_reject_traversal() {
+        let dir = TempDir::new().expect("tempdir");
+        let config = make_config(None, Some(dir.path().to_path_buf()));
+        let tables = Arc::new(ArcSwap::from_pointee(TableRegistry::from_entries(
+            HashMap::new(),
+            None,
+        )));
+        let upd = SchemaUpdateParams {
+            table: "../bad".into(),
+            scope: "project".into(),
+            fields: vec![],
+            dry_run: false,
+        };
+        assert!(matches!(
+            do_schema_update(&config, &tables, upd).await,
+            Err(MiniAppError::Validation { .. })
+        ));
+        let del = SchemaDeleteParams {
+            table: "../bad".into(),
+            scope: "project".into(),
+            dry_run: false,
+        };
+        assert!(matches!(
+            do_schema_delete(&config, &tables, del).await,
+            Err(MiniAppError::Validation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn schema_create_dry_run_also_rejects_traversal() {
+        // dry_run path must also be gated — no information disclosure of
+        // attacker-controlled absolute path via `would_create` field.
+        let dir = TempDir::new().expect("tempdir");
+        let config = make_config(None, Some(dir.path().to_path_buf()));
+        let tables = Arc::new(ArcSwap::from_pointee(TableRegistry::from_entries(
+            HashMap::new(),
+            None,
+        )));
+        let params = SchemaCreateParams {
+            table: "../../etc/atk".into(),
+            scope: "project".into(),
+            fields: vec![],
+            dry_run: true,
+        };
+        assert!(matches!(
+            do_schema_create(&config, &tables, params).await,
+            Err(MiniAppError::Validation { .. })
+        ));
     }
 }
