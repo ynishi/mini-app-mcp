@@ -226,6 +226,19 @@ impl TableRegistry {
         self.entries.keys().map(|k| k.as_str())
     }
 
+    /// Returns an immutable reference to the entries map.
+    ///
+    /// Provides read-only access to all mounted [`TableEntry`] values, keyed by
+    /// table name.  This is used by `rebuild_registry()` to diff old and new
+    /// registries, and by schema CRUD tools to look up an entry's `schema_path`
+    /// and `store` for backup / row-count operations.
+    ///
+    /// **No mutation API is exposed** — the entries HashMap is always accessed
+    /// via immutable reference so existing registry invariants are preserved.
+    pub fn entries(&self) -> &HashMap<String, TableEntry> {
+        &self.entries
+    }
+
     /// Build a registry from a pre-constructed entry map and optional default.
     ///
     /// This constructor is intended for use in tests where stores are created
