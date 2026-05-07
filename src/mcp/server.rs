@@ -1294,9 +1294,7 @@ fields:\n\
                 .pointer("/properties/data")
                 .unwrap_or_else(|| panic!("{name}.input_schema.properties.data missing"));
             let ty = data_schema.get("type").unwrap_or_else(|| {
-                panic!(
-                    "{name}.input_schema.properties.data missing 'type'; got {data_schema}"
-                )
+                panic!("{name}.input_schema.properties.data missing 'type'; got {data_schema}")
             });
             assert_eq!(
                 ty.as_str(),

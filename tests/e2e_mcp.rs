@@ -105,10 +105,7 @@ impl McpClient {
             }
         }));
         let resp = self.recv_for(id);
-        assert!(
-            resp.get("error").is_none(),
-            "initialize failed: {resp:?}"
-        );
+        assert!(resp.get("error").is_none(), "initialize failed: {resp:?}");
         self.send_line(&json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
@@ -137,10 +134,7 @@ impl McpClient {
     /// Invoke an MCP tool and decode its single text content payload as
     /// JSON. mini-app-mcp returns `{"content":[{"type":"text","text":"<json>"}]}`.
     fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
-        let result = self.rpc(
-            "tools/call",
-            json!({"name": name, "arguments": arguments}),
-        );
+        let result = self.rpc("tools/call", json!({"name": name, "arguments": arguments}));
         assert_eq!(
             result.get("isError").and_then(Value::as_bool),
             Some(false),
