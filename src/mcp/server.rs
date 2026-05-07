@@ -529,10 +529,27 @@ pub struct InfoParams {
     pub table: Option<String>,
 }
 
+/// JSON Schema for a `data` field that must arrive as a JSON object.
+///
+/// schemars 1.x emits a permissive schema (no `type` field) for
+/// `serde_json::Value`. Anthropic's tool-use serializer treats untyped
+/// params as opaque and stringifies them, so the server then sees a
+/// `Value::String` and rejects with `value must be a JSON object`.
+/// Forcing `"type": "object"` on the public schema keeps the param shape
+/// honest for the client. See diagnosis 2026-05-07.
+fn data_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "description": "JSON object whose fields conform to schema.yaml.",
+        "additionalProperties": true
+    })
+}
+
 /// Parameters for the `create` tool.
 #[derive(Deserialize, JsonSchema)]
 struct CreateParams {
     /// JSON object whose fields conform to schema.yaml.
+    #[schemars(schema_with = "data_object_schema")]
     data: serde_json::Value,
     /// Name of the table to insert into.
     ///
@@ -579,6 +596,7 @@ struct UpdateParams {
     /// Row id (UUID string).
     id: String,
     /// JSON object whose fields conform to schema.yaml.
+    #[schemars(schema_with = "data_object_schema")]
     data: serde_json::Value,
     /// Name of the table to update in.
     ///
@@ -1256,6 +1274,36 @@ fields:\n\
             );
         }
         assert_eq!(tools.len(), 12, "expected exactly 12 tools");
+    }
+
+    /// RED: ensure create/update tools advertise `data` as an object in their
+    /// JSON Schema. Without `"type": "object"` Anthropic's tool-use serializer
+    /// stringifies the param and the server rejects it with
+    /// `value must be a JSON object`. See diagnosis 2026-05-07.
+    #[tokio::test]
+    async fn create_and_update_data_param_is_typed_object() {
+        let (server, _tmp) = make_server().await;
+        let tools = server.tool_router.list_all();
+        for name in &["create", "update"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name.as_ref() == *name)
+                .unwrap_or_else(|| panic!("{name} tool must exist"));
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            let data_schema = schema
+                .pointer("/properties/data")
+                .unwrap_or_else(|| panic!("{name}.input_schema.properties.data missing"));
+            let ty = data_schema.get("type").unwrap_or_else(|| {
+                panic!(
+                    "{name}.input_schema.properties.data missing 'type'; got {data_schema}"
+                )
+            });
+            assert_eq!(
+                ty.as_str(),
+                Some("object"),
+                "{name}.input_schema.properties.data.type must be 'object'; got {ty}"
+            );
+        }
     }
 
     #[tokio::test]
