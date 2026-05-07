@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-07
+
+### Fixed
+
+- **`create` / `update` reject all object payloads from Anthropic-style clients** (`src/mcp/server.rs`) — `CreateParams.data` and `UpdateParams.data` were typed as `serde_json::Value`, which schemars 1.x emits as a permissive schema with no `type` field. Anthropic's tool-use serializer treats untyped params as opaque and stringifies them, so the server received a `Value::String` and rejected every call with `validation error on field '(root)': value must be a JSON object`. A `data_object_schema` helper now applies `#[schemars(schema_with = ...)]` to both fields, advertising `{"type":"object","additionalProperties":true}` in the public tool schema so clients send the value as an actual JSON object.
+
+### Added
+
+- **MCP stdio E2E test suite** (`tests/e2e_mcp.rs`) — spawns the real `mini-app-mcp --mcp` binary via `std::process::Command` and drives it over stdio JSON-RPC. Covers (a) `tools/list` advertising `data` as `"type":"object"` for `create`/`update`, (b) all 12 tools present, (c) `create` → `get` → `update` → `list` → `delete` round-trip via `tools/call` wire format, (d) negative path: a stringified `data` argument is rejected. Uses tempdir-rooted `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` so the suite never touches `~/.mini-app/`. Closes the gap that allowed the 0.5.0 schema-shape regression to ship: in-process unit tests bypassed the JSON-RPC serialization layer where the bug manifested.
+
 ## [0.5.0] - 2026-05-05
 
 ### Added
