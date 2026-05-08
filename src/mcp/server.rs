@@ -917,7 +917,8 @@ impl MiniAppMcpServer {
                        dry_run=true: verify path is absent and return affects without writing. \
                        Returns SCHEMA_EXISTS (data.code) when schema already exists. \
                        No automatic DDL migrations are applied — the DB is created empty. \
-                       Triggers an atomic registry rebuild after successful write.",
+                       Triggers an atomic registry rebuild after successful write. \
+                       Optional title and description fields can be supplied to attach human-readable docs to the table.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -959,7 +960,8 @@ impl MiniAppMcpServer {
                        change is the operator's responsibility. \
                        Backs up {table}.{ts}.yaml + {table}.{ts}.db to {scope_root}/_backup/ \
                        before writing. Retention default: 10 pairs (MINI_APP_BACKUP_RETENTION). \
-                       Returns TABLE_NOT_FOUND (data.code) when table is not mounted.",
+                       Returns TABLE_NOT_FOUND (data.code) when table is not mounted. \
+                       Optional title and description fields can be supplied to attach human-readable docs to the table.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1155,16 +1157,20 @@ fields:\n\
 
         let schema = SchemaConfig {
             table: "test_table".to_string(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "title".to_string(),
                     ty: FieldType::String,
                     required: true,
+                    description: None,
                 },
                 FieldDef {
                     name: "state".to_string(),
                     ty: FieldType::String,
                     required: false,
+                    description: None,
                 },
             ],
             dump: None,
@@ -1707,19 +1713,25 @@ fields:\n\
         // Build schemas for two tables.
         let schema_a = SchemaConfig {
             table: "table_a".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "name".to_string(),
                 ty: FieldType::String,
                 required: true,
+                description: None,
             }],
             dump: None,
         };
         let schema_b = SchemaConfig {
             table: "table_b".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "value".to_string(),
                 ty: FieldType::Number,
                 required: false,
+                description: None,
             }],
             dump: None,
         };
@@ -1899,16 +1911,22 @@ fields:\n\
 
         let schema_a = SchemaConfig {
             table: "table_a".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: None,
         };
         let schema_b = SchemaConfig {
             table: "table_b".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: None,
         };
         let schema_c = SchemaConfig {
             table: "table_c".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: None,
         };

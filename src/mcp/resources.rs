@@ -26,7 +26,7 @@ All tools accept an optional `table` argument:
 ## `info`
 Return the parsed schema (table name and field definitions) for the given `table`.
 - **Input**: `{ "table": "<name>" }` (table optional in legacy mode)
-- **Output**: JSON object `{ "table": "...", "fields": [...] }`
+- **Output**: JSON object `{ "table": "...", "title": "...", "description": "...", "fields": [...] }` (`title` and `description` are `null` when not set)
 - Annotations: `readOnlyHint=true`, `idempotentHint=true`
 
 ## `create`
@@ -188,16 +188,20 @@ mod tests {
     fn make_schema() -> SchemaConfig {
         SchemaConfig {
             table: "items".to_string(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "title".to_string(),
                     ty: FieldType::String,
                     required: true,
+                    description: None,
                 },
                 FieldDef {
                     name: "count".to_string(),
                     ty: FieldType::Number,
                     required: false,
+                    description: None,
                 },
             ],
             dump: None,
@@ -224,31 +228,38 @@ mod tests {
     fn derive_json_schema_type_mapping() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "s".to_string(),
                     ty: FieldType::String,
                     required: false,
+                    description: None,
                 },
                 FieldDef {
                     name: "n".to_string(),
                     ty: FieldType::Number,
                     required: false,
+                    description: None,
                 },
                 FieldDef {
                     name: "b".to_string(),
                     ty: FieldType::Boolean,
                     required: false,
+                    description: None,
                 },
                 FieldDef {
                     name: "a".to_string(),
                     ty: FieldType::Array,
                     required: false,
+                    description: None,
                 },
                 FieldDef {
                     name: "o".to_string(),
                     ty: FieldType::Object,
                     required: false,
+                    description: None,
                 },
             ],
             dump: None,

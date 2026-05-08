@@ -65,6 +65,7 @@ impl FieldType {
 /// - `ty`: the expected JSON type.
 /// - `required`: if `true`, the field must be present and non-null in every
 ///   row.
+/// - `description`: optional human-readable description of this field.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FieldDef {
     /// Field name (arbitrary string — never hard-coded in application logic).
@@ -75,6 +76,9 @@ pub struct FieldDef {
     /// Whether the field must be present in every row.
     #[serde(default)]
     pub required: bool,
+    /// Optional human-readable description of this field.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// The parsed contents of a `schema.yaml` file.
@@ -85,12 +89,20 @@ pub struct FieldDef {
 ///
 /// # Fields
 /// - `table`: the SQLite table name (also used as a human-readable label).
+/// - `title`: optional human-readable title for the table (short summary).
+/// - `description`: optional long-form description for the table.
 /// - `fields`: ordered list of field definitions.
 /// - `dump`: optional write-only file-materialization configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SchemaConfig {
     /// The logical table name declared in `schema.yaml`.
     pub table: String,
+    /// Optional human-readable title for the table (short summary, plain string).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Optional long-form description for the table. Plain string; CommonMark MAY be used by render tools (server stores it verbatim).
+    #[serde(default)]
+    pub description: Option<String>,
     /// All field definitions, in declaration order.
     pub fields: Vec<FieldDef>,
     /// Optional dump / file-materialization configuration.
@@ -275,16 +287,20 @@ mod tests {
     fn make_test_schema() -> SchemaConfig {
         SchemaConfig {
             table: "items".to_string(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "name".to_string(),
                     ty: FieldType::String,
                     required: true,
+                    description: None,
                 },
                 FieldDef {
                     name: "count".to_string(),
                     ty: FieldType::Number,
                     required: false,
+                    description: None,
                 },
             ],
             dump: None,
@@ -323,16 +339,20 @@ fields:
     fn validate_happy_path_all_fields_present() {
         let schema = SchemaConfig {
             table: "issues".to_string(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "title".to_string(),
                     ty: FieldType::String,
                     required: true,
+                    description: None,
                 },
                 FieldDef {
                     name: "count".to_string(),
                     ty: FieldType::Number,
                     required: false,
+                    description: None,
                 },
             ],
             dump: None,
@@ -345,10 +365,13 @@ fields:
     fn validate_optional_field_absent_is_ok() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "tags".to_string(),
                 ty: FieldType::Array,
                 required: false,
+                description: None,
             }],
             dump: None,
         };
@@ -361,10 +384,13 @@ fields:
         // Crux #1: Agent-First extensibility — extra keys must not cause errors.
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "title".to_string(),
                 ty: FieldType::String,
                 required: true,
+                description: None,
             }],
             dump: None,
         };
@@ -378,10 +404,13 @@ fields:
     fn validate_null_value_for_required_field_is_error() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "title".to_string(),
                 ty: FieldType::String,
                 required: true,
+                description: None,
             }],
             dump: None,
         };
@@ -399,10 +428,13 @@ fields:
     fn validate_null_value_for_optional_field_is_ok() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "state".to_string(),
                 ty: FieldType::String,
                 required: false,
+                description: None,
             }],
             dump: None,
         };
@@ -414,6 +446,8 @@ fields:
     fn validate_empty_object_with_no_required_fields() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: None,
         };
@@ -425,6 +459,8 @@ fields:
     fn validate_non_object_root_is_error() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: None,
         };
@@ -439,10 +475,13 @@ fields:
     fn validate_required_field_missing_returns_validation_error() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "title".to_string(),
                 ty: FieldType::String,
                 required: true,
+                description: None,
             }],
             dump: None,
         };
@@ -463,10 +502,13 @@ fields:
     fn validate_type_mismatch_string_vs_number() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "score".to_string(),
                 ty: FieldType::Number,
                 required: true,
+                description: None,
             }],
             dump: None,
         };
@@ -494,10 +536,13 @@ fields:
     fn validate_type_mismatch_boolean_field() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "active".to_string(),
                 ty: FieldType::Boolean,
                 required: true,
+                description: None,
             }],
             dump: None,
         };
@@ -510,10 +555,13 @@ fields:
     fn validate_type_mismatch_array_field() {
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "tags".to_string(),
                 ty: FieldType::Array,
                 required: true,
+                description: None,
             }],
             dump: None,
         };
@@ -694,6 +742,88 @@ dump:
             matches!(err, MiniAppError::Io(_)),
             "expected Io error, got {:?}",
             err
+        );
+    }
+
+    #[test]
+    fn yaml_with_title_and_description_deserializes() {
+        let yaml = r#"
+table: closet_snap
+title: Closet Snap
+description: |
+  Persona の今日その瞬間の自分を保存する情緒 snapshot。
+  outfit という domain-specific な snap で記録する。
+fields:
+  - name: date
+    type: string
+    required: true
+"#;
+        let f = write_yaml(yaml);
+        let schema =
+            load_from_path(f.path()).expect("valid YAML with title/description must parse");
+        assert_eq!(schema.table, "closet_snap");
+        assert_eq!(
+            schema.title.as_deref(),
+            Some("Closet Snap"),
+            "title must be Some(\"Closet Snap\")"
+        );
+        assert!(
+            schema
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .contains("Persona"),
+            "description must be Some and contain 'Persona'"
+        );
+    }
+
+    #[test]
+    fn yaml_without_title_section_yields_none() {
+        let yaml = r#"
+table: issues
+fields:
+  - name: title
+    type: string
+    required: true
+"#;
+        let f = write_yaml(yaml);
+        let schema =
+            load_from_path(f.path()).expect("valid YAML without title/description must parse");
+        assert!(
+            schema.title.is_none(),
+            "title must be None when section is absent"
+        );
+        assert!(
+            schema.description.is_none(),
+            "description must be None when section is absent"
+        );
+    }
+
+    #[test]
+    fn field_def_with_description_round_trips() {
+        let yaml = r#"
+table: snap
+fields:
+  - name: date
+    type: string
+    required: true
+    description: ISO date (YYYY-MM-DD)
+  - name: mood
+    type: string
+    required: false
+"#;
+        let f = write_yaml(yaml);
+        let schema =
+            load_from_path(f.path()).expect("valid YAML with field description must parse");
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(
+            schema.fields[0].description.as_deref(),
+            Some("ISO date (YYYY-MM-DD)"),
+            "field description must round-trip"
+        );
+        assert!(
+            schema.fields[1].description.is_none(),
+            "absent field description must be None"
         );
     }
 }

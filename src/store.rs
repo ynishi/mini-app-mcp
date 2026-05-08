@@ -597,16 +597,20 @@ mod tests {
     async fn make_test_store() -> Store {
         let schema = SchemaConfig {
             table: "test".into(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "title".into(),
                     ty: FieldType::String,
                     required: true,
+                    description: None,
                 },
                 FieldDef {
                     name: "state".into(),
                     ty: FieldType::String,
                     required: false,
+                    description: None,
                 },
             ],
             dump: None,
@@ -619,16 +623,20 @@ mod tests {
         use crate::dump::{DumpConfig, SyncMode};
         let schema = SchemaConfig {
             table: "test".into(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "title".into(),
                     ty: FieldType::String,
                     required: true,
+                    description: None,
                 },
                 FieldDef {
                     name: "body".into(),
                     ty: FieldType::String,
                     required: false,
+                    description: None,
                 },
             ],
             dump: Some(DumpConfig {
@@ -938,10 +946,13 @@ mod tests {
         // warn log capture is out of scope per Acceptance Criteria §7).
         let schema = SchemaConfig {
             table: "test".into(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "title".into(),
                 ty: FieldType::String,
                 required: false,
+                description: None,
             }],
             dump: Some(DumpConfig {
                 dir: None,
@@ -1150,10 +1161,13 @@ mod tests {
 
         let schema = SchemaConfig {
             table: "test".into(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "title".into(),
                 ty: FieldType::String,
                 required: false,
+                description: None,
             }],
             dump: None,
         };
