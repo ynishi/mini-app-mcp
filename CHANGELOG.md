@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-08
+
+> **Note**: This release adds public fields to several existing structs (`SchemaConfig`, `FieldDef`, `FieldDefInput`, `SchemaCreateParams`, `SchemaUpdateParams`, `BatchOp::SchemaCreate`, `BatchOp::SchemaUpdate`). Per [Cargo SemVer Compatibility §1.3.1](https://doc.rust-lang.org/cargo/reference/semver.html#struct-add-public-field-when-no-private), adding a public field to a non-`#[non_exhaustive]` struct is a SemVer-major change — pre-1.0 this is signalled by a minor bump (0.5.x → 0.6.0). YAML / JSON wire format is fully back-compatible via `#[serde(default)]`; only Rust-level downstream consumers that construct these structs by literal initialization need to be updated to add `title: None` / `description: None`.
+
 ### Added
 
 - **`title` and `description` fields on `SchemaConfig`** (`src/schema.rs`) — table-level `title: Option<String>` and `description: Option<String>` added to `SchemaConfig` with `#[serde(default)]`. Existing `schema.yaml` files without these keys continue to deserialize correctly. When present, both fields are serialized back into the YAML file and included in the `info` tool response and `schema://json` resource automatically.
