@@ -917,7 +917,8 @@ impl MiniAppMcpServer {
                        dry_run=true: verify path is absent and return affects without writing. \
                        Returns SCHEMA_EXISTS (data.code) when schema already exists. \
                        No automatic DDL migrations are applied — the DB is created empty. \
-                       Triggers an atomic registry rebuild after successful write.",
+                       Triggers an atomic registry rebuild after successful write. \
+                       Optional title and description fields can be supplied to attach human-readable docs to the table.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -959,7 +960,8 @@ impl MiniAppMcpServer {
                        change is the operator's responsibility. \
                        Backs up {table}.{ts}.yaml + {table}.{ts}.db to {scope_root}/_backup/ \
                        before writing. Retention default: 10 pairs (MINI_APP_BACKUP_RETENTION). \
-                       Returns TABLE_NOT_FOUND (data.code) when table is not mounted.",
+                       Returns TABLE_NOT_FOUND (data.code) when table is not mounted. \
+                       Optional title and description fields can be supplied to attach human-readable docs to the table.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1155,16 +1157,20 @@ fields:\n\
 
         let schema = SchemaConfig {
             table: "test_table".to_string(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "title".to_string(),
                     ty: FieldType::String,
                     required: true,
+                    description: None,
                 },
                 FieldDef {
                     name: "state".to_string(),
                     ty: FieldType::String,
                     required: false,
+                    description: None,
                 },
             ],
             dump: None,
@@ -1707,19 +1713,25 @@ fields:\n\
         // Build schemas for two tables.
         let schema_a = SchemaConfig {
             table: "table_a".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "name".to_string(),
                 ty: FieldType::String,
                 required: true,
+                description: None,
             }],
             dump: None,
         };
         let schema_b = SchemaConfig {
             table: "table_b".to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "value".to_string(),
                 ty: FieldType::Number,
                 required: false,
+                description: None,
             }],
             dump: None,
         };
@@ -1899,16 +1911,22 @@ fields:\n\
 
         let schema_a = SchemaConfig {
             table: "table_a".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: None,
         };
         let schema_b = SchemaConfig {
             table: "table_b".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: None,
         };
         let schema_c = SchemaConfig {
             table: "table_c".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: None,
         };
@@ -2059,6 +2077,76 @@ fields:\n\
     // T13: reload returns CONFIG_ERROR when server was constructed via new_single
     // (all mount_config fields are None — no directory to re-scan).
     // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_info_includes_title_and_description() {
+        use crate::mcp::registry::TableEntry;
+        use std::collections::HashMap;
+
+        // Build a schema with title and description set.
+        let schema = SchemaConfig {
+            table: "annotated".to_string(),
+            title: Some("Annotated Table".to_string()),
+            description: Some("A table with metadata for round-trip test.".to_string()),
+            fields: vec![FieldDef {
+                name: "content".to_string(),
+                ty: FieldType::String,
+                required: true,
+                description: Some("The main content field.".to_string()),
+            }],
+            dump: None,
+        };
+
+        let store = Store::open(Path::new(":memory:"), schema.clone())
+            .await
+            .expect("in-memory store");
+
+        let mut entries: HashMap<String, TableEntry> = HashMap::new();
+        entries.insert(
+            "annotated".to_string(),
+            TableEntry {
+                store: Arc::new(store),
+                schema: Arc::new(schema),
+                schema_path: Arc::new(PathBuf::from("/fake/annotated/schema.yaml")),
+            },
+        );
+
+        let registry = TableRegistry::from_entries(entries, None);
+        let config = Arc::new(Config {
+            schema_path: None,
+            db_path: None,
+            user_dir: None,
+            project_dir: None,
+            backup_retention: None,
+            snapshot_retention: None,
+        });
+        let server = MiniAppMcpServer::new_multi(registry, config);
+
+        let json = server
+            .tool_info(Parameters(InfoParams {
+                table: Some("annotated".to_string()),
+            }))
+            .await
+            .expect("info must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("info must return valid JSON");
+
+        assert_eq!(
+            parsed["title"],
+            serde_json::Value::String("Annotated Table".to_string()),
+            "tool_info must include title"
+        );
+        assert_eq!(
+            parsed["description"],
+            serde_json::Value::String("A table with metadata for round-trip test.".to_string()),
+            "tool_info must include description"
+        );
+        assert_eq!(
+            parsed["fields"][0]["description"],
+            serde_json::Value::String("The main content field.".to_string()),
+            "tool_info field must include description"
+        );
+    }
 
     #[tokio::test]
     async fn reload_returns_config_error_on_legacy_server() {

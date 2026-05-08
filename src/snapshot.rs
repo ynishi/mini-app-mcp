@@ -956,10 +956,13 @@ mod tests {
         // Build Store and TableRegistry in multi-table mode (default_table = None).
         let schema = SchemaConfig {
             table: table_name.to_string(),
+            title: None,
+            description: None,
             fields: vec![FieldDef {
                 name: "title".to_string(),
                 ty: FieldType::String,
                 required: true,
+                description: None,
             }],
             dump: None,
         };
