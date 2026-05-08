@@ -2434,4 +2434,57 @@ mod tests {
             "expected BatchAborted/Backup/Io, got: {err:?}"
         );
     }
+
+    // ── round-trip tests (Crux: schema_create/update round-trip coverage) ────
+
+    /// Crux: schema_create with title+description persists both to YAML and
+    /// they survive a load_from_path round-trip.  Also verifies FieldDef.description.
+    #[tokio::test]
+    async fn schema_create_round_trips_title_and_description() {
+        let dir = TempDir::new().expect("tempdir");
+        let config = make_config(None, Some(dir.path().to_path_buf()));
+        let tables = Arc::new(ArcSwap::from_pointee(TableRegistry::from_entries(
+            HashMap::new(),
+            None,
+        )));
+
+        let params = SchemaCreateParams {
+            table: "books".into(),
+            scope: "project".into(),
+            title: Some("Books".into()),
+            description: Some("My library".into()),
+            fields: vec![FieldDefInput {
+                name: "isbn".into(),
+                ty: "string".into(),
+                required: true,
+                description: Some("ISBN-13".into()),
+            }],
+            dry_run: false,
+        };
+
+        do_schema_create(&config, &tables, params)
+            .await
+            .expect("schema_create must succeed");
+
+        let yaml_path = dir.path().join("books").join("schema.yaml");
+        assert!(yaml_path.exists(), "schema.yaml must be written");
+
+        let reloaded =
+            crate::schema::load_from_path(&yaml_path).expect("load_from_path must succeed");
+        assert_eq!(
+            reloaded.title.as_deref(),
+            Some("Books"),
+            "title must round-trip through YAML"
+        );
+        assert_eq!(
+            reloaded.description.as_deref(),
+            Some("My library"),
+            "description must round-trip through YAML"
+        );
+        assert_eq!(
+            reloaded.fields[0].description.as_deref(),
+            Some("ISBN-13"),
+            "FieldDef.description must round-trip through YAML"
+        );
+    }
 }
