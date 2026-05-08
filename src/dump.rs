@@ -219,16 +219,20 @@ mod tests {
     fn make_schema_no_dump(table: &str) -> SchemaConfig {
         SchemaConfig {
             table: table.to_string(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "title".into(),
                     ty: FieldType::String,
                     required: false,
+                    description: None,
                 },
                 FieldDef {
                     name: "body".into(),
                     ty: FieldType::String,
                     required: false,
+                    description: None,
                 },
             ],
             dump: None,
@@ -238,16 +242,20 @@ mod tests {
     fn make_schema_with_dump(table: &str, dir: &Path) -> SchemaConfig {
         SchemaConfig {
             table: table.to_string(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDef {
                     name: "title".into(),
                     ty: FieldType::String,
                     required: false,
+                    description: None,
                 },
                 FieldDef {
                     name: "body".into(),
                     ty: FieldType::String,
                     required: false,
+                    description: None,
                 },
             ],
             dump: Some(DumpConfig {
@@ -380,6 +388,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let schema = SchemaConfig {
             table: "issues".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: Some(DumpConfig {
                 dir: Some(tmp.path().to_path_buf()),
@@ -399,6 +409,8 @@ mod tests {
         // cwd mutation needed, so this is safe under parallel test execution.
         let schema = SchemaConfig {
             table: "issues".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: None,
         };
@@ -467,6 +479,8 @@ mod tests {
         let subdir = tmp.path().join("nested").join("dir");
         let schema = SchemaConfig {
             table: "t".to_string(),
+            title: None,
+            description: None,
             fields: vec![],
             dump: Some(DumpConfig {
                 dir: Some(subdir.clone()),

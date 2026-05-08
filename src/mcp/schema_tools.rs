@@ -72,6 +72,12 @@ pub enum BatchOp {
         table: String,
         /// Scope: `"project"` or `"user"`.
         scope: String,
+        /// Optional human-readable title for the table.
+        #[serde(default)]
+        title: Option<String>,
+        /// Optional long-form description for the table.
+        #[serde(default)]
+        description: Option<String>,
         /// Field definitions for the new schema.
         fields: Vec<FieldDefInput>,
     },
@@ -81,6 +87,12 @@ pub enum BatchOp {
         table: String,
         /// Scope: `"project"` or `"user"`.
         scope: String,
+        /// Optional human-readable title for the table.
+        #[serde(default)]
+        title: Option<String>,
+        /// Optional long-form description for the table.
+        #[serde(default)]
+        description: Option<String>,
         /// New field definitions (full overwrite).
         fields: Vec<FieldDefInput>,
     },
@@ -236,6 +248,12 @@ pub struct SchemaCreateParams {
     pub table: String,
     /// Scope in which to create the table: `"project"` or `"user"`.
     pub scope: String,
+    /// Optional human-readable title for the table.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Optional long-form description for the table.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Field definitions for the new schema.
     pub fields: Vec<FieldDefInput>,
     /// When `true`, compute and return what would happen without writing anything.
@@ -254,6 +272,9 @@ pub struct FieldDefInput {
     /// Whether the field is required.
     #[serde(default)]
     pub required: bool,
+    /// Optional human-readable description of this field. Supports CommonMark.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// Parse a field-type string into [`FieldType`], returning a `Validation` error
@@ -285,6 +306,7 @@ fn parse_fields(inputs: &[FieldDefInput]) -> Result<Vec<FieldDef>, MiniAppError>
                 name: f.name.clone(),
                 ty,
                 required: f.required,
+                description: f.description.clone(),
             })
         })
         .collect()
@@ -337,6 +359,8 @@ pub async fn do_schema_create(
 
     let schema = SchemaConfig {
         table: params.table.clone(),
+        title: params.title.clone(),
+        description: params.description.clone(),
         fields,
         dump: None,
     };
@@ -378,6 +402,12 @@ pub struct SchemaUpdateParams {
     pub table: String,
     /// Scope: `"project"` or `"user"`.
     pub scope: String,
+    /// Optional human-readable title for the table.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Optional long-form description for the table.
+    #[serde(default)]
+    pub description: Option<String>,
     /// New field definitions (full overwrite of the schema).
     pub fields: Vec<FieldDefInput>,
     /// When `true`, return field diff without writing anything.
@@ -483,6 +513,8 @@ pub async fn do_schema_update(
     // Build new schema and write atomically.
     let new_schema = SchemaConfig {
         table: params.table.clone(),
+        title: params.title.clone(),
+        description: params.description.clone(),
         fields: new_fields,
         dump: None,
     };
@@ -829,6 +861,8 @@ pub async fn execute_batch(
             BatchOp::SchemaCreate {
                 table,
                 scope,
+                title,
+                description,
                 fields,
             } => {
                 let (scope_root, yaml_path) = resolve_scope_paths(scope, table, config)?;
@@ -852,6 +886,8 @@ pub async fn execute_batch(
                     })?;
                 let new_schema = SchemaConfig {
                     table: table.clone(),
+                    title: title.clone(),
+                    description: description.clone(),
                     fields: parsed_fields,
                     dump: None,
                 };
@@ -874,6 +910,8 @@ pub async fn execute_batch(
             BatchOp::SchemaUpdate {
                 table,
                 scope,
+                title,
+                description,
                 fields,
             } => {
                 let (_scope_root, yaml_path) = resolve_scope_paths(scope, table, config)?;
@@ -885,6 +923,8 @@ pub async fn execute_batch(
                     })?;
                 let new_schema = SchemaConfig {
                     table: table.clone(),
+                    title: title.clone(),
+                    description: description.clone(),
                     fields: parsed_fields,
                     dump: None,
                 };
@@ -967,6 +1007,8 @@ pub async fn execute_batch(
         if let BatchOp::SchemaCreate {
             table,
             scope,
+            title,
+            description,
             fields,
         } = op
         {
@@ -975,6 +1017,8 @@ pub async fn execute_batch(
             let parsed_fields = parse_fields(fields)?;
             let schema = SchemaConfig {
                 table: table.clone(),
+                title: title.clone(),
+                description: description.clone(),
                 fields: parsed_fields,
                 dump: None,
             };
@@ -1021,6 +1065,7 @@ async fn compute_op_affects(
             table,
             scope,
             fields,
+            ..
         } => {
             let (_, yaml_path) = resolve_scope_paths(scope, table, config)?;
             let field_count = fields.len();
@@ -1036,6 +1081,7 @@ async fn compute_op_affects(
             table,
             scope,
             fields,
+            ..
         } => {
             let (_, yaml_path) = resolve_scope_paths(scope, table, config)?;
             // Load existing schema for diff.
@@ -1234,10 +1280,13 @@ mod tests {
         let params = SchemaCreateParams {
             table: "items".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![FieldDefInput {
                 name: "name".into(),
                 ty: "string".into(),
                 required: true,
+                description: None,
             }],
             dry_run: true,
         };
@@ -1271,10 +1320,13 @@ mod tests {
         let params = SchemaCreateParams {
             table: "todos".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![FieldDefInput {
                 name: "title".into(),
                 ty: "string".into(),
                 required: true,
+                description: None,
             }],
             dry_run: false,
         };
@@ -1316,16 +1368,20 @@ mod tests {
         let params = SchemaUpdateParams {
             table: "items".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDefInput {
                     name: "title".into(),
                     ty: "string".into(),
                     required: true,
+                    description: None,
                 },
                 FieldDefInput {
                     name: "description".into(),
                     ty: "string".into(),
                     required: false,
+                    description: None,
                 },
             ],
             dry_run: true,
@@ -1371,16 +1427,20 @@ mod tests {
         let params = SchemaUpdateParams {
             table: "orders".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDefInput {
                     name: "amount".into(),
                     ty: "number".into(),
                     required: true,
+                    description: None,
                 },
                 FieldDefInput {
                     name: "currency".into(),
                     ty: "string".into(),
                     required: false,
+                    description: None,
                 },
             ],
             dry_run: false,
@@ -1506,6 +1566,8 @@ mod tests {
         let params = SchemaCreateParams {
             table: "items".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![],
             dry_run: false,
         };
@@ -1533,6 +1595,8 @@ mod tests {
         let params = SchemaUpdateParams {
             table: "ghost".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![],
             dry_run: false,
         };
@@ -1584,6 +1648,8 @@ mod tests {
         let params = SchemaCreateParams {
             table: "notes".into(),
             scope: "user".into(),
+            title: None,
+            description: None,
             fields: vec![],
             dry_run: false,
         };
@@ -1631,16 +1697,20 @@ mod tests {
         let params = SchemaUpdateParams {
             table: "products".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![
                 FieldDefInput {
                     name: "title".into(),
                     ty: "string".into(),
                     required: true,
+                    description: None,
                 },
                 FieldDefInput {
                     name: "price".into(),
                     ty: "number".into(),
                     required: false,
+                    description: None,
                 },
             ],
             dry_run: false,
@@ -1695,10 +1765,13 @@ mod tests {
         let params = SchemaCreateParams {
             table: "blocked_table".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![FieldDefInput {
                 name: "x".into(),
                 ty: "string".into(),
                 required: false,
+                description: None,
             }],
             dry_run: false,
         };
@@ -1743,10 +1816,13 @@ mod tests {
         let params = SchemaUpdateParams {
             table: "blocker_table".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![FieldDefInput {
                 name: "y".into(),
                 ty: "number".into(),
                 required: false,
+                description: None,
             }],
             dry_run: false,
         };
@@ -1909,10 +1985,13 @@ mod tests {
             let params = SchemaCreateParams {
                 table: bad.into(),
                 scope: "project".into(),
+                title: None,
+                description: None,
                 fields: vec![FieldDefInput {
                     name: "x".into(),
                     ty: "string".into(),
                     required: false,
+                    description: None,
                 }],
                 dry_run: false,
             };
@@ -1943,6 +2022,8 @@ mod tests {
         let upd = SchemaUpdateParams {
             table: "../bad".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![],
             dry_run: false,
         };
@@ -1974,6 +2055,8 @@ mod tests {
         let params = SchemaCreateParams {
             table: "../../etc/atk".into(),
             scope: "project".into(),
+            title: None,
+            description: None,
             fields: vec![],
             dry_run: true,
         };
@@ -2041,16 +2124,20 @@ mod tests {
             ops: vec![BatchOp::SchemaUpdate {
                 table: "items".into(),
                 scope: "project".into(),
+                title: None,
+                description: None,
                 fields: vec![
                     FieldDefInput {
                         name: "title".into(),
                         ty: "string".into(),
                         required: true,
+                        description: None,
                     },
                     FieldDefInput {
                         name: "note".into(),
                         ty: "string".into(),
                         required: false,
+                        description: None,
                     },
                 ],
             }],
@@ -2093,16 +2180,20 @@ mod tests {
             ops: vec![BatchOp::SchemaUpdate {
                 table: "items".into(),
                 scope: "project".into(),
+                title: None,
+                description: None,
                 fields: vec![
                     FieldDefInput {
                         name: "title".into(),
                         ty: "string".into(),
                         required: true,
+                        description: None,
                     },
                     FieldDefInput {
                         name: "extra".into(),
                         ty: "string".into(),
                         required: false,
+                        description: None,
                     },
                 ],
             }],
@@ -2320,10 +2411,13 @@ mod tests {
             ops: vec![BatchOp::SchemaUpdate {
                 table: "items".into(),
                 scope: "project".into(),
+                title: None,
+                description: None,
                 fields: vec![FieldDefInput {
                     name: "title".into(),
                     ty: "string".into(),
                     required: true,
+                    description: None,
                 }],
             }],
             dry_run: false,

@@ -25,10 +25,13 @@ use mini_app_mcp::{
 fn make_schema(table: &str) -> SchemaConfig {
     SchemaConfig {
         table: table.to_string(),
+        title: None,
+        description: None,
         fields: vec![FieldDef {
             name: "title".to_string(),
             ty: FieldType::String,
             required: false,
+            description: None,
         }],
         dump: None,
     }
