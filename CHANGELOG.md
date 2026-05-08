@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`title` and `description` fields on `SchemaConfig`** (`src/schema.rs`) — table-level `title: Option<String>` and `description: Option<String>` added to `SchemaConfig` with `#[serde(default)]`. Existing `schema.yaml` files without these keys continue to deserialize correctly. When present, both fields are serialized back into the YAML file and included in the `info` tool response and `schema://json` resource automatically.
+- **`description` field on `FieldDef`** (`src/schema.rs`) — field-level `description: Option<String>` added to `FieldDef` with `#[serde(default)]`. Enables per-field documentation that round-trips through YAML and appears in `info` tool output.
+- **`title` and `description` parameters on `schema_create` / `schema_update` tools** (`src/mcp/schema_tools.rs`, `src/mcp/server.rs`) — `SchemaCreateParams` and `SchemaUpdateParams` now accept optional `title` and `description` arguments. `BatchOp::SchemaCreate` and `BatchOp::SchemaUpdate` variants also accept these fields. Values are written to `schema.yaml` and immediately readable via `info` or `schema://json`. Naming follows OpenAPI 3.1 §4.7 / JSON Schema 2020-12 §9.1 / RustDoc conventions; no non-standard aliases are used.
+- **`description` parameter on `FieldDefInput`** (`src/mcp/schema_tools.rs`) — field definitions supplied to `schema_create` / `schema_update` / `schema_batch` may now include a `description` string per field. The value is forwarded to `FieldDef` via `parse_fields` and persisted in `schema.yaml`.
+- **Round-trip tests** (`src/schema.rs`, `src/mcp/schema_tools.rs`, `src/mcp/server.rs`) — `yaml_with_title_and_description_deserializes`, `yaml_without_title_section_yields_none`, `field_def_with_description_deserializes`, `schema_create_round_trips_title_and_description`, `tool_info_includes_title_and_description` verify the full write → persist → read path.
+
 ## [0.5.1] - 2026-05-07
 
 ### Fixed

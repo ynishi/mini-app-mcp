@@ -17,10 +17,13 @@ Agent-First CRUD store MCP server — `schema.yaml` driven, SQLite backend, mult
 
 ```yaml
 table: issues
+title: "Issue tracker"
+description: "Tracks bugs and feature requests for a project."
 fields:
   - name: title
     type: string
     required: true
+    description: "Short one-line summary of the issue."
   - name: state
     type: string
     required: false
@@ -28,6 +31,8 @@ fields:
     type: array
     required: false
 ```
+
+The optional `title` and `description` keys at the table level provide human- and AI-readable metadata about the table. Each field entry may also carry an optional `description` string. All three keys follow the OpenAPI 3.1 / JSON Schema 2020-12 naming convention and are included in `info` tool output and the `schema://json` resource.
 
 Supported types: `string`, `number`, `boolean`, `array`, `object`.
 
@@ -183,15 +188,15 @@ dump:
 ### Creating a table
 
 ```
-schema_create(scope="project", table="notes", fields=[...])
+schema_create(scope="project", table="notes", title="Notes", description="Personal notes.", fields=[...])
 ```
 
-The tool writes `<scope_dir>/notes/schema.yaml` and immediately registers the new table in the live registry. Calling it again for the same table name returns `SCHEMA_EXISTS`.
+The tool writes `<scope_dir>/notes/schema.yaml` and immediately registers the new table in the live registry. Calling it again for the same table name returns `SCHEMA_EXISTS`. The optional `title` and `description` arguments are written to the YAML file and are immediately visible via `info` or `schema://json`. Individual field entries may also include a `description` string.
 
 ### Updating a schema
 
 ```
-schema_update(scope="project", table="notes", fields=[...])
+schema_update(scope="project", table="notes", title="Notes", description="Updated notes.", fields=[...])
 ```
 
 Before overwriting, the server backs up the existing `schema.yaml` and a point-in-time SQLite snapshot to `<scope_dir>/_backup/notes.<timestamp>.yaml` and `<scope_dir>/_backup/notes.<timestamp>.db`. The live registry is refreshed after the write. No DDL migration is applied — the underlying table structure is unchanged.
