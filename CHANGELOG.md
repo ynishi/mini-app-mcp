@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-21
+
+> **Note**: This release adds a new `BatchOp::Replace` variant to the existing `BatchOp` enum. Per [Cargo SemVer Compatibility §1.3.5](https://doc.rust-lang.org/cargo/reference/semver.html#enum-variant-new), adding a variant to a non-`#[non_exhaustive]` enum is a SemVer-major change — pre-1.0 this is signalled by a minor bump (0.6.0 → 0.7.0), same convention as 0.5.x → 0.6.0. JSON / MCP wire format is fully back-compatible via `#[serde(tag = "op", rename_all = "snake_case")]`; only Rust-level downstream consumers that exhaustively `match` on `BatchOp` need to add a `BatchOp::Replace { .. } => ...` arm.
+
 ### Added
 
 - **`BatchOp::Replace` variant** (`src/mcp/schema_tools.rs`) — new batch operation that replaces an edge set atomically. The caller supplies a `match` scope (key/value pairs) and an `items` list; the server generates UUIDs, timestamps, and JSON serialisation. Internally, DELETE WHERE (match) and N INSERTs execute within a single existing SAVEPOINT so both phases roll back together on any failure. Serialises to `"op": "replace"` on the wire.
