@@ -725,6 +725,51 @@ fn validate_match_key(key: &str) -> Result<(), MiniAppError> {
     Ok(())
 }
 
+/// Validate a value used inside a Replace op's `match` object.
+///
+/// Only `Value::String` is accepted; every other JSON variant (Null, Number, Bool,
+/// Array, Object) is rejected with a `Validation` error.
+///
+/// # Why string-only
+/// SQLite's `json_extract` returns TEXT for JSON string values.  Passing a
+/// non-string match value via `.to_string()` (e.g. `null` → `"null"`,
+/// `42` → `"42"`, `true` → `"true"`) causes a TEXT ↔ typed-scalar comparison
+/// mismatch that silently matches zero rows — the silent no-op delete bug.
+/// Typed binding (`IS NULL` / INTEGER binding) is intentionally out of scope
+/// (Option B); this helper is the sole gate for that design decision.
+///
+/// # Errors
+/// Returns `MiniAppError::Validation` for every variant except `String`.
+fn validate_match_value(value: &serde_json::Value) -> Result<&str, MiniAppError> {
+    match value {
+        serde_json::Value::String(s) => Ok(s.as_str()),
+        serde_json::Value::Null => Err(MiniAppError::Validation {
+            field: "match".into(),
+            reason: "match value 'null' は未対応 — match value は string scalar のみ allow \
+                     (SQLite json_extract NULL ↔ text 'null' 不一致のため silent no-op を防ぐ)"
+                .into(),
+        }),
+        serde_json::Value::Number(_) => Err(MiniAppError::Validation {
+            field: "match".into(),
+            reason: "match value Number は未対応 — match value は string scalar のみ allow \
+                     (typed binding 未実装、INTEGER ↔ TEXT comparison silent no-op を防ぐ)"
+                .into(),
+        }),
+        serde_json::Value::Bool(_) => Err(MiniAppError::Validation {
+            field: "match".into(),
+            reason: "match value Bool は未対応 — match value は string scalar のみ allow \
+                     (typed binding 未実装、INTEGER 1/0 ↔ TEXT 'true'/'false' comparison silent no-op を防ぐ)"
+                .into(),
+        }),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Err(MiniAppError::Validation {
+                field: "match".into(),
+                reason: "match value は string scalar のみ allow (Array / Object は未対応)".into(),
+            })
+        }
+    }
+}
+
 /// Build the DELETE WHERE SQL fragment + bound parameter list for a Replace op's match.
 ///
 /// Each key/value becomes `json_extract(data, '$.key') = ?` joined by AND.
@@ -734,7 +779,7 @@ fn validate_match_key(key: &str) -> Result<(), MiniAppError> {
 ///
 /// # Errors
 /// - `Validation` if `match` is not an object, is empty (Crux must_not_simplify 3),
-///   or contains non-scalar values or invalid keys.
+///   or contains non-string values (Crux typed scalar rejection) or invalid keys.
 fn build_replace_delete_sql(
     r#match: &serde_json::Value,
 ) -> Result<(String, Vec<String>), MiniAppError> {
@@ -756,18 +801,10 @@ fn build_replace_delete_sql(
     let mut params: Vec<String> = Vec::with_capacity(obj.len());
     for (k, v) in obj.iter() {
         validate_match_key(k)?;
-        let scalar = match v {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
-                v.to_string()
-            }
-            _ => {
-                return Err(MiniAppError::Validation {
-                    field: format!("match.{k}"),
-                    reason: "match value must be a scalar (string/number/bool/null)".into(),
-                });
-            }
-        };
+        // Crux typed scalar rejection: validate_match_value is the sole gate.
+        // Only String values reach the SQL bind site; Null/Number/Bool/Array/Object
+        // are rejected here before any SAVEPOINT is opened.
+        let scalar = validate_match_value(v)?.to_owned();
         // Crux must_not_simplify 2: one clause per key, joined by AND.
         clauses.push(format!("json_extract(data, '$.{k}') = ?"));
         params.push(scalar);
@@ -3389,5 +3426,202 @@ mod tests {
                 "from=Y row to={survivor} must survive (out-of-scope)"
             );
         }
+    }
+
+    // ── Crux typed scalar rejection tests ────────────────────────────────────
+
+    /// Crux typed scalar rejection — null match value
+    ///
+    /// A Replace op with `match: {"from": null}` must return `Validation` error
+    /// and leave the 5 pre-inserted rows untouched.  The rejection must occur
+    /// before any SAVEPOINT is opened (pre-SAVEPOINT placement Crux).
+    #[tokio::test]
+    async fn test_batch_replace_null_match_value_rejected_with_validation_error() {
+        let dir = TempDir::new().expect("tempdir");
+        scaffold_relations(dir.path()).await;
+        let config = make_config(None, Some(dir.path().to_path_buf()));
+        let tables = make_registry_from_dir(dir.path()).await;
+
+        // Insert 5 rows to verify they survive the rejection.
+        let initial_rows: Vec<serde_json::Value> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|to| {
+                serde_json::json!({
+                    "from": "x", "to": to, "type": "null_test", "ts": 1_000_000.0
+                })
+            })
+            .collect();
+        bulk_insert_relations(&config, &tables, &initial_rows).await;
+
+        // Verify initial state.
+        {
+            let guard = tables.load();
+            let entry = guard
+                .resolve(Some("relations"))
+                .expect("relations must be mounted");
+            let rows = entry.store.list(Some(100), None).await.unwrap();
+            assert_eq!(rows.len(), 5, "5 rows before null match attempt");
+        }
+
+        // Attempt Replace with a null match value — must fail with Validation.
+        let params = SchemaBatchParams {
+            ops: vec![BatchOp::Replace {
+                table: "relations".into(),
+                r#match: serde_json::json!({"from": null}),
+                items: vec![serde_json::json!({
+                    "from": "x", "to": "z", "type": "null_test", "ts": 2_000_000.0
+                })],
+            }],
+            dry_run: false,
+        };
+        let err = execute_batch(&config, &tables, params)
+            .await
+            .expect_err("null match value must return Err");
+        assert!(
+            matches!(err, MiniAppError::Validation { .. }),
+            "expected Validation error, got: {err:?}"
+        );
+
+        // All 5 rows must be untouched (no SQL was executed).
+        let guard = tables.load();
+        let entry = guard
+            .resolve(Some("relations"))
+            .expect("relations must be mounted");
+        let rows = entry.store.list(Some(100), None).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            5,
+            "5 rows must survive null match value rejection (pre-SAVEPOINT check)"
+        );
+    }
+
+    /// Crux typed scalar rejection — number match value
+    ///
+    /// A Replace op with `match: {"ts": 1000000.0}` must return `Validation` error
+    /// and leave the 5 pre-inserted rows untouched.  The rejection must occur
+    /// before any SAVEPOINT is opened (pre-SAVEPOINT placement Crux).
+    #[tokio::test]
+    async fn test_batch_replace_number_match_value_rejected_with_validation_error() {
+        let dir = TempDir::new().expect("tempdir");
+        scaffold_relations(dir.path()).await;
+        let config = make_config(None, Some(dir.path().to_path_buf()));
+        let tables = make_registry_from_dir(dir.path()).await;
+
+        // Insert 5 rows to verify they survive the rejection.
+        let initial_rows: Vec<serde_json::Value> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|to| {
+                serde_json::json!({
+                    "from": "x", "to": to, "type": "number_test", "ts": 1_000_000.0
+                })
+            })
+            .collect();
+        bulk_insert_relations(&config, &tables, &initial_rows).await;
+
+        // Verify initial state.
+        {
+            let guard = tables.load();
+            let entry = guard
+                .resolve(Some("relations"))
+                .expect("relations must be mounted");
+            let rows = entry.store.list(Some(100), None).await.unwrap();
+            assert_eq!(rows.len(), 5, "5 rows before number match attempt");
+        }
+
+        // Attempt Replace with a number match value — must fail with Validation.
+        let params = SchemaBatchParams {
+            ops: vec![BatchOp::Replace {
+                table: "relations".into(),
+                r#match: serde_json::json!({"ts": 1_000_000.0}),
+                items: vec![serde_json::json!({
+                    "from": "x", "to": "z", "type": "number_test", "ts": 2_000_000.0
+                })],
+            }],
+            dry_run: false,
+        };
+        let err = execute_batch(&config, &tables, params)
+            .await
+            .expect_err("number match value must return Err");
+        assert!(
+            matches!(err, MiniAppError::Validation { .. }),
+            "expected Validation error, got: {err:?}"
+        );
+
+        // All 5 rows must be untouched (no SQL was executed).
+        let guard = tables.load();
+        let entry = guard
+            .resolve(Some("relations"))
+            .expect("relations must be mounted");
+        let rows = entry.store.list(Some(100), None).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            5,
+            "5 rows must survive number match value rejection (pre-SAVEPOINT check)"
+        );
+    }
+
+    /// Crux typed scalar rejection — bool match value
+    ///
+    /// A Replace op with `match: {"from": true}` must return `Validation` error
+    /// and leave the 5 pre-inserted rows untouched.  The rejection must occur
+    /// before any SAVEPOINT is opened (pre-SAVEPOINT placement Crux).
+    #[tokio::test]
+    async fn test_batch_replace_bool_match_value_rejected_with_validation_error() {
+        let dir = TempDir::new().expect("tempdir");
+        scaffold_relations(dir.path()).await;
+        let config = make_config(None, Some(dir.path().to_path_buf()));
+        let tables = make_registry_from_dir(dir.path()).await;
+
+        // Insert 5 rows to verify they survive the rejection.
+        let initial_rows: Vec<serde_json::Value> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|to| {
+                serde_json::json!({
+                    "from": "x", "to": to, "type": "bool_test", "ts": 1_000_000.0
+                })
+            })
+            .collect();
+        bulk_insert_relations(&config, &tables, &initial_rows).await;
+
+        // Verify initial state.
+        {
+            let guard = tables.load();
+            let entry = guard
+                .resolve(Some("relations"))
+                .expect("relations must be mounted");
+            let rows = entry.store.list(Some(100), None).await.unwrap();
+            assert_eq!(rows.len(), 5, "5 rows before bool match attempt");
+        }
+
+        // Attempt Replace with a bool match value — must fail with Validation.
+        let params = SchemaBatchParams {
+            ops: vec![BatchOp::Replace {
+                table: "relations".into(),
+                r#match: serde_json::json!({"from": true}),
+                items: vec![serde_json::json!({
+                    "from": "x", "to": "z", "type": "bool_test", "ts": 2_000_000.0
+                })],
+            }],
+            dry_run: false,
+        };
+        let err = execute_batch(&config, &tables, params)
+            .await
+            .expect_err("bool match value must return Err");
+        assert!(
+            matches!(err, MiniAppError::Validation { .. }),
+            "expected Validation error, got: {err:?}"
+        );
+
+        // All 5 rows must be untouched (no SQL was executed).
+        let guard = tables.load();
+        let entry = guard
+            .resolve(Some("relations"))
+            .expect("relations must be mounted");
+        let rows = entry.store.list(Some(100), None).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            5,
+            "5 rows must survive bool match value rejection (pre-SAVEPOINT check)"
+        );
     }
 }
