@@ -284,24 +284,41 @@ Any op failure rolls back the entire batch.
 
 ### Bulk replace (edge set full replacement)
 
-To replace all edges matching a filter (e.g. update `persona-x`'s `sister_of` set to a new five-person list), combine `DELETE` + N `INSERT` ops in one batch:
+Use the dedicated `replace` op to swap an edge set in one atomic SAVEPOINT. The server handles UUID generation, timestamps, and JSON serialization; the caller supplies the `match` scope and `items` list only.
 
 ```json
 {
   "ops": [
     {
-      "op": "query",
-      "sql": "DELETE FROM rows WHERE json_extract(data, '$.from') = ?1 AND json_extract(data, '$.type') = ?2",
-      "params": ["persona-x", "sister_of"]
-    },
-    { "op": "query", "sql": "INSERT INTO rows ...", "params": ["..."] }
+      "op": "replace",
+      "table": "relations",
+      "match": {"from": "persona-x", "type": "sister_of"},
+      "items": [
+        {"from": "persona-x", "to": "a", "type": "sister_of", "ts": 1779330000, "strength": 1.0},
+        {"from": "persona-x", "to": "b", "type": "sister_of", "ts": 1779330000, "strength": 1.0},
+        {"from": "persona-x", "to": "c", "type": "sister_of", "ts": 1779330000, "strength": 0.8}
+      ]
+    }
   ]
 }
 ```
 
-The delete and inserts share one SAVEPOINT, so the edge set is swapped atomically.
+The `replace` op runs DELETE WHERE (match) + N INSERTs inside a single SAVEPOINT. Both phases roll back together on any failure. The response includes per-op affects:
 
-> **Caller responsibility**: when using `schema_batch.query`, generate row UUIDs, Unix-second timestamps, and the JSON-serialized `data` column yourself. A higher-level `replace_by` tool is tracked as future work.
+```json
+{
+  "committed": true,
+  "ops_executed": 1,
+  "affects": {"deleted": 5, "inserted": 3}
+}
+```
+
+**Semantics**:
+
+- Each key in `match` becomes a separate `json_extract(data, '$.key') = value` predicate joined by AND. Match value must be a scalar (string/number/bool/null).
+- **Empty `match` (`{}`) is rejected with VALIDATION_ERROR** to prevent accidental full-table wipes.
+- Each item in `items` is validated against the table's schema before any SQL runs.
+- The `query` op (raw SQL escape hatch shown in [Bulk insert](#bulk-insert-n-edges-atomically)) remains available for cases the `replace` op does not cover.
 
 ### Listing edges (sub-1000 scope)
 
