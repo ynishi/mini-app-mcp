@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AND-chained `json_extract` predicates** — each key in `match` is translated to a separate `json_extract(data, '$.key') = value` clause joined by AND. Scalar values only (string/number/bool/null); array/object values and keys with characters outside `[A-Za-z0-9_-]` are rejected.
 - **4 crux regression tests** (`src/mcp/schema_tools.rs` `mod tests`) — `test_replace_savepoint_rollback_on_error` (crux MNS 1: atomicity), `test_replace_empty_match_validation_error` (crux MNS 3: guard), `test_replace_multi_key_and_predicate` (crux MNS 2: AND chain), `test_replace_preserves_non_matched_rows` (set-diff correctness).
 
+### Fixed
+
+- **`BatchOp::Replace` silent no-op on typed scalar match values** (`src/mcp/schema_tools.rs`) — match values of JSON `Null` / `Number` / `Bool` were previously stringified via `v.to_string()` and bound as text, which never matched SQLite `json_extract` results (SQL NULL / INTEGER / 1-0), causing DELETE to silently affect zero rows. Added file-local `validate_match_value` helper that admits only `Value::String` and rejects Null / Number / Bool / Array / Object with `MiniAppError::Validation` before any SQL executes (Option A: smallest correct diff). 3 new named tests (`test_batch_replace_null_match_value_rejected_with_validation_error`, `..._number_...`, `..._bool_...`) cover each rejected scalar type.
+
 ## [0.6.0] - 2026-05-08
 
 > **Note**: This release adds public fields to several existing structs (`SchemaConfig`, `FieldDef`, `FieldDefInput`, `SchemaCreateParams`, `SchemaUpdateParams`, `BatchOp::SchemaCreate`, `BatchOp::SchemaUpdate`). Per [Cargo SemVer Compatibility §1.3.1](https://doc.rust-lang.org/cargo/reference/semver.html#struct-add-public-field-when-no-private), adding a public field to a non-`#[non_exhaustive]` struct is a SemVer-major change — pre-1.0 this is signalled by a minor bump (0.5.x → 0.6.0). YAML / JSON wire format is fully back-compatible via `#[serde(default)]`; only Rust-level downstream consumers that construct these structs by literal initialization need to be updated to add `title: None` / `description: None`.
