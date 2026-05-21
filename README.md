@@ -248,6 +248,75 @@ Add `.mini-app/` (or your custom `dump.dir`) to `.gitignore` if you do not want 
 .mini-app/
 ```
 
+## Relation graph usage
+
+`mini-app-mcp` is table-agnostic, but a common pattern is to use a single table as a **relation graph layer** for agents that need typed edges between nodes (e.g. persona-AI memory: `sister_of`, `member_of_studio`, `mother_of`).
+
+The reference schema lives at `examples/schemas/relations.schema.yaml`:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `from` | string | yes | Source node id |
+| `to` | string | yes | Target node id |
+| `type` | string | yes | Edge label (`sister_of`, `member_of_studio`, ...) |
+| `ts` | number | yes | Unix seconds when asserted |
+| `strength` | number | no | Edge weight in `[0.0, 1.0]`, defaults to `1.0` |
+| `metadata` | object | no | Free-form attributes |
+| `source_entry_id` | string | no | Foreign reference to a journal / log entry |
+
+### Bulk insert (N edges atomically)
+
+Use `schema_batch` with `query` ops to register N edges in one SAVEPOINT:
+
+```json
+{
+  "ops": [
+    {
+      "op": "query",
+      "sql": "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+      "params": ["<uuid>", "{\"from\":\"persona-x\",\"to\":\"a\",\"type\":\"sister_of\",\"ts\":1779330000,\"strength\":1.0}", "1779330000", "1779330000"]
+    }
+  ]
+}
+```
+
+Any op failure rolls back the entire batch.
+
+### Bulk replace (edge set full replacement)
+
+To replace all edges matching a filter (e.g. update `persona-x`'s `sister_of` set to a new five-person list), combine `DELETE` + N `INSERT` ops in one batch:
+
+```json
+{
+  "ops": [
+    {
+      "op": "query",
+      "sql": "DELETE FROM rows WHERE json_extract(data, '$.from') = ?1 AND json_extract(data, '$.type') = ?2",
+      "params": ["persona-x", "sister_of"]
+    },
+    { "op": "query", "sql": "INSERT INTO rows ...", "params": ["..."] }
+  ]
+}
+```
+
+The delete and inserts share one SAVEPOINT, so the edge set is swapped atomically.
+
+> **Caller responsibility**: when using `schema_batch.query`, generate row UUIDs, Unix-second timestamps, and the JSON-serialized `data` column yourself. A higher-level `replace_by` tool is tracked as future work.
+
+### Listing edges (sub-1000 scope)
+
+The `list` tool returns rows in `created_at DESC` order with `limit` capped at 1000 and no `WHERE` filter. For typical persona graphs (~90 nodes, a few hundred edges), fetch the full edge set in one call and filter client-side:
+
+```python
+edges = mini_app.list(table="relations", limit=1000)
+sisters_of_x = [
+    e for e in edges
+    if e["data"]["from"] == "persona-x" and e["data"]["type"] == "sister_of"
+]
+```
+
+If the edge count grows past 1000, server-side filtering (`list_by`) is tracked as future work.
+
 ## Storage notes
 
 SQLite databases are opened in WAL journal mode for safe concurrent access during `reload`. Sidecar files `<db>.db-wal` and `<db>.db-shm` are created next to each `.db` file — these are managed by SQLite and should not be deleted manually.

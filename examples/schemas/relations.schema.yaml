@@ -1,0 +1,32 @@
+table: relations
+title: "Relation graph"
+description: "Typed edges between persona / entity nodes for graph-layer memory."
+fields:
+  - name: from
+    type: string
+    required: true
+    description: "Source node identifier (persona id or entity reference)."
+  - name: to
+    type: string
+    required: true
+    description: "Target node identifier."
+  - name: type
+    type: string
+    required: true
+    description: "Edge label, e.g. sister_of, member_of_studio, mother_of."
+  - name: ts
+    type: number
+    required: true
+    description: "Unix seconds when the edge was asserted."
+  - name: strength
+    type: number
+    required: false
+    description: "Edge weight in [0.0, 1.0]. Defaults to 1.0 when omitted."
+  - name: metadata
+    type: object
+    required: false
+    description: "Free-form attributes attached to the edge."
+  - name: source_entry_id
+    type: string
+    required: false
+    description: "Optional foreign reference to a journal / log entry id."
