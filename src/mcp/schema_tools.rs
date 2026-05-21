@@ -2487,4 +2487,165 @@ mod tests {
             "FieldDef.description must round-trip through YAML"
         );
     }
+
+    // ── TestRelationTable: 素手で bulk insert + bulk replace を書いて caller 苦痛を観察 ──
+    //
+    // 目的: issue 1779332961-72972 の「edge 全置換」を現状 API (schema_batch.Query) で
+    // 素手で書いてみて、caller が何を背負うかを定量化する。本 test は production code
+    // ではなく観察用 fixture。
+    //
+    // シナリオ:
+    //   (1) relations table を scaffold (from/to/type/ts/strength の最小 4 + 1 field)
+    //   (2) persona "persona-x" の sister_of 関係 5 件を bulk insert
+    //   (3) sister_of 関係を新 5 件で完全置換 (DELETE WHERE from='persona-x' AND type='sister_of'
+    //       → INSERT 新 5 件) を 1 SAVEPOINT で atomic 実行
+    //   (4) 旧 to_a..to_e が消え、新 to_f..to_j のみが残ることを assert
+    #[tokio::test]
+    async fn test_relation_table_bulk_replace_by_hand_observation() {
+        let dir = TempDir::new().expect("tempdir");
+        // relations.schema.yaml の主要 field を inline 再現 (metadata / source_entry_id は省略)
+        scaffold_table(
+            dir.path(),
+            "relations",
+            "  - name: from\n    type: string\n    required: true\n\
+             \x20\x20- name: to\n    type: string\n    required: true\n\
+             \x20\x20- name: type\n    type: string\n    required: true\n\
+             \x20\x20- name: ts\n    type: number\n    required: true\n\
+             \x20\x20- name: strength\n    type: number\n    required: false\n",
+        )
+        .await;
+        let config = make_config(None, Some(dir.path().to_path_buf()));
+        let tables = make_registry_from_dir(dir.path()).await;
+
+        // ──────────────────────────────────────────────────────────────────
+        // 観察ポイント (1): UUID 生成 — caller 側で 5 個必要
+        // 観察ポイント (2): ts 文字列 — caller 側で f64 リテラル組み立て
+        // 観察ポイント (3): JSON data 文字列 — caller 側で escape を意識して組む
+        // 観察ポイント (4): (id, data, created_at, updated_at) tuple を rows table の
+        //                  schema 知識として caller が把握している必要あり
+        // 観察ポイント (5): 5 件 INSERT を 1 SQL VALUES 句 にまとめる SQL リテラル組立
+        // ──────────────────────────────────────────────────────────────────
+
+        let initial_targets = ["sister-a", "sister-b", "sister-c", "sister-d", "sister-e"];
+        let initial_ts = 1_000_000.0_f64;
+
+        // 5 件分の VALUES 句を caller 側で組み立てる
+        let mut values_parts: Vec<String> = Vec::new();
+        for to in initial_targets.iter() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let data = format!(
+                "{{\"from\":\"persona-x\",\"to\":\"{to}\",\"type\":\"sister_of\",\"ts\":{initial_ts},\"strength\":1.0}}"
+            );
+            values_parts.push(format!(
+                "('{id}', '{data}', {initial_ts}, {initial_ts})"
+            ));
+        }
+        let bulk_insert_sql = format!(
+            "INSERT INTO rows (id, data, created_at, updated_at) VALUES {}",
+            values_parts.join(", ")
+        );
+
+        let insert_params = SchemaBatchParams {
+            ops: vec![BatchOp::Query {
+                sql: bulk_insert_sql,
+                params: None,
+                table: "relations".into(),
+            }],
+            dry_run: false,
+        };
+        let insert_result_str = execute_batch(&config, &tables, insert_params)
+            .await
+            .expect("bulk insert must succeed");
+        let insert_result: serde_json::Value = serde_json::from_str(&insert_result_str).unwrap();
+        assert_eq!(insert_result["committed"], true);
+        assert_eq!(insert_result["ops_executed"], 1);
+
+        // Verify 5 件挿入
+        {
+            let guard = tables.load();
+            let entry = guard
+                .resolve(Some("relations"))
+                .expect("relations must be mounted");
+            let rows = entry.store.list(Some(100), None).await.unwrap();
+            assert_eq!(rows.len(), 5, "5 sister_of edges must exist after bulk insert");
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Bulk replace: DELETE WHERE + INSERT 新 5 件 を 2 ops で SAVEPOINT 内
+        //
+        // 観察ポイント (6): match scope (from='persona-x' AND type='sister_of') を
+        //                  caller が JSON path で書く必要あり
+        // 観察ポイント (7): DELETE の WHERE 句は json_extract(data, '$.from') 等 SQLite の
+        //                  JSON 関数知識が caller に必要 (mini-app の rows.data は TEXT JSON)
+        // 観察ポイント (8): DELETE 句と INSERT 句で同じ match scope を 2 箇所書く重複
+        // 観察ポイント (9): 2 ops に分割するが、atomicity は schema_batch 側 SAVEPOINT 任せ
+        // ──────────────────────────────────────────────────────────────────
+
+        let replace_targets = ["sister-f", "sister-g", "sister-h", "sister-i", "sister-j"];
+        let replace_ts = 2_000_000.0_f64;
+
+        let delete_sql = "DELETE FROM rows \
+                          WHERE json_extract(data, '$.from') = 'persona-x' \
+                          AND json_extract(data, '$.type') = 'sister_of'"
+            .to_string();
+
+        let mut new_values_parts: Vec<String> = Vec::new();
+        for to in replace_targets.iter() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let data = format!(
+                "{{\"from\":\"persona-x\",\"to\":\"{to}\",\"type\":\"sister_of\",\"ts\":{replace_ts},\"strength\":0.8}}"
+            );
+            new_values_parts.push(format!(
+                "('{id}', '{data}', {replace_ts}, {replace_ts})"
+            ));
+        }
+        let new_insert_sql = format!(
+            "INSERT INTO rows (id, data, created_at, updated_at) VALUES {}",
+            new_values_parts.join(", ")
+        );
+
+        let replace_params = SchemaBatchParams {
+            ops: vec![
+                BatchOp::Query {
+                    sql: delete_sql,
+                    params: None,
+                    table: "relations".into(),
+                },
+                BatchOp::Query {
+                    sql: new_insert_sql,
+                    params: None,
+                    table: "relations".into(),
+                },
+            ],
+            dry_run: false,
+        };
+        let replace_result_str = execute_batch(&config, &tables, replace_params)
+            .await
+            .expect("bulk replace must succeed");
+        let replace_result: serde_json::Value =
+            serde_json::from_str(&replace_result_str).unwrap();
+        assert_eq!(replace_result["committed"], true);
+        assert_eq!(replace_result["ops_executed"], 2);
+
+        // Verify: 旧 to_a..to_e 消失、新 to_f..to_j のみ残存
+        {
+            let guard = tables.load();
+            let entry = guard
+                .resolve(Some("relations"))
+                .expect("relations must be mounted");
+            let rows = entry.store.list(Some(100), None).await.unwrap();
+            assert_eq!(rows.len(), 5, "5 new sister_of edges after replace");
+
+            let tos: std::collections::HashSet<String> = rows
+                .iter()
+                .filter_map(|r| r.data.get("to").and_then(|t| t.as_str()).map(String::from))
+                .collect();
+            for new_to in replace_targets.iter() {
+                assert!(tos.contains(*new_to), "new target {new_to} must exist");
+            }
+            for old_to in initial_targets.iter() {
+                assert!(!tos.contains(*old_to), "old target {old_to} must be gone");
+            }
+        }
+    }
 }
