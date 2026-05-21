@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BatchOp::Replace` variant** (`src/mcp/schema_tools.rs`) — new batch operation that replaces an edge set atomically. The caller supplies a `match` scope (key/value pairs) and an `items` list; the server generates UUIDs, timestamps, and JSON serialisation. Internally, DELETE WHERE (match) and N INSERTs execute within a single existing SAVEPOINT so both phases roll back together on any failure. Serialises to `"op": "replace"` on the wire.
+- **`ReplaceAffects` struct and `BatchResult.affects` field** (`src/mcp/schema_tools.rs`) — `BatchResult` gains an `affects: Option<ReplaceAffects>` field (`#[serde(skip_serializing_if = "Option::is_none")]`). When a Replace op is committed the field is present as `{"deleted": N, "inserted": M}`; all other batch results omit it. `ReplaceAffects` derives `JsonSchema` via the already-present `schemars` dependency.
+- **Empty `match` guard** — a Replace op with an empty `match` object (`{}`) is rejected with `VALIDATION_ERROR` before any SQL executes, preventing accidental full-table deletion.
+- **AND-chained `json_extract` predicates** — each key in `match` is translated to a separate `json_extract(data, '$.key') = value` clause joined by AND. Scalar values only (string/number/bool/null); array/object values and keys with characters outside `[A-Za-z0-9_-]` are rejected.
+- **4 crux regression tests** (`src/mcp/schema_tools.rs` `mod tests`) — `test_replace_savepoint_rollback_on_error` (crux MNS 1: atomicity), `test_replace_empty_match_validation_error` (crux MNS 3: guard), `test_replace_multi_key_and_predicate` (crux MNS 2: AND chain), `test_replace_preserves_non_matched_rows` (set-diff correctness).
+
 ## [0.6.0] - 2026-05-08
 
 > **Note**: This release adds public fields to several existing structs (`SchemaConfig`, `FieldDef`, `FieldDefInput`, `SchemaCreateParams`, `SchemaUpdateParams`, `BatchOp::SchemaCreate`, `BatchOp::SchemaUpdate`). Per [Cargo SemVer Compatibility §1.3.1](https://doc.rust-lang.org/cargo/reference/semver.html#struct-add-public-field-when-no-private), adding a public field to a non-`#[non_exhaustive]` struct is a SemVer-major change — pre-1.0 this is signalled by a minor bump (0.5.x → 0.6.0). YAML / JSON wire format is fully back-compatible via `#[serde(default)]`; only Rust-level downstream consumers that construct these structs by literal initialization need to be updated to add `title: None` / `description: None`.
