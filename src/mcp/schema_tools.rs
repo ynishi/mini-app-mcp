@@ -105,6 +105,36 @@ pub enum BatchOp {
         /// Scope: `"project"` or `"user"`.
         scope: String,
     },
+    /// Replace rows in a table atomically by deleting rows matching `match` and
+    /// inserting new `items` inside the same SAVEPOINT.
+    ///
+    /// # Atomicity (Crux must_not_simplify 1)
+    /// DELETE and all INSERTs run inside one SAVEPOINT (shared with other ops in
+    /// the batch). Any failure rolls back both phases together. Never commits a
+    /// half-applied state.
+    ///
+    /// # Match semantics (Crux must_not_simplify 2)
+    /// Each key-value pair in `match` becomes a separate
+    /// `json_extract(data, '$.key') = ?` clause joined by AND. Never collapsed
+    /// into a single predicate or hardcoded field reference.
+    ///
+    /// # Validation (Crux must_not_simplify 3)
+    /// - Empty `match` (`{}`) is rejected with `Validation` BEFORE any SQL runs,
+    ///   to prevent full-table wipes.
+    /// - Each `match` value must be a scalar (string/number/bool/null).
+    /// - Each `match` key must match `[A-Za-z0-9_-]+`.
+    /// - Each item in `items` is validated against the table's `SchemaConfig`.
+    Replace {
+        /// Logical table name targeted by this op.
+        table: String,
+        /// Match scope. Each key-value becomes `json_extract(data, '$.key') = value`
+        /// joined by AND. Empty object is rejected with VALIDATION_ERROR.
+        #[serde(rename = "match")]
+        r#match: serde_json::Value,
+        /// New rows to insert. Each item must be a JSON object conforming to the
+        /// table's schema. UUID / created_at / updated_at are generated server-side.
+        items: Vec<serde_json::Value>,
+    },
 }
 
 impl BatchOp {
@@ -115,6 +145,7 @@ impl BatchOp {
             BatchOp::SchemaCreate { table, .. } => table,
             BatchOp::SchemaUpdate { table, .. } => table,
             BatchOp::SchemaDelete { table, .. } => table,
+            BatchOp::Replace { table, .. } => table,
         }
     }
 }
@@ -134,6 +165,18 @@ pub struct SchemaBatchParams {
     pub dry_run: bool,
 }
 
+/// Per-op affects returned for `BatchOp::Replace`.
+///
+/// Surfaces deleted (rows removed by DELETE WHERE) and inserted (rows added
+/// by INSERT) counts so callers can verify the SAVEPOINT's 2-phase outcome.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReplaceAffects {
+    /// Number of rows DELETE matched and removed.
+    pub deleted: u64,
+    /// Number of rows successfully INSERTed (== items.len() on success).
+    pub inserted: u64,
+}
+
 /// Result returned by a successful `schema_batch` call.
 #[derive(Debug, Serialize)]
 pub struct BatchResult {
@@ -147,6 +190,10 @@ pub struct BatchResult {
     pub backups_written: Vec<PathBuf>,
     /// Whether the registry was rebuilt (always false for dry_run).
     pub registry_rebuilt: bool,
+    /// Aggregated affects for Replace ops in this batch.
+    /// `None` if no Replace op executed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub affects: Option<ReplaceAffects>,
 }
 
 // =============================================================================
@@ -637,6 +684,123 @@ pub async fn do_schema_delete(
 }
 
 // =============================================================================
+// schema_batch helper types and functions
+// =============================================================================
+
+/// Returns the current time as seconds since the UNIX epoch.
+///
+/// Used by `execute_batch` when generating `created_at` / `updated_at`
+/// timestamps for Replace-inserted rows. Mirrors `Store::now_secs` which is
+/// private to `src/store.rs`.
+///
+/// Returns `0` if the system clock is set before 1970-01-01 (defensive only).
+fn batch_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Validate a key used inside a Replace op's `match` object.
+///
+/// Prevents JSON path injection in the SQL fragment
+/// `json_extract(data, '$.<key>') = ?`.  Allowed: ASCII alphanumeric, `_`, `-`.
+fn validate_match_key(key: &str) -> Result<(), MiniAppError> {
+    if key.is_empty() {
+        return Err(MiniAppError::Validation {
+            field: "match".into(),
+            reason: "match key must not be empty".into(),
+        });
+    }
+    for c in key.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err(MiniAppError::Validation {
+                field: format!("match.{key}"),
+                reason: format!(
+                    "match key contains invalid character '{c}'; allowed: [A-Za-z0-9_-]"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Build the DELETE WHERE SQL fragment + bound parameter list for a Replace op's match.
+///
+/// Each key/value becomes `json_extract(data, '$.key') = ?` joined by AND.
+///
+/// # Crux must_not_simplify 2
+/// Never collapse multiple key-value pairs into a single predicate.
+///
+/// # Errors
+/// - `Validation` if `match` is not an object, is empty (Crux must_not_simplify 3),
+///   or contains non-scalar values or invalid keys.
+fn build_replace_delete_sql(
+    r#match: &serde_json::Value,
+) -> Result<(String, Vec<String>), MiniAppError> {
+    let obj = r#match
+        .as_object()
+        .ok_or_else(|| MiniAppError::Validation {
+            field: "match".into(),
+            reason: "match must be a JSON object".into(),
+        })?;
+    // Crux must_not_simplify 3: empty match would wipe the entire table.
+    if obj.is_empty() {
+        return Err(MiniAppError::Validation {
+            field: "match".into(),
+            reason: "match must not be empty (would delete all rows in the table)".into(),
+        });
+    }
+
+    let mut clauses: Vec<String> = Vec::with_capacity(obj.len());
+    let mut params: Vec<String> = Vec::with_capacity(obj.len());
+    for (k, v) in obj.iter() {
+        validate_match_key(k)?;
+        let scalar = match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
+                v.to_string()
+            }
+            _ => {
+                return Err(MiniAppError::Validation {
+                    field: format!("match.{k}"),
+                    reason: "match value must be a scalar (string/number/bool/null)".into(),
+                });
+            }
+        };
+        // Crux must_not_simplify 2: one clause per key, joined by AND.
+        clauses.push(format!("json_extract(data, '$.{k}') = ?"));
+        params.push(scalar);
+    }
+    let sql = format!("DELETE FROM rows WHERE {}", clauses.join(" AND "));
+    Ok((sql, params))
+}
+
+/// A single database operation spec, used to drive the unified SAVEPOINT closure.
+///
+/// Defined file-locally so that Query and Replace ops share the same SAVEPOINT
+/// (Crux must_not_simplify 1: one SAVEPOINT per batch, never split across closures).
+#[derive(Clone)]
+enum DbOpSpec {
+    Query {
+        idx: usize,
+        sql: String,
+        sql_params: Vec<String>,
+    },
+    ReplaceDelete {
+        idx: usize,
+        sql: String,
+        sql_params: Vec<String>,
+    },
+    ReplaceInsert {
+        idx: usize,
+        id: String,
+        data_str: String,
+        ts: i64,
+    },
+}
+
+// =============================================================================
 // schema_batch execution
 // =============================================================================
 
@@ -674,6 +838,7 @@ pub async fn execute_batch(
             yaml_writes: vec![],
             backups_written: vec![],
             registry_rebuilt: false,
+            affects: None,
         };
         return serde_json::to_string(&result).map_err(|e| MiniAppError::Schema(e.to_string()));
     }
@@ -741,17 +906,16 @@ pub async fn execute_batch(
     }
 
     // Step 3b: Resolve the Store for the target table.
-    let (store, _schema) = {
+    let (store, schema_opt) = {
         let guard = tables.load();
-        // We need the Store only for query ops. If there's no query op (only schema ops),
-        // the table may not be mounted yet (e.g. schema_create as first op).
-        // We'll resolve lazily inside the SAVEPOINT for query ops.
-        // For now, we only need the Store if any query op is present.
-        let has_query = params
+        // We need the Store for Query ops and Replace ops. If there's no such op
+        // (only schema ops), the table may not be mounted yet (e.g. schema_create
+        // as first op).
+        let has_db_op = params
             .ops
             .iter()
-            .any(|op| matches!(op, BatchOp::Query { .. }));
-        if has_query {
+            .any(|op| matches!(op, BatchOp::Query { .. } | BatchOp::Replace { .. }));
+        if has_db_op {
             let entry =
                 guard
                     .resolve(Some(&first_table))
@@ -767,16 +931,19 @@ pub async fn execute_batch(
         }
     };
 
-    // Step 3c: Execute all ops under a single SAVEPOINT.
-    // For query ops: execute SQL inside SAVEPOINT via store.execute_under_savepoint.
-    // For schema ops: accumulate (path, content) pairs in deferred-write list (memory only).
+    // Step 3c: Execute all DB ops under a single SAVEPOINT.
     //
-    // Since we may have mixed query + schema ops, and SAVEPOINT must be a single
-    // spawn_blocking call, we run all query SQL inside one SAVEPOINT call.
-    // Schema ops are handled as deferred writes outside SAVEPOINT (YAML only).
+    // Query ops and Replace ops are pre-processed into a Vec<DbOpSpec> that is
+    // moved into the execute_under_savepoint closure. Schema ops are accumulated
+    // as deferred YAML writes (handled outside SAVEPOINT).
+    //
+    // Crux must_not_simplify 1: ALL DB ops (Query + Replace) share ONE SAVEPOINT.
+    // Splitting Replace into a second SAVEPOINT would break atomicity if a Query
+    // op runs before it and commits independently.
     //
     // Per design choice X1: YAML writes for schema ops are held in memory
-    // during SAVEPOINT; committed to disk only after SAVEPOINT succeeds.
+    // (deferred-write list) and only applied after SAVEPOINT commit succeeds —
+    // if SAVEPOINT fails, no YAML is touched.
 
     // Collect deferred YAML writes: (target_path, new_yaml_content, op_kind)
     enum DeferredYamlWrite {
@@ -785,79 +952,71 @@ pub async fn execute_batch(
     }
     let mut deferred_writes: Vec<DeferredYamlWrite> = Vec::new();
 
-    // Gather all query ops into a single SAVEPOINT if any.
-    let query_ops: Vec<(usize, &BatchOp)> = params
-        .ops
-        .iter()
-        .enumerate()
-        .filter(|(_, op)| matches!(op, BatchOp::Query { .. }))
-        .collect();
+    // Pre-process ops into DbOpSpec (Query + Replace) or deferred YAML (Schema*).
+    // Validation errors (empty match, non-scalar match values, invalid keys,
+    // items failing per-row schema validate) are returned HERE — before the
+    // SAVEPOINT is opened (Crux must_not_simplify 3).
+    let mut db_specs: Vec<DbOpSpec> = Vec::new();
 
-    if !query_ops.is_empty() {
-        let store_ref = store.as_ref().ok_or_else(|| MiniAppError::TableNotFound {
-            table: first_table.clone(),
-        })?;
-
-        // Collect SQL + params for query ops.
-        #[derive(Clone)]
-        struct QuerySpec {
-            idx: usize,
-            sql: String,
-            sql_params: Vec<String>,
-        }
-
-        let specs: Vec<QuerySpec> = query_ops
-            .iter()
-            .map(|(idx, op)| {
-                if let BatchOp::Query {
-                    sql,
-                    params: raw_params,
-                    ..
-                } = op
-                {
-                    let sql_params: Vec<String> = raw_params
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .iter()
-                        .map(|v| match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    QuerySpec {
-                        idx: *idx,
-                        sql: sql.clone(),
-                        sql_params,
-                    }
-                } else {
-                    unreachable!("filtered to Query ops only")
-                }
-            })
-            .collect();
-
-        store_ref
-            .execute_under_savepoint(move |sp| {
-                for spec in &specs {
-                    let params_refs: Vec<&dyn rusqlite::types::ToSql> = spec
-                        .sql_params
-                        .iter()
-                        .map(|s| s as &dyn rusqlite::types::ToSql)
-                        .collect();
-                    sp.execute(&spec.sql, params_refs.as_slice()).map_err(|e| {
-                        MiniAppError::BatchAborted {
-                            op_index: spec.idx,
-                            reason: e.to_string(),
-                        }
-                    })?;
-                }
-                Ok(())
-            })
-            .await?;
-    }
-
-    // Step 3d: Prepare deferred YAML writes for schema ops.
     for (idx, op) in params.ops.iter().enumerate() {
         match op {
+            BatchOp::Query {
+                sql,
+                params: raw_params,
+                ..
+            } => {
+                let sql_params: Vec<String> = raw_params
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                db_specs.push(DbOpSpec::Query {
+                    idx,
+                    sql: sql.clone(),
+                    sql_params,
+                });
+            }
+            BatchOp::Replace { r#match, items, .. } => {
+                // Build DELETE SQL + params. Returns Validation error (empty
+                // match / non-object / invalid key / non-scalar value) BEFORE
+                // SAVEPOINT opens. (Crux must_not_simplify 3)
+                // build_replace_delete_sql returns Validation error for empty match,
+                // non-object match, invalid keys, or non-scalar values — before SAVEPOINT.
+                // (Crux must_not_simplify 3)
+                let (delete_sql, delete_params) = build_replace_delete_sql(r#match)?;
+                db_specs.push(DbOpSpec::ReplaceDelete {
+                    idx,
+                    sql: delete_sql,
+                    sql_params: delete_params,
+                });
+
+                // Per-row validate + eager UUID/ts generation (R7: outside closure).
+                let schema_ref = schema_opt
+                    .as_ref()
+                    .expect("has_db_op => schema_opt present for Replace");
+                let ts = batch_now_secs();
+                for (i, item) in items.iter().enumerate() {
+                    schema_ref
+                        .validate(item)
+                        .map_err(|e| MiniAppError::BatchAborted {
+                            op_index: idx,
+                            reason: format!("items[{i}]: {e}"),
+                        })?;
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let data_str = serde_json::to_string(item)
+                        .expect("serde_json::Value serialization is infallible");
+                    db_specs.push(DbOpSpec::ReplaceInsert {
+                        idx,
+                        id,
+                        data_str,
+                        ts,
+                    });
+                }
+            }
             BatchOp::SchemaCreate {
                 table,
                 scope,
@@ -937,11 +1096,84 @@ pub async fn execute_batch(
                 let (_scope_root, yaml_path) = resolve_scope_paths(scope, table, config)?;
                 deferred_writes.push(DeferredYamlWrite::Remove { path: yaml_path });
             }
-            BatchOp::Query { .. } => {
-                // Already handled in SAVEPOINT block above.
-            }
         }
     }
+
+    // Execute all DB specs (Query + Replace) under a single SAVEPOINT.
+    // (Crux must_not_simplify 1: one SAVEPOINT, DELETE before INSERT per Replace op,
+    // error rolls back both phases.)
+    let (deleted, inserted) = if !db_specs.is_empty() {
+        let store_ref = store.as_ref().ok_or_else(|| MiniAppError::TableNotFound {
+            table: first_table.clone(),
+        })?;
+
+        let specs_clone = db_specs.clone();
+        store_ref
+            .execute_under_savepoint(move |sp| {
+                let mut deleted: u64 = 0;
+                let mut inserted: u64 = 0;
+                for spec in &specs_clone {
+                    match spec {
+                        DbOpSpec::Query {
+                            idx,
+                            sql,
+                            sql_params,
+                        } => {
+                            let params_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+                                .iter()
+                                .map(|s| s as &dyn rusqlite::types::ToSql)
+                                .collect();
+                            sp.execute(sql, params_refs.as_slice()).map_err(|e| {
+                                MiniAppError::BatchAborted {
+                                    op_index: *idx,
+                                    reason: e.to_string(),
+                                }
+                            })?;
+                        }
+                        DbOpSpec::ReplaceDelete {
+                            idx,
+                            sql,
+                            sql_params,
+                        } => {
+                            let params_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+                                .iter()
+                                .map(|s| s as &dyn rusqlite::types::ToSql)
+                                .collect();
+                            let n = sp.execute(sql, params_refs.as_slice()).map_err(|e| {
+                                MiniAppError::BatchAborted {
+                                    op_index: *idx,
+                                    reason: e.to_string(),
+                                }
+                            })?;
+                            deleted = deleted.saturating_add(n as u64);
+                        }
+                        DbOpSpec::ReplaceInsert {
+                            idx,
+                            id,
+                            data_str,
+                            ts,
+                        } => {
+                            sp.execute(
+                                "INSERT INTO rows (id, data, created_at, updated_at) \
+                                 VALUES (?1, ?2, ?3, ?4)",
+                                rusqlite::params![id, data_str, ts, ts],
+                            )
+                            .map_err(|e| {
+                                MiniAppError::BatchAborted {
+                                    op_index: *idx,
+                                    reason: e.to_string(),
+                                }
+                            })?;
+                            inserted = inserted.saturating_add(1);
+                        }
+                    }
+                }
+                Ok((deleted, inserted))
+            })
+            .await?
+    } else {
+        (0u64, 0u64)
+    };
 
     // ── 4. Apply deferred YAML writes ────────────────────────────────────────
     // SAVEPOINT committed (or no query ops). Now write/remove YAML files.
@@ -1031,12 +1263,23 @@ pub async fn execute_batch(
     // ── 7. Rebuild registry once at end (design choice Y1) ──────────────────
     rebuild_registry(config, tables).await?;
 
+    let has_replace = params
+        .ops
+        .iter()
+        .any(|op| matches!(op, BatchOp::Replace { .. }));
+    let affects = if has_replace {
+        Some(ReplaceAffects { deleted, inserted })
+    } else {
+        None
+    };
+
     let result = BatchResult {
         committed: true,
         ops_executed: params.ops.len(),
         yaml_writes,
         backups_written,
         registry_rebuilt: true,
+        affects,
     };
     serde_json::to_string(&result).map_err(|e| MiniAppError::Schema(e.to_string()))
 }
@@ -1135,6 +1378,25 @@ async fn compute_op_affects(
                 "table": table,
                 "would_remove_yaml": yaml_path.display().to_string(),
                 "rows_orphaned": rows_count,
+            }))
+        }
+        BatchOp::Replace {
+            table,
+            r#match,
+            items,
+        } => {
+            // dry_run: side-effect-free guarantee — no DELETE/INSERT executed,
+            // no SELECT COUNT(*) either (would touch the DB). would_delete_estimate
+            // is null because we cannot know without running the query.
+            let match_keys = r#match.as_object().map(|o| o.len()).unwrap_or(0);
+            Ok(serde_json::json!({
+                "op": "replace",
+                "table": table,
+                "match_keys": match_keys,
+                "items_count": items.len(),
+                "would_delete_estimate": null,
+                "would_insert": items.len(),
+                "note": "dry_run: DELETE/INSERT not executed",
             }))
         }
     }
@@ -2536,9 +2798,7 @@ mod tests {
             let data = format!(
                 "{{\"from\":\"persona-x\",\"to\":\"{to}\",\"type\":\"sister_of\",\"ts\":{initial_ts},\"strength\":1.0}}"
             );
-            values_parts.push(format!(
-                "('{id}', '{data}', {initial_ts}, {initial_ts})"
-            ));
+            values_parts.push(format!("('{id}', '{data}', {initial_ts}, {initial_ts})"));
         }
         let bulk_insert_sql = format!(
             "INSERT INTO rows (id, data, created_at, updated_at) VALUES {}",
@@ -2567,7 +2827,11 @@ mod tests {
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
             let rows = entry.store.list(Some(100), None).await.unwrap();
-            assert_eq!(rows.len(), 5, "5 sister_of edges must exist after bulk insert");
+            assert_eq!(
+                rows.len(),
+                5,
+                "5 sister_of edges must exist after bulk insert"
+            );
         }
 
         // ──────────────────────────────────────────────────────────────────
@@ -2595,9 +2859,7 @@ mod tests {
             let data = format!(
                 "{{\"from\":\"persona-x\",\"to\":\"{to}\",\"type\":\"sister_of\",\"ts\":{replace_ts},\"strength\":0.8}}"
             );
-            new_values_parts.push(format!(
-                "('{id}', '{data}', {replace_ts}, {replace_ts})"
-            ));
+            new_values_parts.push(format!("('{id}', '{data}', {replace_ts}, {replace_ts})"));
         }
         let new_insert_sql = format!(
             "INSERT INTO rows (id, data, created_at, updated_at) VALUES {}",
@@ -2622,8 +2884,7 @@ mod tests {
         let replace_result_str = execute_batch(&config, &tables, replace_params)
             .await
             .expect("bulk replace must succeed");
-        let replace_result: serde_json::Value =
-            serde_json::from_str(&replace_result_str).unwrap();
+        let replace_result: serde_json::Value = serde_json::from_str(&replace_result_str).unwrap();
         assert_eq!(replace_result["committed"], true);
         assert_eq!(replace_result["ops_executed"], 2);
 
