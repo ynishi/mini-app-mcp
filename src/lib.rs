@@ -58,3 +58,9 @@ pub mod backup;
 /// exclusively by `MINI_APP_SNAPSHOT_RETENTION` (separate from backup
 /// retention).
 pub mod snapshot;
+
+/// Server-side row filter for the `list` tool.
+///
+/// [`filter::ListFilter`] is a serde tagged enum (Eq / In / Or / And) that
+/// supports schema-validated field filtering and recursive composition.
+pub mod filter;
