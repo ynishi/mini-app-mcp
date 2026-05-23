@@ -2398,7 +2398,7 @@ mod tests {
         // Verify row was inserted.
         let guard = tables.load();
         let entry = guard.resolve(Some("items")).expect("items must be mounted");
-        let rows = entry.store.list(Some(10), None).await.unwrap();
+        let rows = entry.store.list(Some(10), None, None).await.unwrap();
         assert_eq!(rows.len(), 1, "committed INSERT must persist");
     }
 
@@ -2562,7 +2562,7 @@ mod tests {
         // After rollback: no rows must exist (Crux SAVEPOINT atomicity).
         let guard = tables.load();
         let entry = guard.resolve(Some("items")).expect("items must be mounted");
-        let rows = entry.store.list(Some(10), None).await.unwrap();
+        let rows = entry.store.list(Some(10), None, None).await.unwrap();
         assert_eq!(
             rows.len(),
             0,
@@ -2860,7 +2860,7 @@ mod tests {
             let entry = guard
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
-            let rows = entry.store.list(Some(100), None).await.unwrap();
+            let rows = entry.store.list(Some(100), None, None).await.unwrap();
             assert_eq!(
                 rows.len(),
                 5,
@@ -2928,7 +2928,7 @@ mod tests {
             let entry = guard
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
-            let rows = entry.store.list(Some(100), None).await.unwrap();
+            let rows = entry.store.list(Some(100), None, None).await.unwrap();
             assert_eq!(rows.len(), 5, "5 new sister_of edges after replace");
 
             let tos: std::collections::HashSet<String> = rows
@@ -3025,7 +3025,7 @@ mod tests {
             let entry = guard
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
-            let rows = entry.store.list(Some(100), None).await.unwrap();
+            let rows = entry.store.list(Some(100), None, None).await.unwrap();
             assert_eq!(rows.len(), 5, "5 rows must exist before Replace");
         }
 
@@ -3072,7 +3072,7 @@ mod tests {
         let entry = guard
             .resolve(Some("relations"))
             .expect("relations must be mounted");
-        let rows = entry.store.list(Some(100), None).await.unwrap();
+        let rows = entry.store.list(Some(100), None, None).await.unwrap();
         assert_eq!(
             rows.len(),
             5,
@@ -3128,7 +3128,7 @@ mod tests {
             let entry = guard
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
-            let rows = entry.store.list(Some(100), None).await.unwrap();
+            let rows = entry.store.list(Some(100), None, None).await.unwrap();
             assert_eq!(rows.len(), 5, "5 rows before invalid Replace attempts");
         }
 
@@ -3161,7 +3161,7 @@ mod tests {
             let entry = guard
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
-            let rows = entry.store.list(Some(100), None).await.unwrap();
+            let rows = entry.store.list(Some(100), None, None).await.unwrap();
             assert_eq!(
                 rows.len(),
                 5,
@@ -3269,7 +3269,7 @@ mod tests {
         let entry = guard
             .resolve(Some("relations"))
             .expect("relations must be mounted");
-        let rows = entry.store.list(Some(100), None).await.unwrap();
+        let rows = entry.store.list(Some(100), None, None).await.unwrap();
         assert_eq!(rows.len(), 4, "4 rows total after Replace");
 
         let tos: std::collections::HashSet<String> = rows
@@ -3342,7 +3342,7 @@ mod tests {
             let entry = guard
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
-            let rows = entry.store.list(Some(100), None).await.unwrap();
+            let rows = entry.store.list(Some(100), None, None).await.unwrap();
             assert_eq!(rows.len(), 10, "10 rows before Replace");
         }
 
@@ -3388,7 +3388,7 @@ mod tests {
         let entry = guard
             .resolve(Some("relations"))
             .expect("relations must be mounted");
-        let rows = entry.store.list(Some(100), None).await.unwrap();
+        let rows = entry.store.list(Some(100), None, None).await.unwrap();
         assert_eq!(
             rows.len(),
             8,
@@ -3459,7 +3459,7 @@ mod tests {
             let entry = guard
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
-            let rows = entry.store.list(Some(100), None).await.unwrap();
+            let rows = entry.store.list(Some(100), None, None).await.unwrap();
             assert_eq!(rows.len(), 5, "5 rows before null match attempt");
         }
 
@@ -3487,7 +3487,7 @@ mod tests {
         let entry = guard
             .resolve(Some("relations"))
             .expect("relations must be mounted");
-        let rows = entry.store.list(Some(100), None).await.unwrap();
+        let rows = entry.store.list(Some(100), None, None).await.unwrap();
         assert_eq!(
             rows.len(),
             5,
@@ -3524,7 +3524,7 @@ mod tests {
             let entry = guard
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
-            let rows = entry.store.list(Some(100), None).await.unwrap();
+            let rows = entry.store.list(Some(100), None, None).await.unwrap();
             assert_eq!(rows.len(), 5, "5 rows before number match attempt");
         }
 
@@ -3552,7 +3552,7 @@ mod tests {
         let entry = guard
             .resolve(Some("relations"))
             .expect("relations must be mounted");
-        let rows = entry.store.list(Some(100), None).await.unwrap();
+        let rows = entry.store.list(Some(100), None, None).await.unwrap();
         assert_eq!(
             rows.len(),
             5,
@@ -3589,7 +3589,7 @@ mod tests {
             let entry = guard
                 .resolve(Some("relations"))
                 .expect("relations must be mounted");
-            let rows = entry.store.list(Some(100), None).await.unwrap();
+            let rows = entry.store.list(Some(100), None, None).await.unwrap();
             assert_eq!(rows.len(), 5, "5 rows before bool match attempt");
         }
 
@@ -3617,7 +3617,7 @@ mod tests {
         let entry = guard
             .resolve(Some("relations"))
             .expect("relations must be mounted");
-        let rows = entry.store.list(Some(100), None).await.unwrap();
+        let rows = entry.store.list(Some(100), None, None).await.unwrap();
         assert_eq!(
             rows.len(),
             5,
