@@ -322,7 +322,38 @@ The `replace` op runs DELETE WHERE (match) + N INSERTs inside a single SAVEPOINT
 
 ### Listing edges (sub-1000 scope)
 
-The `list` tool returns rows in `created_at DESC` order with `limit` capped at 1000 and no `WHERE` filter. For typical persona graphs (~90 nodes, a few hundred edges), fetch the full edge set in one call and filter client-side:
+The `list` tool returns rows in `created_at DESC` order with `limit` capped at 1000. An optional `filter` argument enables server-side row filtering over schema-validated fields.
+
+#### Filter variants
+
+| type | description |
+|---|---|
+| `eq` | Equality match: `{"type": "eq", "field": "...", "value": ...}` |
+| `in` | Set membership: `{"type": "in", "field": "...", "values": [...]}` |
+| `or` | OR composition: `{"type": "or", "filters": [...]}` |
+| `and` | AND composition: `{"type": "and", "filters": [...]}` |
+
+`or` and `and` accept `Vec<ListFilter>` recursively, enabling nested compositions to arbitrary depth.
+
+**Constraints**: field names must be registered in the table's `schema.yaml` (unknown fields return a `VALIDATION_ERROR`). Values are type-checked against the schema field's declared type — the same typed scalar validation applied to `BatchOp::Replace` match values. Omitting `filter` returns all rows within `limit`/`offset` (full backward compatibility).
+
+#### Mailbox-style OR filter example
+
+Fetch messages addressed to "alice" or "broadcast" in a single call:
+
+```json
+{
+  "filter": {
+    "type": "or",
+    "filters": [
+      {"type": "eq", "field": "to", "value": "alice"},
+      {"type": "eq", "field": "to", "value": "broadcast"}
+    ]
+  }
+}
+```
+
+For small graphs where client-side filtering is sufficient:
 
 ```python
 edges = mini_app.list(table="relations", limit=1000)
@@ -331,8 +362,6 @@ sisters_of_x = [
     if e["data"]["from"] == "persona-x" and e["data"]["type"] == "sister_of"
 ]
 ```
-
-If the edge count grows past 1000, server-side filtering (`list_by`) is tracked as future work.
 
 ## Storage notes
 
