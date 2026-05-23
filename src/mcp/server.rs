@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::MiniAppError;
+use crate::filter::ListFilter;
 use crate::mcp::registry::TableRegistry;
 use crate::mcp::resources as res;
 use crate::mcp::schema_tools::{
@@ -588,6 +589,12 @@ struct ListParams {
     /// `MINI_APP_DB`) this may be omitted and the single configured table is
     /// used automatically.
     table: Option<String>,
+    /// Optional server-side filter.  Supports `Eq`, `In`, `Or`, and `And`
+    /// variants.  All field names must be present in the table's `schema.yaml`
+    /// and values must match the schema-declared type.  Omitting this argument
+    /// (or passing `null`) returns all rows unfiltered (backward-compatible).
+    #[serde(default)]
+    filter: Option<ListFilter>,
 }
 
 /// Parameters for the `update` tool.
@@ -721,10 +728,11 @@ impl MiniAppMcpServer {
         serde_json::to_string(&record).map_err(|e| e.to_string())
     }
 
-    /// List rows with optional pagination.
+    /// List rows with optional pagination and server-side filtering.
     #[tool(
         name = "list",
         description = "List rows ordered by created_at descending. Supports limit (default 100, max 1000) and offset. \
+                       Optional `filter` argument supports Eq/In/Or/And composition over schema-validated fields. \
                        In multi-table mode, `table` is required; omitting it returns a \
                        TABLE_REQUIRED error (data.code=\"TABLE_REQUIRED\"). \
                        In legacy single-table mode (`MINI_APP_SCHEMA`+`MINI_APP_DB`), `table` may be omitted. \
@@ -740,11 +748,14 @@ impl MiniAppMcpServer {
         &self,
         Parameters(params): Parameters<ListParams>,
     ) -> Result<String, String> {
-        let (store, _schema) = self
+        let (store, schema) = self
             .resolve_table(params.table.as_deref())
             .map_err(|e| e.to_string())?;
+        if let Some(ref f) = params.filter {
+            f.validate(&schema).map_err(|e| e.to_string())?;
+        }
         let records = store
-            .list(params.limit, params.offset)
+            .list(params.limit, params.offset, params.filter)
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_string(&records).map_err(|e| e.to_string())
@@ -1220,6 +1231,7 @@ fields:\n\
                 limit,
                 offset,
                 table: None,
+                filter: None,
             }))
             .await?;
         Ok(serde_json::from_str(&json).unwrap())

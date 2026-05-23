@@ -351,7 +351,7 @@ async fn test_dual_store_wal_no_lock_conflict() {
         tokio::spawn(async move {
             for _ in 0..10 {
                 let rows = s
-                    .list(Some(10), None)
+                    .list(Some(10), None, None)
                     .await
                     .expect("old_store list must not return SQLITE_BUSY");
                 assert!(!rows.is_empty(), "must have at least the seed row");
