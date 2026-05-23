@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ListFilter enum (Eq/In/Or/And) for server-side row filtering in `list` tool. Supports recursive Or/And composition over schema-validated fields with typed scalar checking. `filter=None` keeps full backward compatibility for existing callers.
+
 ## [0.7.0] - 2026-05-21
 
 > **Note**: This release adds a new `BatchOp::Replace` variant to the existing `BatchOp` enum. Per [Cargo SemVer Compatibility §1.3.5](https://doc.rust-lang.org/cargo/reference/semver.html#enum-variant-new), adding a variant to a non-`#[non_exhaustive]` enum is a SemVer-major change — pre-1.0 this is signalled by a minor bump (0.6.0 → 0.7.0), same convention as 0.5.x → 0.6.0. JSON / MCP wire format is fully back-compatible via `#[serde(tag = "op", rename_all = "snake_case")]`; only Rust-level downstream consumers that exhaustively `match` on `BatchOp` need to add a `BatchOp::Replace { .. } => ...` arm.
