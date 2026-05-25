@@ -70,7 +70,7 @@ All tools accept an optional `table` argument that selects the target table. In 
 | `create` | Inserts a new row; validates the `data` object against the schema |
 | `get` | Retrieves a single row by `id` |
 | `list` | Returns rows with optional `limit` / `offset` pagination |
-| `update` | Replaces the `data` of an existing row by `id` |
+| `update` | Updates an existing row by `id`. Default mode is **merge** (RFC 7396): absent fields are preserved from the stored row, `null` values delete optional fields or raise a Validation error for required ones. Pass `"mode": "replace"` for full replacement (pre-0.9 behaviour). |
 | `delete` | Removes a row by `id` |
 | `reload` | Re-scan `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and atomically replace the table registry. Legacy `MINI_APP_SCHEMA` + `MINI_APP_DB` are re-applied if set. Returns `{ mounted, added, removed }`. Limitations: no file watcher (explicit invocation only); whole-registry replace (no per-table partial reload); no schema migration for existing rows; concurrent `reload` calls are last-write-wins. |
 | `schema_create` | Create a new `schema.yaml` under the specified `scope` (`project` or `user`) and register the table live. Pass `dry_run: true` to preview without writing. Fails with `SCHEMA_EXISTS` if the table already exists. |
@@ -441,6 +441,41 @@ sisters_of_x = [
     if e["data"]["from"] == "persona-x" and e["data"]["type"] == "sister_of"
 ]
 ```
+
+## Update semantics: merge vs replace
+
+The `update` tool supports two modes controlled by the optional `"mode"` field.
+
+### Merge mode (default)
+
+```json
+update(table="notes", id="<uuid>", data={"state": "done"})
+// or equivalently:
+update(table="notes", id="<uuid>", data={"state": "done"}, mode="merge")
+```
+
+Merge mode follows [RFC 7396 (JSON Merge Patch)](https://datatracker.ietf.org/doc/html/rfc7396) shallow semantics:
+
+- **Absent fields are preserved** — keys not present in `data` keep their stored values.
+- **Non-null values overwrite** — a key present in `data` with a non-null value replaces the stored value for that key. Nested objects are replaced wholesale (no deep merge).
+- **`null` deletes an optional field** — if a key's value is `null` and the field is `required: false` in the schema, the field is removed from the stored row.
+- **`null` on a required field is a Validation error** — if a key's value is `null` and the field is `required: true`, the call fails with `VALIDATION_ERROR` before any write occurs.
+- **Full schema validation runs on the merged result** — after merging, the complete merged object is validated against the schema. Any constraint violation (missing required field, type mismatch) returns a Validation error and the row is not updated.
+
+### Replace mode
+
+```json
+update(table="notes", id="<uuid>", data={...}, mode="replace")
+```
+
+Replace mode performs a full replacement: `data` is validated against the schema and then written as-is, completely overwriting the stored row. This is identical to the behaviour of `update` before version 0.9. Callers that relied on the old default and send partial `data` objects should switch to `mode="replace"` to restore the original behaviour.
+
+### Choosing a mode
+
+| Mode | When to use |
+|---|---|
+| `merge` (default) | Partial updates — only send the fields you want to change. Existing fields you omit are untouched. |
+| `replace` | Full rewrites — you supply the complete intended state of the row. Omitted fields are deleted. |
 
 ## Storage notes
 
