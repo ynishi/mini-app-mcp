@@ -77,6 +77,21 @@ Create per-table SQLite snapshot dump(s) under `{scope_root}/_snapshots/`. Uses 
 - **Output (dry_run=true)**: `{ "dry_run": true, "affects": { "target_tables": [...], "row_counts": {"table": N}, "would_purge_generations": {"table": N} } }`
 - **Retention**: controlled by `MINI_APP_SNAPSHOT_RETENTION` (default 10); strictly separate from `MINI_APP_BACKUP_RETENTION`.
 - Annotations: `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=false`
+
+## `row_materialize`
+Write row data from a table to absolute filesystem path(s) with multi-format serialisation and SHA-256 integrity digest.
+- **Input**: `{ "table": "<name>" (optional), "selector": {...}, "fields": {...}, "format": "...", "dest": "<absolute-path>", "concat": true|false (optional), "write_mode": "overwrite"|"error" (optional), "dry_run": true|false (optional) }`
+  - `selector`: `{"type": "by_id", "id": "<uuid>"}` or `{"type": "by_filter", "filter": {...}, "limit": N, "offset": N}`.
+  - `fields`: `{"mode": "all"}` (all schema fields in declaration order) or `{"mode": "list", "fields": ["f1", "f2"]}` (named subset in specified order).
+  - `format`: `raw` (`.txt`, field values joined by newlines) | `markdown` (`.md`, field headings) | `json` (`.json`, JSON object/array) | `yaml` (`.yaml`, YAML document/stream).
+  - `dest`: **absolute path required** — relative paths are rejected immediately (`MATERIALIZE_DEST_RELATIVE`). When `concat=false` this is a directory; when `concat=true` it is the output file path.
+  - `concat`: `false` (default) — one file per row at `{dest}/{id}.{ext}`, `row_id` is set in each result. `true` — all rows concatenated into one file at `{dest}`, `row_id` is `null`. `concat=true` with `selector=by_id` is an error.
+  - `write_mode`: `overwrite` (default) | `error` (return `MATERIALIZE_DEST_INVALID` if target file already exists; checked even with `dry_run=true`).
+  - `dry_run`: `true` — validation, projection, serialisation, and SHA-256 computation run normally but **no file is written**; returned `files` carry would-be `path`, `bytes`, and `sha256` values.
+- **Output**: `{ "count": N, "files": [{ "path": "<abs-path>", "bytes": N, "sha256": "<64-char-hex>", "row_id": "<uuid>" | null }, ...] }`
+  - `sha256` is always a 64-character lower-hex SHA-256 digest (never empty, even with `dry_run=true`).
+  - `row_id` is `null` when `concat=true`; the source row UUID when `concat=false`.
+- Annotations: `readOnlyHint=false`, `destructiveHint=true`, `idempotentHint=true`
 "#;
 
 /// Hand-written reference table of all error codes from `src/error.rs`.
@@ -100,6 +115,15 @@ All MCP errors carry a structured JSON `data` object with at minimum:
 | `TABLE_NOT_FOUND` | 404 | The specified `table` name is not mounted in the server. Also includes `"table": "<name>"` in `data`. |
 | `TABLE_REQUIRED` | 422 | Multi-table mode requires a `table` argument but it was omitted. |
 | `SNAPSHOT_ERROR` | 500 | SQLite snapshot creation or purge failed. |
+| `MATERIALIZE_DEST_RELATIVE` | 422 | The `dest` path supplied to `row_materialize` is not absolute. Absolute paths are required (Agent-First trust model). Also includes `"path": "<path>"` in `data`. |
+| `MATERIALIZE_DEST_INVALID` | 422 | The `dest` path is absolute but invalid (e.g. parent directory cannot be created, or file already exists when `write_mode=error`). Also includes `"path"` and `"reason"` in `data`. |
+| `MATERIALIZE_IO_ERROR` | 500 | A filesystem I/O error occurred during `row_materialize` (file write failure). |
+| `MATERIALIZE_SHA256_ERROR` | 500 | SHA-256 computation failed during `row_materialize` (e.g. blocking task panic). |
+| `MATERIALIZE_ROW_NOT_FOUND` | 404 | The row id specified in a `by_id` selector was not found. Also includes `"id": "<id>"` in `data`. |
+| `MATERIALIZE_EMPTY_RESULT` | 404 | The `by_filter` selector matched zero rows. |
+| `MATERIALIZE_FORMAT_ERROR` | 500 | Serialisation to the requested format failed during `row_materialize`. |
+| `MATERIALIZE_FIELD_UNKNOWN` | 422 | A projected field name is not present in the table schema. Also includes `"field": "<name>"` in `data`. |
+| `MATERIALIZE_INVALID_PARAM` | 422 | `row_materialize` parameters are structurally invalid (e.g. `concat=true` with `selector=by_id`). Also includes `"field"` and `"reason"` in `data`. |
 
 ## Validation Error Example
 ```json
@@ -304,6 +328,15 @@ mod tests {
             "TABLE_NOT_FOUND",
             "TABLE_REQUIRED",
             "SNAPSHOT_ERROR",
+            "MATERIALIZE_DEST_RELATIVE",
+            "MATERIALIZE_DEST_INVALID",
+            "MATERIALIZE_IO_ERROR",
+            "MATERIALIZE_SHA256_ERROR",
+            "MATERIALIZE_ROW_NOT_FOUND",
+            "MATERIALIZE_EMPTY_RESULT",
+            "MATERIALIZE_FORMAT_ERROR",
+            "MATERIALIZE_FIELD_UNKNOWN",
+            "MATERIALIZE_INVALID_PARAM",
         ] {
             assert!(
                 ERRORS_DOC.contains(code),
@@ -317,6 +350,14 @@ mod tests {
         assert!(
             TOOLS_DOC.contains("## `data_snapshot`"),
             "TOOLS_DOC must contain section for 'data_snapshot'"
+        );
+    }
+
+    #[test]
+    fn tools_doc_contains_row_materialize() {
+        assert!(
+            TOOLS_DOC.contains("## `row_materialize`"),
+            "TOOLS_DOC must contain section for 'row_materialize'"
         );
     }
 }

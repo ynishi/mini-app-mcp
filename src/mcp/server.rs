@@ -1,8 +1,8 @@
 /// MCP server implementation for mini-app-mcp.
 ///
-/// Exposes 12 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
+/// Exposes 13 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
 /// `reload`, `schema_create`, `schema_update`, `schema_delete`, `schema_batch`,
-/// `data_snapshot`) and resources
+/// `data_snapshot`, `row_materialize`) and resources
 /// (`schema://yaml`, `schema://json`, `schema://json-schema`, `docs://readme`,
 /// `docs://tools`, `docs://errors`) as MCP capabilities over stdio transport.
 /// No HTTP / REST / CLI-CRUD entry points are provided (Crux "MCP-only entry
@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::error::MiniAppError;
 use crate::filter::ListFilter;
+use crate::materialize::{self, MaterializeParams};
 use crate::mcp::registry::TableRegistry;
 use crate::mcp::resources as res;
 use crate::mcp::schema_tools::{
@@ -1132,6 +1133,85 @@ impl MiniAppMcpServer {
             .await
             .map_err(|e| e.to_string())
     }
+
+    /// Write row data from a table to absolute filesystem path(s).
+    ///
+    /// Selects rows via `selector` (by UUID or by filter predicate), projects
+    /// the fields listed in `fields`, serialises to `format`, and writes the
+    /// result to `dest`.
+    ///
+    /// # selector
+    /// `{"type": "by_id", "id": "<uuid>"}` — fetch one row.
+    /// `{"type": "by_filter", "filter": {...}, "limit": N, "offset": N}` — fetch
+    /// rows matching a [`ListFilter`] predicate.
+    ///
+    /// # fields
+    /// `{"mode": "all"}` — all schema fields in declaration order.
+    /// `{"mode": "list", "fields": ["f1", "f2"]}` — named subset in specified order.
+    ///
+    /// # format
+    /// `raw` → `.txt` (field values joined by newlines).
+    /// `markdown` → `.md` (each field as a heading + body).
+    /// `json` → `.json` (JSON object per row; array when concat=true).
+    /// `yaml` → `.yaml` (YAML document per row; document stream when concat=true).
+    ///
+    /// # dest
+    /// **Absolute path required** (Agent-First trust model — relative paths are
+    /// rejected immediately with `MATERIALIZE_DEST_RELATIVE`).
+    /// When `concat=false` (default): treated as a directory; each row is
+    /// written to `{dest}/{row_id}.{ext}`.
+    /// When `concat=true`: treated as a file path; all rows are concatenated
+    /// into a single file.
+    ///
+    /// # concat
+    /// `false` (default): one file per row, `row_id` set in each result entry.
+    /// `true`: all rows concatenated into one file, `row_id` is `null`.
+    /// Note: `concat=true` with `selector=by_id` is an error.
+    ///
+    /// # write_mode
+    /// `overwrite` (default): existing files are overwritten.
+    /// `error`: returns `MATERIALIZE_DEST_INVALID` if the target file exists.
+    ///
+    /// # dry_run
+    /// `true`: validation, projection, serialisation, and SHA-256 computation
+    /// run normally, but **no file is written**.  The returned `files` entries
+    /// carry would-be `path`, `bytes`, and `sha256` values.
+    ///
+    /// # Return
+    /// `{ "count": N, "files": [{ "path": "...", "bytes": N, "sha256": "...", "row_id": "..." | null }, ...] }`
+    #[tool(
+        name = "row_materialize",
+        description = "Write row data from a table to absolute filesystem path(s). \
+                       selector: {type:by_id,id:...} or {type:by_filter,filter:{...},limit?,offset?}. \
+                       fields: {mode:all} or {mode:list,fields:[...]}. \
+                       format: raw|markdown|json|yaml (extensions .txt/.md/.json/.yaml). \
+                       dest: ABSOLUTE path required — relative paths are rejected (Agent-First trust). \
+                       When concat=false (default) dest is a directory and each row becomes {dest}/{id}.{ext} with row_id set. \
+                       When concat=true dest is a file path and all rows are merged; row_id is null. \
+                       concat=true with selector=by_id is an error. \
+                       write_mode: overwrite (default) | error (fail if file exists, even with dry_run). \
+                       dry_run=true: compute sha256/bytes but do NOT write any file. \
+                       Returns {count:N, files:[{path,bytes,sha256,row_id}]}.",
+        annotations(
+            read_only_hint = false,
+            idempotent_hint = true,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn tool_materialize(
+        &self,
+        Parameters(params): Parameters<MaterializeParams>,
+    ) -> Result<String, String> {
+        materialize::do_materialize(&self.mount_config, &self.tables, params)
+            .await
+            .and_then(|r| {
+                serde_json::to_string(&r).map_err(|e| {
+                    crate::error::MiniAppError::MaterializeFormatError(format!("json result: {e}"))
+                })
+            })
+            .map_err(|e| e.to_string())
+    }
 }
 
 // =============================================================================
@@ -1268,7 +1348,7 @@ fields:\n\
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn list_tools_contains_all_twelve() {
+    async fn list_tools_contains_all_thirteen() {
         let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -1285,13 +1365,14 @@ fields:\n\
             "schema_delete",
             "schema_batch",
             "data_snapshot",
+            "row_materialize",
         ] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(tools.len(), 12, "expected exactly 12 tools");
+        assert_eq!(tools.len(), 13, "expected exactly 13 tools");
     }
 
     /// RED: ensure create/update tools advertise `data` as an object in their
