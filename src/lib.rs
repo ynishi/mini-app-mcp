@@ -64,3 +64,12 @@ pub mod snapshot;
 /// [`filter::ListFilter`] is a serde tagged enum (Eq / In / Or / And) that
 /// supports schema-validated field filtering and recursive composition.
 pub mod filter;
+
+/// `row_materialize` MCP tool — row selection, field projection, and
+/// multi-format filesystem output with SHA-256 integrity digest.
+///
+/// [`materialize::do_materialize`] is the handler invoked by `tool_materialize`
+/// in `mcp::server`.  It enforces the Agent-First absolute-path trust model
+/// (Crux #1), returns a SHA-256 hex digest for every output file (Crux #3),
+/// and is covered by the format × selector × concat grid test suite (Crux #2).
+pub mod materialize;
