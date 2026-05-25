@@ -44,6 +44,24 @@ pub mod codes {
     pub const BATCH_ABORTED: &str = "BATCH_ABORTED";
     /// Returned when a snapshot I/O or SQLite snapshot operation fails.
     pub const SNAPSHOT_ERROR: &str = "SNAPSHOT_ERROR";
+    /// Returned when the `row_materialize` dest path is relative (absolute required).
+    pub const MATERIALIZE_DEST_RELATIVE: &str = "MATERIALIZE_DEST_RELATIVE";
+    /// Returned when the `row_materialize` dest path is invalid for another reason.
+    pub const MATERIALIZE_DEST_INVALID: &str = "MATERIALIZE_DEST_INVALID";
+    /// Returned when a file I/O error occurs during `row_materialize`.
+    pub const MATERIALIZE_IO_ERROR: &str = "MATERIALIZE_IO_ERROR";
+    /// Returned when SHA-256 computation fails during `row_materialize`.
+    pub const MATERIALIZE_SHA256_ERROR: &str = "MATERIALIZE_SHA256_ERROR";
+    /// Returned when the specified row id is not found during `row_materialize`.
+    pub const MATERIALIZE_ROW_NOT_FOUND: &str = "MATERIALIZE_ROW_NOT_FOUND";
+    /// Returned when the filter in `row_materialize` matches zero rows.
+    pub const MATERIALIZE_EMPTY_RESULT: &str = "MATERIALIZE_EMPTY_RESULT";
+    /// Returned when serialization to the requested format fails during `row_materialize`.
+    pub const MATERIALIZE_FORMAT_ERROR: &str = "MATERIALIZE_FORMAT_ERROR";
+    /// Returned when a projected field name is not present in the schema.
+    pub const MATERIALIZE_FIELD_UNKNOWN: &str = "MATERIALIZE_FIELD_UNKNOWN";
+    /// Returned when `row_materialize` parameters are structurally invalid.
+    pub const MATERIALIZE_INVALID_PARAM: &str = "MATERIALIZE_INVALID_PARAM";
 }
 
 /// All errors that can arise inside mini-app-mcp.
@@ -72,6 +90,27 @@ pub mod codes {
 ///   inner `String` unifies errors from both `rusqlite::Error` and `io::Error`
 ///   origins (K-79: avoids multiple `#[from]` conflict with existing
 ///   `Storage` and `Io` variants).
+/// - `MaterializeDestRelative` — the destination path supplied to
+///   `row_materialize` is not absolute.  Absolute paths are required (Agent-First
+///   trust model).
+/// - `MaterializeDestInvalid` — the destination path is absolute but invalid
+///   for another reason (e.g. parent directory cannot be created, or the path
+///   already exists as a file when `write_mode = Error`).
+/// - `MaterializeIo` — a filesystem I/O error occurred during `row_materialize`.
+///   The inner `String` carries the error message (K-79: avoids conflict with
+///   the existing `Io` variant).
+/// - `MaterializeSha256` — SHA-256 computation failed during `row_materialize`
+///   (e.g. `spawn_blocking` task panicked).
+/// - `MaterializeRowNotFound` — the row id specified in a `ById` selector was
+///   not found.
+/// - `MaterializeEmptyResult` — a `ByFilter` selector matched zero rows and
+///   `ignore_empty` is false.
+/// - `MaterializeFormatError` — serialization to the requested format failed.
+///   The inner `String` carries the serializer error message (K-79).
+/// - `MaterializeFieldUnknown` — a projected field name is not present in the
+///   table schema.
+/// - `MaterializeInvalidParam` — `row_materialize` parameters are structurally
+///   inconsistent (e.g. `concat=true` with a single-row `ById` selector).
 #[derive(Error, Debug)]
 pub enum MiniAppError {
     /// Validation failed for a specific field.
@@ -163,6 +202,77 @@ pub enum MiniAppError {
     /// - `reason`: human-readable description of why the op failed.
     #[error("batch aborted at op #{op_index}: {reason}")]
     BatchAborted { op_index: usize, reason: String },
+
+    /// The destination path supplied to `row_materialize` is not absolute.
+    ///
+    /// Agent-First trust model: absolute paths are required; relative paths are
+    /// rejected at parameter validation time.
+    ///
+    /// # Fields
+    /// - `path`: the relative path that was rejected.
+    #[error("materialize dest must be absolute: {path}")]
+    MaterializeDestRelative { path: String },
+
+    /// The destination path is absolute but invalid for another reason.
+    ///
+    /// Examples: the parent directory cannot be created, or the path already
+    /// exists as a file when `write_mode = Error`.
+    ///
+    /// # Fields
+    /// - `path`: the offending path.
+    /// - `reason`: human-readable description of the problem.
+    #[error("materialize dest invalid '{path}': {reason}")]
+    MaterializeDestInvalid { path: String, reason: String },
+
+    /// A filesystem I/O error occurred during `row_materialize`.
+    ///
+    /// The inner `String` unifies error messages from `std::io::Error`.
+    /// A dedicated string-tuple variant (rather than `#[from]` conversion) is
+    /// used to avoid conflict with the existing `Io` variant (K-79).
+    #[error("materialize io error: {0}")]
+    MaterializeIo(String),
+
+    /// SHA-256 computation failed during `row_materialize`.
+    ///
+    /// The inner `String` carries the error detail (e.g. `spawn_blocking` panic
+    /// message).  A string-tuple variant avoids `#[from]` conflicts (K-79).
+    #[error("materialize sha256 error: {0}")]
+    MaterializeSha256(String),
+
+    /// The row id specified in a `ById` selector was not found.
+    ///
+    /// # Fields
+    /// - `id`: the row identifier that was not found.
+    #[error("materialize row not found: {id}")]
+    MaterializeRowNotFound { id: String },
+
+    /// A `ByFilter` selector matched zero rows and `ignore_empty` is false.
+    #[error("materialize filter matched zero rows")]
+    MaterializeEmptyResult,
+
+    /// Serialization to the requested output format failed.
+    ///
+    /// The inner `String` carries the serializer error message.  A string-tuple
+    /// variant avoids `#[from]` conflicts (K-79).
+    #[error("materialize format error: {0}")]
+    MaterializeFormatError(String),
+
+    /// A projected field name is not present in the table schema.
+    ///
+    /// # Fields
+    /// - `field`: the unknown field name.
+    #[error("materialize unknown field: {field}")]
+    MaterializeFieldUnknown { field: String },
+
+    /// `row_materialize` parameters are structurally inconsistent.
+    ///
+    /// Examples: `concat=true` combined with a single-row `ById` selector.
+    ///
+    /// # Fields
+    /// - `field`: the parameter name that is invalid.
+    /// - `reason`: human-readable description of the inconsistency.
+    #[error("materialize invalid param '{field}': {reason}")]
+    MaterializeInvalidParam { field: String, reason: String },
 }
 
 impl MiniAppError {
@@ -188,6 +298,15 @@ impl MiniAppError {
             MiniAppError::Backup(_) => codes::BACKUP_ERROR,
             MiniAppError::Snapshot(_) => codes::SNAPSHOT_ERROR,
             MiniAppError::BatchAborted { .. } => codes::BATCH_ABORTED,
+            MiniAppError::MaterializeDestRelative { .. } => codes::MATERIALIZE_DEST_RELATIVE,
+            MiniAppError::MaterializeDestInvalid { .. } => codes::MATERIALIZE_DEST_INVALID,
+            MiniAppError::MaterializeIo(_) => codes::MATERIALIZE_IO_ERROR,
+            MiniAppError::MaterializeSha256(_) => codes::MATERIALIZE_SHA256_ERROR,
+            MiniAppError::MaterializeRowNotFound { .. } => codes::MATERIALIZE_ROW_NOT_FOUND,
+            MiniAppError::MaterializeEmptyResult => codes::MATERIALIZE_EMPTY_RESULT,
+            MiniAppError::MaterializeFormatError(_) => codes::MATERIALIZE_FORMAT_ERROR,
+            MiniAppError::MaterializeFieldUnknown { .. } => codes::MATERIALIZE_FIELD_UNKNOWN,
+            MiniAppError::MaterializeInvalidParam { .. } => codes::MATERIALIZE_INVALID_PARAM,
         }
     }
 }
@@ -243,6 +362,43 @@ impl From<MiniAppError> for McpError {
                     "code": code,
                     "message": message,
                     "op_index": op_index,
+                    "reason": reason,
+                })
+            }
+            MiniAppError::MaterializeDestRelative { path } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "path": path,
+                })
+            }
+            MiniAppError::MaterializeDestInvalid { path, reason } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "path": path,
+                    "reason": reason,
+                })
+            }
+            MiniAppError::MaterializeRowNotFound { id } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "id": id,
+                })
+            }
+            MiniAppError::MaterializeFieldUnknown { field } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "field": field,
+                })
+            }
+            MiniAppError::MaterializeInvalidParam { field, reason } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "field": field,
                     "reason": reason,
                 })
             }
@@ -398,6 +554,52 @@ mod tests {
                     reason: "schema not found".into(),
                 },
             ),
+            (
+                codes::MATERIALIZE_DEST_RELATIVE,
+                MiniAppError::MaterializeDestRelative {
+                    path: "relative/path".into(),
+                },
+            ),
+            (
+                codes::MATERIALIZE_DEST_INVALID,
+                MiniAppError::MaterializeDestInvalid {
+                    path: "/bad/path".into(),
+                    reason: "parent dir not writable".into(),
+                },
+            ),
+            (
+                codes::MATERIALIZE_IO_ERROR,
+                MiniAppError::MaterializeIo("write failed".into()),
+            ),
+            (
+                codes::MATERIALIZE_SHA256_ERROR,
+                MiniAppError::MaterializeSha256("task panicked".into()),
+            ),
+            (
+                codes::MATERIALIZE_ROW_NOT_FOUND,
+                MiniAppError::MaterializeRowNotFound { id: "row-1".into() },
+            ),
+            (
+                codes::MATERIALIZE_EMPTY_RESULT,
+                MiniAppError::MaterializeEmptyResult,
+            ),
+            (
+                codes::MATERIALIZE_FORMAT_ERROR,
+                MiniAppError::MaterializeFormatError("yaml error".into()),
+            ),
+            (
+                codes::MATERIALIZE_FIELD_UNKNOWN,
+                MiniAppError::MaterializeFieldUnknown {
+                    field: "unknown_field".into(),
+                },
+            ),
+            (
+                codes::MATERIALIZE_INVALID_PARAM,
+                MiniAppError::MaterializeInvalidParam {
+                    field: "concat".into(),
+                    reason: "concat=true requires ByFilter selector".into(),
+                },
+            ),
         ];
         for (expected_code, err) in cases {
             assert_eq!(
@@ -431,6 +633,25 @@ mod tests {
             MiniAppError::BatchAborted {
                 op_index: 0,
                 reason: "reason".into(),
+            },
+            MiniAppError::MaterializeDestRelative {
+                path: "relative/path".into(),
+            },
+            MiniAppError::MaterializeDestInvalid {
+                path: "/bad/path".into(),
+                reason: "parent not writable".into(),
+            },
+            MiniAppError::MaterializeIo("write failed".into()),
+            MiniAppError::MaterializeSha256("task panicked".into()),
+            MiniAppError::MaterializeRowNotFound { id: "row-1".into() },
+            MiniAppError::MaterializeEmptyResult,
+            MiniAppError::MaterializeFormatError("yaml error".into()),
+            MiniAppError::MaterializeFieldUnknown {
+                field: "unknown_field".into(),
+            },
+            MiniAppError::MaterializeInvalidParam {
+                field: "concat".into(),
+                reason: "requires ByFilter".into(),
             },
         ];
         for err in errs {
@@ -521,5 +742,142 @@ mod tests {
         assert_eq!(err.code(), codes::BACKUP_ERROR);
         assert_ne!(err.code(), codes::STORAGE_ERROR);
         assert_ne!(err.code(), codes::IO_ERROR);
+    }
+
+    // --- Materialize variants: 9 individual tests ---
+
+    // T1: MaterializeDestRelative carries the path field in structured data
+    #[test]
+    fn materialize_dest_relative_has_path_field() {
+        let err = MiniAppError::MaterializeDestRelative {
+            path: "some/relative".to_string(),
+        };
+        assert_eq!(err.code(), codes::MATERIALIZE_DEST_RELATIVE);
+        let mcp: McpError = err.into();
+        let data = mcp
+            .data
+            .expect("data must be Some for MaterializeDestRelative");
+        assert_eq!(data["code"], "MATERIALIZE_DEST_RELATIVE");
+        assert_eq!(data["path"], "some/relative");
+        assert!(data["message"].is_string());
+    }
+
+    // T1: MaterializeDestInvalid carries path and reason fields
+    #[test]
+    fn materialize_dest_invalid_has_path_and_reason_fields() {
+        let err = MiniAppError::MaterializeDestInvalid {
+            path: "/no/such/parent".to_string(),
+            reason: "parent dir not writable".to_string(),
+        };
+        assert_eq!(err.code(), codes::MATERIALIZE_DEST_INVALID);
+        let mcp: McpError = err.into();
+        let data = mcp
+            .data
+            .expect("data must be Some for MaterializeDestInvalid");
+        assert_eq!(data["code"], "MATERIALIZE_DEST_INVALID");
+        assert_eq!(data["path"], "/no/such/parent");
+        assert_eq!(data["reason"], "parent dir not writable");
+        assert!(data["message"].is_string());
+    }
+
+    // T1: MaterializeIo produces structured data with code and message
+    #[test]
+    fn materialize_io_error_has_structured_data() {
+        let err = MiniAppError::MaterializeIo("write failed: disk full".to_string());
+        assert_eq!(err.code(), codes::MATERIALIZE_IO_ERROR);
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for MaterializeIo");
+        assert_eq!(data["code"], "MATERIALIZE_IO_ERROR");
+        assert!(data["message"].is_string());
+        // Falls through to default arm — no extra fields
+        assert!(data.get("path").is_none());
+    }
+
+    // T1: MaterializeSha256 produces structured data with code and message
+    #[test]
+    fn materialize_sha256_error_has_structured_data() {
+        let err = MiniAppError::MaterializeSha256("spawn_blocking panicked".to_string());
+        assert_eq!(err.code(), codes::MATERIALIZE_SHA256_ERROR);
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for MaterializeSha256");
+        assert_eq!(data["code"], "MATERIALIZE_SHA256_ERROR");
+        assert!(data["message"].is_string());
+    }
+
+    // T1: MaterializeRowNotFound carries the id field
+    #[test]
+    fn materialize_row_not_found_has_id_field() {
+        let err = MiniAppError::MaterializeRowNotFound {
+            id: "row-abc".to_string(),
+        };
+        assert_eq!(err.code(), codes::MATERIALIZE_ROW_NOT_FOUND);
+        let mcp: McpError = err.into();
+        let data = mcp
+            .data
+            .expect("data must be Some for MaterializeRowNotFound");
+        assert_eq!(data["code"], "MATERIALIZE_ROW_NOT_FOUND");
+        assert_eq!(data["id"], "row-abc");
+        assert!(data["message"].is_string());
+    }
+
+    // T2: MaterializeEmptyResult (unit variant) produces structured data
+    #[test]
+    fn materialize_empty_result_has_structured_data() {
+        let err = MiniAppError::MaterializeEmptyResult;
+        assert_eq!(err.code(), codes::MATERIALIZE_EMPTY_RESULT);
+        let mcp: McpError = err.into();
+        let data = mcp
+            .data
+            .expect("data must be Some for MaterializeEmptyResult");
+        assert_eq!(data["code"], "MATERIALIZE_EMPTY_RESULT");
+        assert!(data["message"].is_string());
+    }
+
+    // T3: MaterializeFormatError code is distinct from SCHEMA_ERROR
+    #[test]
+    fn materialize_format_error_has_structured_data() {
+        let err = MiniAppError::MaterializeFormatError("yaml: unexpected key".to_string());
+        assert_eq!(err.code(), codes::MATERIALIZE_FORMAT_ERROR);
+        assert_ne!(err.code(), codes::SCHEMA_ERROR);
+        let mcp: McpError = err.into();
+        let data = mcp
+            .data
+            .expect("data must be Some for MaterializeFormatError");
+        assert_eq!(data["code"], "MATERIALIZE_FORMAT_ERROR");
+        assert!(data["message"].is_string());
+    }
+
+    // T1: MaterializeFieldUnknown carries the field name
+    #[test]
+    fn materialize_field_unknown_has_field_name() {
+        let err = MiniAppError::MaterializeFieldUnknown {
+            field: "nonexistent_col".to_string(),
+        };
+        assert_eq!(err.code(), codes::MATERIALIZE_FIELD_UNKNOWN);
+        let mcp: McpError = err.into();
+        let data = mcp
+            .data
+            .expect("data must be Some for MaterializeFieldUnknown");
+        assert_eq!(data["code"], "MATERIALIZE_FIELD_UNKNOWN");
+        assert_eq!(data["field"], "nonexistent_col");
+        assert!(data["message"].is_string());
+    }
+
+    // T1: MaterializeInvalidParam carries field and reason
+    #[test]
+    fn materialize_invalid_param_has_field_and_reason() {
+        let err = MiniAppError::MaterializeInvalidParam {
+            field: "concat".to_string(),
+            reason: "concat=true requires ByFilter selector".to_string(),
+        };
+        assert_eq!(err.code(), codes::MATERIALIZE_INVALID_PARAM);
+        let mcp: McpError = err.into();
+        let data = mcp
+            .data
+            .expect("data must be Some for MaterializeInvalidParam");
+        assert_eq!(data["code"], "MATERIALIZE_INVALID_PARAM");
+        assert_eq!(data["field"], "concat");
+        assert_eq!(data["reason"], "concat=true requires ByFilter selector");
+        assert!(data["message"].is_string());
     }
 }
