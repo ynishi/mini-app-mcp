@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **BREAKING CHANGE**: The `update` tool now defaults to **merge** (RFC 7396 shallow merge) instead of full replacement. Callers that depend on the old full-replacement behaviour must pass `"mode": "replace"` explicitly to restore it. Callers that omit `mode` will now receive merge semantics, which preserves fields absent from the patch and deletes fields whose patch value is `null` (subject to `required` constraints).
+
+### Added
+
+- **`UpdateMode` enum** (`src/store.rs`, re-exported from `src/lib.rs`) — two variants: `Merge` (default) and `Replace`. `Merge` performs RFC 7396 shallow merge; `Replace` restores the pre-breaking-change full-replacement behaviour byte-for-byte.
+- **`mode` parameter on the `update` MCP tool** (`src/mcp/server.rs`) — optional `"mode"` field (`"merge"` or `"replace"`, default `"merge"`). Omitting `mode` is equivalent to `"mode": "merge"` and is the new default.
+- **RFC 7396 shallow merge logic** (`src/store.rs`) — new private `shallow_merge` helper applies top-level field-by-field patching: absent fields are preserved from the stored row, non-null patch values overwrite the stored value for that key, and `null` patch values either delete the field (`required=false`) or raise a `Validation` error (`required=true`). Nested objects are replaced wholesale (not recursively merged). Post-merge full schema validation runs before persisting.
+- **5 merge/replace grid tests** (`src/mcp/server.rs`) — `test_update_replace_round_trip` (Replace mode byte-for-byte identity), `test_update_merge_absent_field_preserved` (absent fields survive merge), `test_update_merge_null_required_error` (null on required field → Validation error), `test_update_merge_null_optional_deletes_and_validates` (null on optional field deletes key + post-merge validation runs), `test_update_merge_nested_object_full_replace` (nested object is fully replaced, not deeply merged).
+
+### Changed
+
+- **`update` tool default semantics** — the default behaviour changed from full replacement to RFC 7396 merge. This is a breaking change for callers that relied on the old default (sending a partial `data` object now preserves unmentioned fields rather than silently deleting them). To restore old behaviour pass `"mode": "replace"`.
+- **`Store::update` signature** (`src/store.rs`) — added `mode: UpdateMode` parameter. All existing internal call sites now pass `UpdateMode::Replace` for backward-compatible test coverage; the MCP layer passes the caller-supplied mode (defaulting to `Merge`).
+
 ## [0.8.0] - 2026-05-26
 
 > **Note**: This release adds a new public MCP tool (`row_materialize`), 9 new `MiniAppError` variants, and 2 new crate dependencies (`sha2`, `hex`). Per [Cargo SemVer Compatibility §1.3.5](https://doc.rust-lang.org/cargo/reference/semver.html#enum-variant-new), enum variant additions on `MiniAppError` (non-`#[non_exhaustive]`) are SemVer-major; pre-1.0 this is signalled by a minor bump (0.7.0 → 0.8.0), same convention as 0.6.0 → 0.7.0. JSON / MCP wire format is fully back-compatible; only Rust-level downstream consumers that exhaustively `match` on `MiniAppError` need to add arms for the new `Materialize*` variants.
