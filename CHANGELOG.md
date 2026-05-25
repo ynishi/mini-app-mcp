@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`row_materialize` MCP tool** (`src/materialize.rs`, `src/mcp/server.rs`) — writes one or more rows to arbitrary absolute paths on the local filesystem. Rows are selected by `id` (`RowSelector::ById`) or by a `ListFilter` expression (`RowSelector::ByFilter`). Output format is one of `raw` (newline-separated field values), `markdown` (field names as headings), `json` (pretty JSON object or array), or `yaml` (YAML document stream). When `concat=false` (default) the destination is treated as a directory and each row is written to `{dest}/{id}.{ext}`; when `concat=true` all rows are concatenated into a single file at `dest`. An optional `write_mode` controls whether an existing file is overwritten (`Overwrite`, default) or rejected (`Error`). Supports `dry_run=true` to compute path, byte count, and SHA-256 without writing any file. Returns `{ count, files: [{path, bytes, sha256, row_id}] }` — every output file always includes a 64-character SHA-256 hex digest computed from the written bytes, providing an integrity fingerprint for idempotency verification. `row_id` is `Some` for per-row files and `None` for concatenated output. Marked `read_only_hint=false`, `destructive_hint=true` (overwrite-by-default), `idempotent_hint=true`.
+- **9 new `MiniAppError` variants** (`src/error.rs`) — `MaterializeDestRelative`, `MaterializeDestInvalid`, `MaterializeIo`, `MaterializeSha256`, `MaterializeRowNotFound`, `MaterializeEmptyResult`, `MaterializeFormatError`, `MaterializeFieldUnknown`, `MaterializeInvalidParam` — each with a dedicated `MATERIALIZE_*` error code for programmatic handling.
+- **`sha2` and `hex` crate dependencies** (`Cargo.toml`) — used for SHA-256 digest computation inside `tokio::task::spawn_blocking`.
+
 - ListFilter enum (Eq/In/Or/And) for server-side row filtering in `list` tool. Supports recursive Or/And composition over schema-validated fields with typed scalar checking. `filter=None` keeps full backward compatibility for existing callers.
 
 ## [0.7.0] - 2026-05-21
