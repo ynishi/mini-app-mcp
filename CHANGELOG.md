@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-26
+
+> **Note**: This release adds a new public MCP tool (`row_materialize`), 9 new `MiniAppError` variants, and 2 new crate dependencies (`sha2`, `hex`). Per [Cargo SemVer Compatibility §1.3.5](https://doc.rust-lang.org/cargo/reference/semver.html#enum-variant-new), enum variant additions on `MiniAppError` (non-`#[non_exhaustive]`) are SemVer-major; pre-1.0 this is signalled by a minor bump (0.7.0 → 0.8.0), same convention as 0.6.0 → 0.7.0. JSON / MCP wire format is fully back-compatible; only Rust-level downstream consumers that exhaustively `match` on `MiniAppError` need to add arms for the new `Materialize*` variants.
+
 ### Added
 
 - **`row_materialize` MCP tool** (`src/materialize.rs`, `src/mcp/server.rs`) — writes one or more rows to arbitrary absolute paths on the local filesystem. Rows are selected by `id` (`RowSelector::ById`) or by a `ListFilter` expression (`RowSelector::ByFilter`). Output format is one of `raw` (newline-separated field values), `markdown` (field names as headings), `json` (pretty JSON object or array), or `yaml` (YAML document stream). When `concat=false` (default) the destination is treated as a directory and each row is written to `{dest}/{id}.{ext}`; when `concat=true` all rows are concatenated into a single file at `dest`. An optional `write_mode` controls whether an existing file is overwritten (`Overwrite`, default) or rejected (`Error`). Supports `dry_run=true` to compute path, byte count, and SHA-256 without writing any file. Returns `{ count, files: [{path, bytes, sha256, row_id}] }` — every output file always includes a 64-character SHA-256 hex digest computed from the written bytes, providing an integrity fingerprint for idempotency verification. `row_id` is `Some` for per-row files and `None` for concatenated output. Marked `read_only_hint=false`, `destructive_hint=true` (overwrite-by-default), `idempotent_hint=true`.
