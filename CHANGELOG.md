@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-26
+
 > **BREAKING CHANGE**: The `update` tool now defaults to **merge** (RFC 7396 shallow merge) instead of full replacement. Callers that depend on the old full-replacement behaviour must pass `"mode": "replace"` explicitly to restore it. Callers that omit `mode` will now receive merge semantics, which preserves fields absent from the patch and deletes fields whose patch value is `null` (subject to `required` constraints).
 
 ### Added
