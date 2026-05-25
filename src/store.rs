@@ -14,7 +14,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use rusqlite::{OptionalExtension, params_from_iter};
 
@@ -53,7 +54,8 @@ pub struct RowRecord {
 /// - `Replace`: Full replacement — identical to the pre-breaking-change default
 ///   behavior. The stored row is overwritten byte-for-byte with the supplied
 ///   `value` after schema validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum UpdateMode {
     /// RFC 7396 shallow merge (default).
     #[default]

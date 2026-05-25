@@ -49,8 +49,11 @@ List rows with optional pagination (ordered by `created_at` descending) from the
 - Annotations: `readOnlyHint=true`, `idempotentHint=true`
 
 ## `update`
-Replace the `data` of an existing row by UUID in the given `table`.
-- **Input**: `{ "id": "<uuid>", "data": { ... }, "table": "<name>" }` — `data` must match `schema.yaml`; `table` optional in legacy mode
+Update the `data` of an existing row by UUID in the given `table`. Defaults to RFC 7396 shallow merge.
+- **Input**: `{ "id": "<uuid>", "data": { ... }, "table": "<name>", "mode": "merge"|"replace" }`
+  - `data` must match `schema.yaml`; `table` optional in legacy mode; `mode` optional (default `"merge"`)
+- **Merge mode** (default): fields absent from `data` are preserved from the stored row; `null` deletes an optional field; `null` on a required field returns a Validation error. Full schema validation runs on the merged result (RFC 7396).
+- **Replace mode** (`"mode": "replace"`): replaces the entire `data` object — identical to the pre-breaking-change behavior.
 - **Output**: updated record `{ "id": "...", "data": {...}, ... }`
 - Annotations: `readOnlyHint=false`, `idempotentHint=true`
 
