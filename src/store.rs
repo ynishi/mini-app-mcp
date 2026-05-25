@@ -43,6 +43,25 @@ pub struct RowRecord {
     pub updated_at: i64,
 }
 
+/// Update semantics for [`Store::update`].
+///
+/// - `Merge` (default): RFC 7396 shallow merge. Absent fields are preserved
+///   from the stored row. A `null` patch value deletes the field when
+///   `required = false`; it returns a [`MiniAppError::Validation`] error when
+///   `required = true`. A full schema validation runs on the merged result
+///   before persisting.
+/// - `Replace`: Full replacement — identical to the pre-breaking-change default
+///   behavior. The stored row is overwritten byte-for-byte with the supplied
+///   `value` after schema validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpdateMode {
+    /// RFC 7396 shallow merge (default).
+    #[default]
+    Merge,
+    /// Full replacement (legacy behavior).
+    Replace,
+}
+
 /// Async CRUD store backed by a single SQLite table.
 ///
 /// The store wraps a `rusqlite::Connection` in an `Arc<Mutex<_>>` so it can
@@ -85,6 +104,64 @@ fn now_secs() -> i64 {
 /// Parse a JSON text column back into `serde_json::Value`.
 fn parse_data(json_str: &str) -> Result<serde_json::Value, MiniAppError> {
     serde_json::from_str(json_str).map_err(|e| MiniAppError::Schema(format!("data column: {e}")))
+}
+
+/// RFC 7396 shallow merge: apply `patch` on top of `current`, consulting
+/// `schema` for required-field null-deletion checks.
+///
+/// Rules:
+/// - `patch` must be a JSON object; otherwise `Err(Validation { field: "(root)", .. })`.
+/// - For each `(key, value)` in `patch`:
+///   - If `value` is `null`: look up the field in `schema`.
+///     - `required = true` → `Err(Validation { field: key, reason: "required field cannot be deleted via null" })`.
+///     - Otherwise → remove the key from `current` (physical deletion from the Map).
+///   - If `value` is non-null: overwrite `current[key]` with `value` (nested
+///     objects are replaced wholesale — no deep merge).
+/// - Fields not mentioned in `patch` are untouched in `current`.
+/// - Returns the merged `serde_json::Value` (always an Object).
+///
+/// The caller is responsible for running `schema.validate(&merged)` after this
+/// call to enforce post-merge type/required constraints.
+fn shallow_merge(
+    mut current: serde_json::Value,
+    patch: serde_json::Value,
+    schema: &SchemaConfig,
+) -> Result<serde_json::Value, MiniAppError> {
+    let patch_map = patch.as_object().ok_or_else(|| MiniAppError::Validation {
+        field: "(root)".to_string(),
+        reason: "patch must be a JSON object".to_string(),
+    })?;
+
+    let current_map = current
+        .as_object_mut()
+        .ok_or_else(|| MiniAppError::Validation {
+            field: "(root)".to_string(),
+            reason: "stored row is not a JSON object".to_string(),
+        })?;
+
+    for (key, value) in patch_map {
+        if value.is_null() {
+            // Null means "delete this field" per RFC 7396.
+            let is_required = schema
+                .fields
+                .iter()
+                .find(|f| &f.name == key)
+                .map(|f| f.required)
+                .unwrap_or(false);
+
+            if is_required {
+                return Err(MiniAppError::Validation {
+                    field: key.clone(),
+                    reason: "required field cannot be deleted via null".to_string(),
+                });
+            }
+            current_map.remove(key);
+        } else {
+            current_map.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(current)
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +504,8 @@ impl Store {
     ///
     /// # Errors
     /// - [`MiniAppError::NotFound`] — no row with the given `id`.
-    /// - [`MiniAppError::Validation`] — required field absent or type mismatch.
+    /// - [`MiniAppError::Validation`] — required field absent or type mismatch, or
+    ///   a null patch value targets a required field (Merge mode only).
     /// - [`MiniAppError::Storage`] — rusqlite error.
     /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
     /// - [`MiniAppError::Io`] — dump file write failure (only when `dump` is configured).
@@ -438,40 +516,59 @@ impl Store {
         &self,
         id: &str,
         value: serde_json::Value,
+        mode: UpdateMode,
     ) -> Result<RowRecord, MiniAppError> {
-        self.schema.validate(&value)?;
-
         let now = now_secs();
-        let data_str =
-            serde_json::to_string(&value).expect("serde_json::Value serialization is infallible");
-
         let conn = self.conn.clone();
-        let id = id.to_string();
+        let id_str = id.to_string();
+        let schema = self.schema.clone();
 
         let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
             let conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
 
-            // Fetch created_at first to return it unchanged.
-            let created_at: Option<i64> = conn
+            // Fetch both data and created_at in one query.
+            // For Replace mode, the data column is read but unused; this keeps
+            // the SQL identical across modes and avoids a second lock acquisition.
+            let row_data: Option<(String, i64)> = conn
                 .query_row(
-                    "SELECT created_at FROM rows WHERE id = ?1",
-                    rusqlite::params![id],
-                    |row| row.get(0),
+                    "SELECT data, created_at FROM rows WHERE id = ?1",
+                    rusqlite::params![id_str],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
 
-            let created_at = created_at.ok_or_else(|| MiniAppError::NotFound { id: id.clone() })?;
+            let (current_data_str, created_at) =
+                row_data.ok_or_else(|| MiniAppError::NotFound { id: id_str.clone() })?;
+
+            let merged = match mode {
+                UpdateMode::Merge => {
+                    let current: serde_json::Value = parse_data(&current_data_str)?;
+                    let merged = shallow_merge(current, value, &schema)?;
+                    // Post-merge full schema validation (Crux #1: must run after merge).
+                    schema.validate(&merged)?;
+                    merged
+                }
+                UpdateMode::Replace => {
+                    // Replace: validate first, then store as-is (byte-for-byte identical
+                    // to pre-breaking-change behavior — Crux #2).
+                    schema.validate(&value)?;
+                    value
+                }
+            };
+
+            let merged_str = serde_json::to_string(&merged)
+                .expect("serde_json::Value serialization is infallible");
 
             conn.execute(
                 "UPDATE rows SET data = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![data_str, now, id],
+                rusqlite::params![merged_str, now, id_str],
             )?;
 
             Ok(RowRecord {
-                id,
-                data: value,
+                id: id_str,
+                data: merged,
                 created_at,
                 updated_at: now,
             })
@@ -725,7 +822,11 @@ mod tests {
         // (In practice both are epoch seconds, so same-second updates produce
         //  the same value — the test verifies created_at is preserved.)
         let updated = store
-            .update(&row.id, serde_json::json!({"title": "changed"}))
+            .update(
+                &row.id,
+                serde_json::json!({"title": "changed"}),
+                UpdateMode::Replace,
+            )
             .await
             .unwrap();
         assert_eq!(updated.created_at, row.created_at);
@@ -756,7 +857,11 @@ mod tests {
     async fn test_update_unknown_id_not_found() {
         let store = make_test_store().await;
         let err = store
-            .update("nonexistent-id", serde_json::json!({"title": "x"}))
+            .update(
+                "nonexistent-id",
+                serde_json::json!({"title": "x"}),
+                UpdateMode::Replace,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, MiniAppError::NotFound { .. }));
@@ -834,6 +939,7 @@ mod tests {
             s2.update(
                 &id2,
                 serde_json::json!({"title": "updated", "state": "closed"}),
+                UpdateMode::Replace,
             )
             .await
         });
@@ -896,6 +1002,7 @@ mod tests {
             .update(
                 &row.id,
                 serde_json::json!({"title": "Updated", "body": "v2"}),
+                UpdateMode::Replace,
             )
             .await
             .expect("update ok");
@@ -1130,6 +1237,7 @@ mod tests {
                         s.update(
                             &row_id,
                             serde_json::json!({"title": format!("task-{task_id}-update-{i}")}),
+                            UpdateMode::Replace,
                         )
                         .await
                         .expect("concurrent update must succeed");
@@ -1210,6 +1318,160 @@ mod tests {
             mode.to_lowercase(),
             "wal",
             "Store::open must set journal_mode = WAL for dual-registry safety (Crux #1)"
+        );
+    }
+
+    // --- shallow_merge unit tests (Subtask 1, Crux #1) ---
+
+    /// Helper: build a minimal SchemaConfig with the given fields.
+    fn make_schema(fields: Vec<FieldDef>) -> SchemaConfig {
+        SchemaConfig {
+            table: "test".into(),
+            title: None,
+            description: None,
+            fields,
+            dump: None,
+        }
+    }
+
+    /// AC #3-a: absent fields in the patch are preserved from current.
+    #[test]
+    fn shallow_merge_preserves_absent_fields() {
+        let schema = make_schema(vec![
+            FieldDef {
+                name: "a".into(),
+                ty: FieldType::Number,
+                required: true,
+                description: None,
+            },
+            FieldDef {
+                name: "b".into(),
+                ty: FieldType::Number,
+                required: false,
+                description: None,
+            },
+        ]);
+        let current = serde_json::json!({"a": 1, "b": 2});
+        let patch = serde_json::json!({"a": 9});
+        let merged = shallow_merge(current, patch, &schema).expect("merge ok");
+        assert_eq!(merged["a"], 9, "patched field must be updated");
+        assert_eq!(
+            merged["b"], 2,
+            "absent patch field must be preserved from current"
+        );
+    }
+
+    /// AC #3-b: null value for an optional field physically removes it from the merged object.
+    #[test]
+    fn shallow_merge_deletes_null_for_optional_field() {
+        let schema = make_schema(vec![
+            FieldDef {
+                name: "a".into(),
+                ty: FieldType::Number,
+                required: true,
+                description: None,
+            },
+            FieldDef {
+                name: "b".into(),
+                ty: FieldType::Number,
+                required: false,
+                description: None,
+            },
+        ]);
+        let current = serde_json::json!({"a": 1, "b": 2});
+        let patch = serde_json::json!({"b": null});
+        let merged = shallow_merge(current, patch, &schema).expect("merge ok");
+        assert_eq!(merged["a"], 1);
+        assert!(
+            merged.get("b").is_none(),
+            "null-patched optional field must be physically removed (not set to null)"
+        );
+    }
+
+    /// AC #3-c: null value for a required field returns a Validation error.
+    #[test]
+    fn shallow_merge_errors_on_null_for_required_field() {
+        let schema = make_schema(vec![FieldDef {
+            name: "title".into(),
+            ty: FieldType::String,
+            required: true,
+            description: None,
+        }]);
+        let current = serde_json::json!({"title": "hello"});
+        let patch = serde_json::json!({"title": null});
+        let err = shallow_merge(current, patch, &schema).expect_err("must error");
+        match err {
+            MiniAppError::Validation { field, reason } => {
+                assert_eq!(field, "title");
+                assert!(
+                    reason.contains("required field cannot be deleted via null"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
+
+    /// AC #3-d: nested objects are replaced wholesale, not deep-merged.
+    #[test]
+    fn shallow_merge_replaces_nested_object_wholesale() {
+        let schema = make_schema(vec![FieldDef {
+            name: "cfg".into(),
+            ty: FieldType::Object,
+            required: false,
+            description: None,
+        }]);
+        let current = serde_json::json!({"cfg": {"x": 1, "y": 2}});
+        let patch = serde_json::json!({"cfg": {"x": 9}});
+        let merged = shallow_merge(current, patch, &schema).expect("merge ok");
+        assert_eq!(merged["cfg"]["x"], 9, "x must be updated");
+        assert!(
+            merged["cfg"].get("y").is_none(),
+            "y must be absent (nested object replaced wholesale, not deep-merged)"
+        );
+    }
+
+    /// AC #3-e: non-object patch (array / number / string) returns Validation error.
+    #[test]
+    fn shallow_merge_rejects_non_object_patch() {
+        let schema = make_schema(vec![]);
+        let current = serde_json::json!({"a": 1});
+
+        for bad_patch in [
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(42),
+            serde_json::json!("string"),
+        ] {
+            let err = shallow_merge(current.clone(), bad_patch, &schema)
+                .expect_err("non-object patch must be rejected");
+            match err {
+                MiniAppError::Validation { field, .. } => {
+                    assert_eq!(field, "(root)", "error field must be '(root)'");
+                }
+                other => panic!("expected Validation error, got: {other:?}"),
+            }
+        }
+    }
+
+    /// AC #3-f: post-merge schema validation catches type mismatches in the merged result.
+    /// Tests the full Store::update Merge path (not just shallow_merge in isolation).
+    #[tokio::test]
+    async fn store_update_merge_runs_post_merge_validation() {
+        let store = make_test_store().await;
+        let row = store
+            .create(serde_json::json!({"title": "x", "state": "open"}))
+            .await
+            .unwrap();
+
+        // Patch `state` with a number — type mismatch must be caught by post-merge validate.
+        let err = store
+            .update(&row.id, serde_json::json!({"state": 42}), UpdateMode::Merge)
+            .await
+            .expect_err("type mismatch must fail post-merge validation");
+
+        assert!(
+            matches!(err, MiniAppError::Validation { .. }),
+            "expected Validation error, got: {err:?}"
         );
     }
 }
