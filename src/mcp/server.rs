@@ -768,7 +768,9 @@ impl MiniAppMcpServer {
     /// `Store::update` — no field-specific access is performed here.
     #[tool(
         name = "update",
-        description = "Replace the data of an existing row. The `data` argument must be a JSON object matching schema.yaml. \
+        description = "Update an existing row by id. By default uses RFC 7396 shallow merge: fields absent from `data` are preserved, \
+                       a null value deletes an optional field, and a null value on a required field returns a Validation error. \
+                       The `data` argument must be a JSON object matching schema.yaml. \
                        In multi-table mode, `table` is required; omitting it returns a \
                        TABLE_REQUIRED error (data.code=\"TABLE_REQUIRED\"). \
                        In legacy single-table mode (`MINI_APP_SCHEMA`+`MINI_APP_DB`), `table` may be omitted. \
@@ -788,7 +790,7 @@ impl MiniAppMcpServer {
             .resolve_table(params.table.as_deref())
             .map_err(|e| e.to_string())?;
         let record = store
-            .update(&params.id, params.data)
+            .update(&params.id, params.data, crate::store::UpdateMode::Merge)
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_string(&record).map_err(|e| e.to_string())

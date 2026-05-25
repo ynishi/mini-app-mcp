@@ -33,6 +33,10 @@ pub mod config;
 /// SQLite-backed row store (async CRUD via `tokio::task::spawn_blocking`).
 pub mod store;
 
+/// Update semantics for [`store::Store::update`]: [`UpdateMode::Merge`] (default,
+/// RFC 7396 shallow merge) or [`UpdateMode::Replace`] (full replacement).
+pub use store::UpdateMode;
+
 /// MCP server: 6 tools (info, create, get, list, update, delete) over stdio.
 pub mod mcp;
 
