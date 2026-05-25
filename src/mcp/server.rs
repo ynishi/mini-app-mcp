@@ -51,7 +51,7 @@ use crate::mcp::schema_tools::{
 };
 use crate::schema::SchemaConfig;
 use crate::snapshot::{self, DataSnapshotParams};
-use crate::store::Store;
+use crate::store::{Store, UpdateMode};
 
 // =============================================================================
 // Public entry point
@@ -613,6 +613,15 @@ struct UpdateParams {
     /// `MINI_APP_DB`) this may be omitted and the single configured table is
     /// used automatically.
     table: Option<String>,
+    /// Optional update mode.
+    ///
+    /// - `"merge"` (default): RFC 7396 shallow merge. Fields absent from `data`
+    ///   are preserved. A `null` value deletes an optional field; a `null` on a
+    ///   required field returns a Validation error.
+    /// - `"replace"`: replace the entire `data` object with the supplied value
+    ///   (pre-breaking-change behavior).
+    #[serde(default)]
+    mode: Option<UpdateMode>,
 }
 
 /// Parameters for the `delete` tool.
@@ -768,8 +777,10 @@ impl MiniAppMcpServer {
     /// `Store::update` — no field-specific access is performed here.
     #[tool(
         name = "update",
-        description = "Update an existing row by id. By default uses RFC 7396 shallow merge: fields absent from `data` are preserved, \
-                       a null value deletes an optional field, and a null value on a required field returns a Validation error. \
+        description = "Update an existing row by id. Optional `mode` argument: \"merge\" (default, RFC 7396 shallow merge) \
+                       or \"replace\" (replace entire data with the `data` argument). \
+                       Merge mode: fields absent from `data` are preserved, a null value deletes an optional field, \
+                       and a null value on a required field returns a Validation error. \
                        The `data` argument must be a JSON object matching schema.yaml. \
                        In multi-table mode, `table` is required; omitting it returns a \
                        TABLE_REQUIRED error (data.code=\"TABLE_REQUIRED\"). \
@@ -789,8 +800,9 @@ impl MiniAppMcpServer {
         let (store, _schema) = self
             .resolve_table(params.table.as_deref())
             .map_err(|e| e.to_string())?;
+        let mode = params.mode.unwrap_or(UpdateMode::Merge);
         let record = store
-            .update(&params.id, params.data, crate::store::UpdateMode::Merge)
+            .update(&params.id, params.data, mode)
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_string(&record).map_err(|e| e.to_string())
@@ -1323,12 +1335,14 @@ fields:\n\
         server: &MiniAppMcpServer,
         id: &str,
         data: serde_json::Value,
+        mode: Option<UpdateMode>,
     ) -> Result<serde_json::Value, String> {
         let json = server
             .tool_update(Parameters(UpdateParams {
                 id: id.to_string(),
                 data,
                 table: None,
+                mode,
             }))
             .await?;
         Ok(serde_json::from_str(&json).unwrap())
@@ -1615,7 +1629,7 @@ fields:\n\
             .unwrap();
         let id = created["id"].as_str().unwrap();
 
-        let updated = do_update(&server, id, serde_json::json!({ "title": "updated" }))
+        let updated = do_update(&server, id, serde_json::json!({ "title": "updated" }), None)
             .await
             .expect("update must succeed");
         assert_eq!(updated["data"]["title"], "updated");
@@ -1670,6 +1684,7 @@ fields:\n\
             &server,
             "nonexistent-id",
             serde_json::json!({ "title": "x" }),
+            None,
         )
         .await;
         assert!(result.is_err(), "not-found must return Err");
@@ -2259,6 +2274,235 @@ fields:\n\
         assert!(
             err_str.contains("CONFIG_ERROR") || err_str.contains("reload not configured"),
             "error must indicate CONFIG_ERROR or 'reload not configured', got: {err_str}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Helper: server with an extra optional `meta` (object) field for nested tests.
+    // ---------------------------------------------------------------------------
+
+    async fn make_server_with_meta() -> (MiniAppMcpServer, tempfile::NamedTempFile) {
+        use std::io::Write as _;
+        let schema_yaml = b"\
+table: test_table\n\
+fields:\n\
+  - name: title\n\
+    type: string\n\
+    required: true\n\
+  - name: state\n\
+    type: string\n\
+    required: false\n\
+  - name: meta\n\
+    type: object\n\
+    required: false\n";
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+        tmp.write_all(schema_yaml).expect("write schema yaml");
+
+        let schema = SchemaConfig {
+            table: "test_table".to_string(),
+            title: None,
+            description: None,
+            fields: vec![
+                FieldDef {
+                    name: "title".to_string(),
+                    ty: FieldType::String,
+                    required: true,
+                    description: None,
+                },
+                FieldDef {
+                    name: "state".to_string(),
+                    ty: FieldType::String,
+                    required: false,
+                    description: None,
+                },
+                FieldDef {
+                    name: "meta".to_string(),
+                    ty: FieldType::Object,
+                    required: false,
+                    description: None,
+                },
+            ],
+            dump: None,
+        };
+        let store = Store::open(Path::new(":memory:"), schema.clone())
+            .await
+            .expect("in-memory store must open");
+        let schema_path = tmp.path().to_path_buf();
+        (
+            MiniAppMcpServer::new_single(store, schema, schema_path),
+            tmp,
+        )
+    }
+
+    // ---------------------------------------------------------------------------
+    // Grid tests: merge / replace mode semantics (Crux #1 + #2 end-to-end via tool_update)
+    // ---------------------------------------------------------------------------
+
+    /// Crux #2: mode="replace" must produce results byte-for-byte identical to
+    /// the pre-breaking-change full-replacement behavior.
+    #[tokio::test]
+    async fn update_replace_mode_round_trip_identity() {
+        let (server, _tmp) = make_server().await;
+        let created = do_create(
+            &server,
+            serde_json::json!({ "title": "original", "state": "open" }),
+        )
+        .await
+        .unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        let patch = serde_json::json!({ "title": "replaced" });
+        let updated = do_update(&server, id, patch.clone(), Some(UpdateMode::Replace))
+            .await
+            .expect("replace must succeed");
+
+        // result.data must equal patch exactly (byte-for-byte: only "title" key present).
+        assert_eq!(
+            updated["data"], patch,
+            "Replace mode: result.data must equal the patch object exactly"
+        );
+        // The "state" field must NOT be present (full replacement, not merge).
+        assert!(
+            updated["data"].get("state").is_none(),
+            "Replace mode: absent patch fields must not appear in result.data"
+        );
+    }
+
+    /// Crux #1 (a): merge default preserves fields absent from the patch.
+    #[tokio::test]
+    async fn update_merge_mode_default_preserves_absent_fields() {
+        let (server, _tmp) = make_server().await;
+        let created = do_create(
+            &server,
+            serde_json::json!({ "title": "x", "state": "open" }),
+        )
+        .await
+        .unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        // Patch only `state`; `title` is absent from the patch.
+        let updated = do_update(
+            &server,
+            id,
+            serde_json::json!({ "state": "closed" }),
+            None, // Merge default
+        )
+        .await
+        .expect("merge must succeed");
+
+        assert_eq!(
+            updated["data"]["title"], "x",
+            "Absent field must be preserved"
+        );
+        assert_eq!(
+            updated["data"]["state"], "closed",
+            "Patched field must be updated"
+        );
+    }
+
+    /// Crux #1 (b): null on an optional field deletes it from the stored row.
+    #[tokio::test]
+    async fn update_merge_mode_deletes_optional_field_on_null() {
+        let (server, _tmp) = make_server().await;
+        let created = do_create(
+            &server,
+            serde_json::json!({ "title": "x", "state": "open" }),
+        )
+        .await
+        .unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        // `state` is optional; null must delete it.
+        let updated = do_update(
+            &server,
+            id,
+            serde_json::json!({ "state": serde_json::Value::Null }),
+            Some(UpdateMode::Merge),
+        )
+        .await
+        .expect("null on optional must succeed");
+
+        assert!(
+            updated["data"].get("state").is_none(),
+            "Optional field set to null must be absent (physically removed) from merged result"
+        );
+    }
+
+    /// Crux #1 (c): null on a required field must return a Validation error.
+    #[tokio::test]
+    async fn update_merge_mode_returns_validation_on_null_required() {
+        let (server, _tmp) = make_server().await;
+        let created = do_create(&server, serde_json::json!({ "title": "x" }))
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        // `title` is required; null must be rejected.
+        let result = do_update(
+            &server,
+            id,
+            serde_json::json!({ "title": serde_json::Value::Null }),
+            Some(UpdateMode::Merge),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "null on required field must return Err (Validation error)"
+        );
+    }
+
+    /// Crux #1 (d): post-merge schema validation catches type mismatches.
+    #[tokio::test]
+    async fn update_merge_mode_runs_post_merge_validation() {
+        let (server, _tmp) = make_server().await;
+        let created = do_create(&server, serde_json::json!({ "title": "x" }))
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        // `title` is String; passing a Number must trigger post-merge validation error.
+        let result = do_update(
+            &server,
+            id,
+            serde_json::json!({ "title": 42 }),
+            Some(UpdateMode::Merge),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "type mismatch in patch must be caught by post-merge validation"
+        );
+    }
+
+    /// Crux #1 (nested): nested objects are replaced wholesale, not deep-merged.
+    #[tokio::test]
+    async fn update_merge_mode_replaces_nested_object_wholesale() {
+        let (server, _tmp) = make_server_with_meta().await;
+        let created = do_create(
+            &server,
+            serde_json::json!({ "title": "x", "meta": { "a": 1, "b": 2 } }),
+        )
+        .await
+        .unwrap();
+        let id = created["id"].as_str().unwrap();
+
+        // Patch `meta` with only `a: 9`; `b` must NOT be preserved (no deep merge).
+        let updated = do_update(
+            &server,
+            id,
+            serde_json::json!({ "meta": { "a": 9 } }),
+            Some(UpdateMode::Merge),
+        )
+        .await
+        .expect("wholesale object replace must succeed");
+
+        assert_eq!(
+            updated["data"]["meta"],
+            serde_json::json!({ "a": 9 }),
+            "Nested object must be replaced wholesale, not deep-merged"
         );
     }
 }
