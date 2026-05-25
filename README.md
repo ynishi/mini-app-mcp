@@ -78,10 +78,11 @@ All tools accept an optional `table` argument that selects the target table. In 
 | `schema_delete` | Remove a table's `schema.yaml` (moved to `_backup/`) and unregister it from the live registry. **Does not alter or drop the SQLite table** — DDL changes remain the operator's responsibility. Pass `dry_run: true` to preview. |
 | `schema_batch` | Execute an array of `ops[]` atomically under a single SQLite SAVEPOINT. Any op failure rolls back all preceding ops, leaving YAML and DB untouched. All ops must target the same table. Returns per-op results or a `BATCH_ABORTED` error with the index of the failing op. |
 | `data_snapshot` | Create a point-in-time SQLite snapshot of one or all mounted tables using the SQLite hot backup API. Snapshots are written to `<scope_root>/_snapshots/<table>.<unix_secs>.db`. Pass `table` and/or `scope` to limit the target set; omit both to snapshot all mounted tables. Pass `dry_run: true` to preview the operation (target tables, row counts, would-purge count) without creating any files. Retention is controlled by `MINI_APP_SNAPSHOT_RETENTION` (default 10), independent of `MINI_APP_BACKUP_RETENTION`. |
+| `row_materialize` | Write one or more rows to arbitrary absolute paths on the local filesystem. Select rows by `id` or by a `ListFilter` expression. Choose output format (`raw`, `markdown`, `json`, `yaml`), field projection (`All` or a named subset), and whether to write one file per row (`concat=false`, default) or concatenate all rows into a single file (`concat=true`). Returns `{ count, files: [{path, bytes, sha256, row_id}] }` — every file entry includes a SHA-256 hex digest of the written bytes. Pass `dry_run: true` to compute results without writing. |
 
 ## MCP resources
 
-In addition to the 12 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
+In addition to the 13 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
 
 | URI | MIME | Content |
 |---|---|---|
@@ -89,7 +90,7 @@ In addition to the 12 tools above, the server exposes 6 read-only **Resources** 
 | `schema://json` | `application/json` | Parsed `SchemaConfig` as JSON (same shape the `info` tool returns) |
 | `schema://json-schema` | `application/schema+json` | JSON Schema (draft-07) derived from the schema's fields. Use this to validate `data` arguments before calling `create` / `update` |
 | `docs://readme` | `text/markdown` | This README, compiled into the binary |
-| `docs://tools` | `text/markdown` | Cheat sheet of the 12 MCP tools and their input shapes |
+| `docs://tools` | `text/markdown` | Cheat sheet of the 13 MCP tools and their input shapes |
 | `docs://errors` | `text/markdown` | Reference table of error codes returned by the server |
 
 The `info` tool and `schema://json` resource return equivalent content but serve different purposes: `info` is a callable tool (good for one-off introspection in a conversation), while resources are URI-addressable and can be subscribed to or cached by the client.
@@ -239,6 +240,84 @@ data_snapshot(dry_run=true)           # preview without writing
 ```
 
 Snapshots are written to `<scope_root>/_snapshots/<table>.<unix_secs>.db` using the SQLite hot backup API (`rusqlite::Connection::backup`), so the source database remains open and writable during the operation. The retention limit (default 10) is controlled independently via `MINI_APP_SNAPSHOT_RETENTION` and never interacts with `_backup/`.
+
+## Row materialization
+
+`row_materialize` exports rows from any mounted table to the local filesystem in a format your agent or toolchain can consume directly — without re-reading the database.
+
+### Selecting rows
+
+```
+row_materialize(table="notes", selector={"type": "ById", "id": "<uuid>"}, ...)
+row_materialize(table="notes", selector={"type": "ByFilter", "filter": {"type": "eq", "field": "state", "value": "done"}}, ...)
+```
+
+`ById` fetches exactly one row by primary key. `ByFilter` accepts any `ListFilter` expression (the same `eq` / `in` / `or` / `and` combinators available in `list`).
+
+### Output formats
+
+| `format` | Extension | Description |
+|---|---|---|
+| `raw` | `.txt` | Field values joined by newlines in schema order (or specified order when projecting) |
+| `markdown` | `.md` | Each field rendered as a Markdown heading + value block |
+| `json` | `.json` | `serde_json::to_string_pretty` — single object per row, or JSON array when `concat=true` |
+| `yaml` | `.yaml` | YAML document stream — one document per row, separated by `---` |
+
+### Destination and concat mode
+
+```
+# One file per row, written to /tmp/export/{id}.md
+row_materialize(table="notes", format="markdown", dest="/tmp/export", concat=false)
+
+# All rows concatenated into a single file
+row_materialize(table="notes", format="json", dest="/tmp/notes.json", concat=true)
+```
+
+When `concat=false` (default), `dest` is treated as a directory and each row is written to `{dest}/{id}.{ext}`. The directory is created with `create_dir_all` if it does not exist.
+
+When `concat=true`, `dest` is a file path. Raw rows are separated by `\n\n`, Markdown rows by `---\n`, and YAML rows by `---\n`. JSON uses a top-level array.
+
+**The destination path must be absolute.** Relative paths are rejected immediately with `MATERIALIZE_DEST_RELATIVE`. No project-root sandbox is applied — any absolute path is permitted, giving agents full filesystem reach.
+
+### Field projection
+
+```
+row_materialize(..., fields={"type": "All"})                              # default: all schema fields
+row_materialize(..., fields={"type": "List", "fields": ["title", "state"]})  # named subset
+```
+
+Unknown field names return `MATERIALIZE_FIELD_UNKNOWN` before any file is written.
+
+### Integrity: SHA-256 in every response
+
+Every entry in `files[]` includes a `sha256` field — a 64-character hex digest of the exact bytes written. Agents can use this for idempotency checks or to verify content after transfer without re-reading the file.
+
+```json
+{
+  "count": 2,
+  "files": [
+    { "path": "/tmp/export/abc.md", "bytes": 142, "sha256": "e3b0c44…", "row_id": "abc" },
+    { "path": "/tmp/export/def.md", "bytes": 198, "sha256": "a87ff6…", "row_id": "def" }
+  ]
+}
+```
+
+`row_id` is the source row's primary key for per-row files and `null` for concatenated output.
+
+### Dry run
+
+```
+row_materialize(..., dry_run=true)
+```
+
+Dry-run mode runs all validation, projection, serialization, and SHA-256 computation but skips `std::fs::write`. The response shape is identical to a real write — path, byte count, and digest are all populated as "would-be" values.
+
+### Write mode
+
+```
+row_materialize(..., write_mode="Overwrite")   # default: overwrite existing files
+row_materialize(..., write_mode="Error")       # fail with MATERIALIZE_DEST_INVALID if dest exists
+```
 
 ### Ignoring dump files in git
 
