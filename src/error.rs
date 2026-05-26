@@ -62,6 +62,11 @@ pub mod codes {
     pub const MATERIALIZE_FIELD_UNKNOWN: &str = "MATERIALIZE_FIELD_UNKNOWN";
     /// Returned when `row_materialize` parameters are structurally invalid.
     pub const MATERIALIZE_INVALID_PARAM: &str = "MATERIALIZE_INVALID_PARAM";
+    /// Returned when a named query alias does not exist in `_aliases`.
+    pub const ALIAS_NOT_FOUND: &str = "ALIAS_NOT_FOUND";
+    /// Returned when `alias_create` is called but an alias with the same name
+    /// already exists in the table's `_aliases` storage.
+    pub const ALIAS_ALREADY_EXISTS: &str = "ALIAS_ALREADY_EXISTS";
 }
 
 /// All errors that can arise inside mini-app-mcp.
@@ -273,6 +278,23 @@ pub enum MiniAppError {
     /// - `reason`: human-readable description of the inconsistency.
     #[error("materialize invalid param '{field}': {reason}")]
     MaterializeInvalidParam { field: String, reason: String },
+
+    /// No query alias with the given `name` was found in `_aliases`.
+    ///
+    /// # Fields
+    /// - `name`: the alias name that was not found.
+    #[error("alias not found: {name}")]
+    AliasNotFound { name: String },
+
+    /// An alias with the given `name` already exists in `_aliases`.
+    ///
+    /// Returned by `alias_create` when the name is already registered.  Use
+    /// `alias_delete` first, or choose a different name.
+    ///
+    /// # Fields
+    /// - `name`: the duplicate alias name.
+    #[error("alias already exists: {name}")]
+    AliasAlreadyExists { name: String },
 }
 
 impl MiniAppError {
@@ -307,6 +329,8 @@ impl MiniAppError {
             MiniAppError::MaterializeFormatError(_) => codes::MATERIALIZE_FORMAT_ERROR,
             MiniAppError::MaterializeFieldUnknown { .. } => codes::MATERIALIZE_FIELD_UNKNOWN,
             MiniAppError::MaterializeInvalidParam { .. } => codes::MATERIALIZE_INVALID_PARAM,
+            MiniAppError::AliasNotFound { .. } => codes::ALIAS_NOT_FOUND,
+            MiniAppError::AliasAlreadyExists { .. } => codes::ALIAS_ALREADY_EXISTS,
         }
     }
 }
@@ -400,6 +424,20 @@ impl From<MiniAppError> for McpError {
                     "message": message,
                     "field": field,
                     "reason": reason,
+                })
+            }
+            MiniAppError::AliasNotFound { name } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "name": name,
+                })
+            }
+            MiniAppError::AliasAlreadyExists { name } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "name": name,
                 })
             }
             _ => {
@@ -600,6 +638,18 @@ mod tests {
                     reason: "concat=true requires ByFilter selector".into(),
                 },
             ),
+            (
+                codes::ALIAS_NOT_FOUND,
+                MiniAppError::AliasNotFound {
+                    name: "my_alias".into(),
+                },
+            ),
+            (
+                codes::ALIAS_ALREADY_EXISTS,
+                MiniAppError::AliasAlreadyExists {
+                    name: "my_alias".into(),
+                },
+            ),
         ];
         for (expected_code, err) in cases {
             assert_eq!(
@@ -652,6 +702,12 @@ mod tests {
             MiniAppError::MaterializeInvalidParam {
                 field: "concat".into(),
                 reason: "requires ByFilter".into(),
+            },
+            MiniAppError::AliasNotFound {
+                name: "my_alias".into(),
+            },
+            MiniAppError::AliasAlreadyExists {
+                name: "my_alias".into(),
             },
         ];
         for err in errs {
@@ -878,6 +934,37 @@ mod tests {
         assert_eq!(data["code"], "MATERIALIZE_INVALID_PARAM");
         assert_eq!(data["field"], "concat");
         assert_eq!(data["reason"], "concat=true requires ByFilter selector");
+        assert!(data["message"].is_string());
+    }
+
+    // T1: AliasNotFound has code ALIAS_NOT_FOUND and carries name field
+    #[test]
+    fn alias_not_found_error_has_structured_data() {
+        let err = MiniAppError::AliasNotFound {
+            name: "recent_open".to_string(),
+        };
+        assert_eq!(err.code(), codes::ALIAS_NOT_FOUND);
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for AliasNotFound");
+        assert_eq!(data["code"], Value::String("ALIAS_NOT_FOUND".to_string()));
+        assert_eq!(data["name"], Value::String("recent_open".to_string()));
+        assert!(data["message"].is_string());
+    }
+
+    // T1: AliasAlreadyExists has code ALIAS_ALREADY_EXISTS and carries name field
+    #[test]
+    fn alias_already_exists_error_has_structured_data() {
+        let err = MiniAppError::AliasAlreadyExists {
+            name: "recent_open".to_string(),
+        };
+        assert_eq!(err.code(), codes::ALIAS_ALREADY_EXISTS);
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for AliasAlreadyExists");
+        assert_eq!(
+            data["code"],
+            Value::String("ALIAS_ALREADY_EXISTS".to_string())
+        );
+        assert_eq!(data["name"], Value::String("recent_open".to_string()));
         assert!(data["message"].is_string());
     }
 }

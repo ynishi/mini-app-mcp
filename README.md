@@ -79,10 +79,14 @@ All tools accept an optional `table` argument that selects the target table. In 
 | `schema_batch` | Execute an array of `ops[]` atomically under a single SQLite SAVEPOINT. Any op failure rolls back all preceding ops, leaving YAML and DB untouched. All ops must target the same table. Returns per-op results or a `BATCH_ABORTED` error with the index of the failing op. |
 | `data_snapshot` | Create a point-in-time SQLite snapshot of one or all mounted tables using the SQLite hot backup API. Snapshots are written to `<scope_root>/_snapshots/<table>.<unix_secs>.db`. Pass `table` and/or `scope` to limit the target set; omit both to snapshot all mounted tables. Pass `dry_run: true` to preview the operation (target tables, row counts, would-purge count) without creating any files. Retention is controlled by `MINI_APP_SNAPSHOT_RETENTION` (default 10), independent of `MINI_APP_BACKUP_RETENTION`. |
 | `row_materialize` | Write one or more rows to arbitrary absolute paths on the local filesystem. Select rows by `id` or by a `ListFilter` expression. Choose output format (`raw`, `markdown`, `json`, `yaml`), field projection (`All` or a named subset), and whether to write one file per row (`concat=false`, default) or concatenate all rows into a single file (`concat=true`). Returns `{ count, files: [{path, bytes, sha256, row_id}] }` — every file entry includes a SHA-256 hex digest of the written bytes. Pass `dry_run: true` to compute results without writing. |
+| `alias_create` | Register a named query alias for a table. Accepts `name`, `filter` (a `ListFilter` expression), optional `default_limit`, and optional `description`. Alias names are unique per table; duplicate names return `ALIAS_ALREADY_EXISTS`. Aliases are scoped per table and stored in the table's own SQLite database. |
+| `alias_list` | Return all aliases registered for a table as a JSON array of `{ name, filter, default_limit, description }` objects. |
+| `alias_run` | Execute a stored alias by name. Accepts optional runtime `limit` and `offset` that override the stored `default_limit` at call time. Returns the same shape as the `list` tool. Returns `ALIAS_NOT_FOUND` for an unknown name. |
+| `alias_delete` | Delete a named alias for a table. Returns `ALIAS_NOT_FOUND` if the alias does not exist. |
 
 ## MCP resources
 
-In addition to the 13 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
+In addition to the 17 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
 
 | URI | MIME | Content |
 |---|---|---|
@@ -90,7 +94,7 @@ In addition to the 13 tools above, the server exposes 6 read-only **Resources** 
 | `schema://json` | `application/json` | Parsed `SchemaConfig` as JSON (same shape the `info` tool returns) |
 | `schema://json-schema` | `application/schema+json` | JSON Schema (draft-07) derived from the schema's fields. Use this to validate `data` arguments before calling `create` / `update` |
 | `docs://readme` | `text/markdown` | This README, compiled into the binary |
-| `docs://tools` | `text/markdown` | Cheat sheet of the 13 MCP tools and their input shapes |
+| `docs://tools` | `text/markdown` | Cheat sheet of the 17 MCP tools and their input shapes |
 | `docs://errors` | `text/markdown` | Reference table of error codes returned by the server |
 
 The `info` tool and `schema://json` resource return equivalent content but serve different purposes: `info` is a callable tool (good for one-off introspection in a conversation), while resources are URI-addressable and can be subscribed to or cached by the client.
@@ -477,6 +481,52 @@ Replace mode performs a full replacement: `data` is validated against the schema
 |---|---|
 | `merge` (default) | Partial updates — only send the fields you want to change. Existing fields you omit are untouched. |
 | `replace` | Full rewrites — you supply the complete intended state of the row. Omitted fields are deleted. |
+
+## Query aliases
+
+Query aliases let you save a `ListFilter` expression under a short name and replay it — with optional per-call `limit` / `offset` overrides — without repeating the filter JSON every time.
+
+### Creating an alias
+
+```
+alias_create(
+  table="notes",
+  name="recent_open",
+  filter={"type": "eq", "field": "state", "value": "open"},
+  default_limit=20,
+  description="Open notes, newest first"
+)
+```
+
+The alias is stored in the table's own SQLite database under `_aliases`. Alias names are unique per table; calling `alias_create` again with the same name returns `ALIAS_ALREADY_EXISTS`.
+
+### Running an alias
+
+```
+alias_run(table="notes", name="recent_open")
+# → uses stored default_limit=20
+
+alias_run(table="notes", name="recent_open", limit=5)
+# → runtime limit overrides the stored default_limit
+
+alias_run(table="notes", name="recent_open", limit=10, offset=20)
+# → pagination with runtime overrides
+```
+
+`alias_run` resolves the stored filter and passes `limit` / `offset` to `Store::list`. If `limit` is supplied at call time it overrides `default_limit`; if omitted, `default_limit` from the alias is used. `offset` is always a runtime-only argument (not stored).
+
+### Listing and deleting aliases
+
+```
+alias_list(table="notes")
+# → [{"name": "recent_open", "filter": {...}, "default_limit": 20, "description": "..."}]
+
+alias_delete(table="notes", name="recent_open")
+```
+
+### Alias isolation
+
+Each table's `_aliases` storage is physically separate: aliases for `notes` live in `notes.db`, aliases for `issues` live in `issues.db`. There is no global alias namespace and no way for an alias operation to read or write aliases belonging to a different table.
 
 ## Storage notes
 

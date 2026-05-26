@@ -638,6 +638,76 @@ struct DeleteParams {
     table: Option<String>,
 }
 
+/// Parameters for the `alias_create` tool.
+#[derive(Deserialize, JsonSchema)]
+struct AliasCreateParams {
+    /// Name of the table whose alias namespace to use.
+    ///
+    /// In multi-table mode this argument is required; omitting it returns a
+    /// TABLE_REQUIRED error. In legacy single-table mode (`MINI_APP_SCHEMA` +
+    /// `MINI_APP_DB`) this may be omitted and the single configured table is
+    /// used automatically.
+    table: Option<String>,
+    /// Unique name for this alias within the table's alias namespace.
+    name: String,
+    /// The filter to store for this alias.
+    filter: ListFilter,
+    /// Default limit applied when `alias_run` is called without a runtime
+    /// `limit` override.  If omitted, `Store::list` applies its own default
+    /// (100 rows).
+    limit: Option<u32>,
+    /// Optional human-readable description for this alias.
+    description: Option<String>,
+}
+
+/// Parameters for the `alias_list` tool.
+#[derive(Deserialize, JsonSchema)]
+struct AliasListParams {
+    /// Name of the table whose alias namespace to list.
+    ///
+    /// In multi-table mode this argument is required; omitting it returns a
+    /// TABLE_REQUIRED error. In legacy single-table mode (`MINI_APP_SCHEMA` +
+    /// `MINI_APP_DB`) this may be omitted and the single configured table is
+    /// used automatically.
+    table: Option<String>,
+}
+
+/// Parameters for the `alias_run` tool.
+#[derive(Deserialize, JsonSchema)]
+struct AliasRunParams {
+    /// Name of the table whose alias namespace to query.
+    ///
+    /// In multi-table mode this argument is required; omitting it returns a
+    /// TABLE_REQUIRED error. In legacy single-table mode (`MINI_APP_SCHEMA` +
+    /// `MINI_APP_DB`) this may be omitted and the single configured table is
+    /// used automatically.
+    table: Option<String>,
+    /// Name of the alias to run.
+    name: String,
+    /// Runtime limit override.  When supplied, takes precedence over the
+    /// alias's stored `default_limit`.  When omitted, the stored
+    /// `default_limit` is used; if that is also absent, `Store::list`
+    /// applies its own default (100 rows).
+    limit: Option<u32>,
+    /// Runtime offset (number of rows to skip).  Not stored in the alias;
+    /// must be supplied at execution time when pagination is needed.
+    offset: Option<u32>,
+}
+
+/// Parameters for the `alias_delete` tool.
+#[derive(Deserialize, JsonSchema)]
+struct AliasDeleteParams {
+    /// Name of the table whose alias namespace to delete from.
+    ///
+    /// In multi-table mode this argument is required; omitting it returns a
+    /// TABLE_REQUIRED error. In legacy single-table mode (`MINI_APP_SCHEMA` +
+    /// `MINI_APP_DB`) this may be omitted and the single configured table is
+    /// used automatically.
+    table: Option<String>,
+    /// Name of the alias to delete.
+    name: String,
+}
+
 /// Result returned by the `reload` tool.
 ///
 /// Reports the outcome of the registry reload: how many tables are now mounted,
@@ -1226,6 +1296,197 @@ impl MiniAppMcpServer {
             })
             .map_err(|e| e.to_string())
     }
+
+    // -------------------------------------------------------------------------
+    // Alias tools
+    // -------------------------------------------------------------------------
+
+    /// Create a named query alias for a table.
+    ///
+    /// Registers a `filter` + optional `default_limit` under `name` in the
+    /// table's per-table `_aliases` storage.  The alias can later be executed
+    /// with `alias_run`.
+    ///
+    /// Returns `ALIAS_ALREADY_EXISTS` (data.code) if an alias with the same
+    /// name already exists for this table.
+    ///
+    /// In multi-table mode the `table` argument is required; omitting it
+    /// returns a TABLE_REQUIRED error (data.code="TABLE_REQUIRED").
+    #[tool(
+        name = "alias_create",
+        description = "Register a named query alias for a table.  Supply a `filter` \
+                       (the same filter object accepted by the `list` tool) and an \
+                       optional `limit` (stored as the default row cap when the alias \
+                       is run).  The alias is scoped exclusively to the named `table`. \
+                       Returns ALIAS_ALREADY_EXISTS if the name is already taken. \
+                       In multi-table mode `table` is required; omitting it returns \
+                       TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\").",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_alias_create(
+        &self,
+        Parameters(params): Parameters<AliasCreateParams>,
+    ) -> Result<String, String> {
+        let (store, schema) = self
+            .resolve_table(params.table.as_deref())
+            .map_err(|e| e.to_string())?;
+        // Validate the filter against the table schema before persisting.
+        params.filter.validate(&schema).map_err(|e| e.to_string())?;
+        store
+            .alias_create(
+                &params.name,
+                &params.filter,
+                params.limit,
+                params.description,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&serde_json::json!({ "created": params.name }))
+            .map_err(|e| e.to_string())
+    }
+
+    /// List all named query aliases for a table.
+    ///
+    /// Returns an array of alias records (name, filter JSON, default_limit,
+    /// description) scoped exclusively to the named table.
+    ///
+    /// In multi-table mode the `table` argument is required; omitting it
+    /// returns a TABLE_REQUIRED error (data.code="TABLE_REQUIRED").
+    #[tool(
+        name = "alias_list",
+        description = "List all named query aliases registered for a table.  \
+                       Each record includes `name`, `filter` (the stored filter JSON), \
+                       `default_limit`, and `description`.  Aliases are scoped \
+                       exclusively to the named `table`. \
+                       In multi-table mode `table` is required; omitting it returns \
+                       TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\").",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_alias_list(
+        &self,
+        Parameters(params): Parameters<AliasListParams>,
+    ) -> Result<String, String> {
+        let (store, _schema) = self
+            .resolve_table(params.table.as_deref())
+            .map_err(|e| e.to_string())?;
+        let aliases = store.alias_list().await.map_err(|e| e.to_string())?;
+        // AliasRecord does not derive Serialize; map to serde_json::Value manually.
+        let values: Vec<serde_json::Value> = aliases
+            .into_iter()
+            .map(|a| {
+                serde_json::json!({
+                    "name": a.name,
+                    "filter": a.filter,
+                    "default_limit": a.default_limit,
+                    "description": a.description,
+                })
+            })
+            .collect();
+        serde_json::to_string(&values).map_err(|e| e.to_string())
+    }
+
+    /// Execute a named query alias and return matching rows.
+    ///
+    /// Looks up the stored filter for `name`, then calls `Store::list` with
+    /// the resolved limit and offset.  Runtime `limit` and `offset` override
+    /// the alias's stored `default_limit`; if neither is supplied the stored
+    /// default is used (falling back to `Store::list`'s own default of 100).
+    ///
+    /// Returns `ALIAS_NOT_FOUND` (data.code) if no alias with `name` exists
+    /// for this table.
+    ///
+    /// In multi-table mode the `table` argument is required; omitting it
+    /// returns a TABLE_REQUIRED error (data.code="TABLE_REQUIRED").
+    #[tool(
+        name = "alias_run",
+        description = "Execute a named query alias and return matching rows.  \
+                       The stored filter is replayed against `Store::list`.  \
+                       Supply a runtime `limit` to override the alias's stored \
+                       default_limit, and/or an `offset` for pagination (offset is \
+                       never stored in the alias).  The alias is scoped exclusively \
+                       to the named `table`. \
+                       Returns ALIAS_NOT_FOUND if the alias does not exist. \
+                       In multi-table mode `table` is required; omitting it returns \
+                       TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\").",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_alias_run(
+        &self,
+        Parameters(params): Parameters<AliasRunParams>,
+    ) -> Result<String, String> {
+        let (store, schema) = self
+            .resolve_table(params.table.as_deref())
+            .map_err(|e| e.to_string())?;
+        let alias = store
+            .alias_get(&params.name)
+            .await
+            .map_err(|e| e.to_string())?;
+        let filter: crate::filter::ListFilter =
+            serde_json::from_str(&alias.filter).map_err(|e| e.to_string())?;
+        filter.validate(&schema).map_err(|e| e.to_string())?;
+        // Crux: runtime limit/offset override stored defaults; never replay
+        // stored parameters verbatim.
+        let limit = params.limit.or(alias.default_limit);
+        let offset = params.offset;
+        let records = store
+            .list(limit, offset, Some(filter))
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&records).map_err(|e| e.to_string())
+    }
+
+    /// Delete a named query alias from a table.
+    ///
+    /// Removes the alias with `name` from the table's per-table `_aliases`
+    /// storage.  Returns `ALIAS_NOT_FOUND` (data.code) if no alias with that
+    /// name exists for this table.
+    ///
+    /// In multi-table mode the `table` argument is required; omitting it
+    /// returns a TABLE_REQUIRED error (data.code="TABLE_REQUIRED").
+    #[tool(
+        name = "alias_delete",
+        description = "Delete a named query alias from a table.  \
+                       The alias is scoped exclusively to the named `table`; \
+                       aliases belonging to other tables are never affected. \
+                       Returns ALIAS_NOT_FOUND if the alias does not exist. \
+                       In multi-table mode `table` is required; omitting it returns \
+                       TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\").",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_alias_delete(
+        &self,
+        Parameters(params): Parameters<AliasDeleteParams>,
+    ) -> Result<String, String> {
+        let (store, _schema) = self
+            .resolve_table(params.table.as_deref())
+            .map_err(|e| e.to_string())?;
+        store
+            .alias_delete(&params.name)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&serde_json::json!({ "deleted": params.name }))
+            .map_err(|e| e.to_string())
+    }
 }
 
 // =============================================================================
@@ -1364,7 +1625,7 @@ fields:\n\
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn list_tools_contains_all_thirteen() {
+    async fn list_tools_contains_all_seventeen() {
         let (server, _tmp) = make_server().await;
         let tools = server.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -1382,13 +1643,17 @@ fields:\n\
             "schema_batch",
             "data_snapshot",
             "row_materialize",
+            "alias_create",
+            "alias_list",
+            "alias_run",
+            "alias_delete",
         ] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(tools.len(), 13, "expected exactly 13 tools");
+        assert_eq!(tools.len(), 17, "expected exactly 17 tools");
     }
 
     /// RED: ensure create/update tools advertise `data` as an object in their
