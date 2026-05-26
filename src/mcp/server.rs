@@ -1,10 +1,11 @@
 /// MCP server implementation for mini-app-mcp.
 ///
-/// Exposes 13 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
+/// Exposes 17 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
 /// `reload`, `schema_create`, `schema_update`, `schema_delete`, `schema_batch`,
-/// `data_snapshot`, `row_materialize`) and resources
+/// `data_snapshot`, `row_materialize`, `alias_create`, `alias_list`, `alias_run`,
+/// `alias_delete`) and resources
 /// (`schema://yaml`, `schema://json`, `schema://json-schema`, `docs://readme`,
-/// `docs://tools`, `docs://errors`) as MCP capabilities over stdio transport.
+/// `docs://tools`, `docs://errors`, `docs://filters`) as MCP capabilities over stdio transport.
 /// No HTTP / REST / CLI-CRUD entry points are provided (Crux "MCP-only entry
 /// point" constraint).
 ///
@@ -252,6 +253,7 @@ const URI_SCHEMA_JSON_SCHEMA: &str = "schema://json-schema";
 const URI_DOCS_README: &str = "docs://readme";
 const URI_DOCS_TOOLS: &str = "docs://tools";
 const URI_DOCS_ERRORS: &str = "docs://errors";
+const URI_DOCS_FILTERS: &str = "docs://filters";
 
 /// Parse the `table=<name>` query parameter from a URI of the form
 /// `<base>[?table=<name>[&...]]`.
@@ -364,7 +366,7 @@ impl MiniAppMcpServer {
         resources.push(
             RawResource::new(URI_DOCS_TOOLS, "Tools Reference")
                 .with_description(
-                    "Cheat sheet listing all 12 tools with descriptions and input shapes.",
+                    "Cheat sheet listing all 17 tools with descriptions and input shapes.",
                 )
                 .with_mime_type("text/markdown")
                 .no_annotation(),
@@ -372,6 +374,15 @@ impl MiniAppMcpServer {
         resources.push(
             RawResource::new(URI_DOCS_ERRORS, "Error Code Reference")
                 .with_description("Reference table of all error codes returned by this server.")
+                .with_mime_type("text/markdown")
+                .no_annotation(),
+        );
+        resources.push(
+            RawResource::new(URI_DOCS_FILTERS, "Filter Construction Guide")
+                .with_description(
+                    "Guide for constructing filter objects (Eq/In/Like/Or/And) used by \
+                     the `list` tool, `alias_create`, and `row_materialize`.",
+                )
                 .with_mime_type("text/markdown")
                 .no_annotation(),
         );
@@ -420,6 +431,9 @@ impl MiniAppMcpServer {
             URI_DOCS_ERRORS => {
                 ResourceContents::text(res::ERRORS_DOC, uri).with_mime_type("text/markdown")
             }
+            URI_DOCS_FILTERS => {
+                ResourceContents::text(res::FILTERS_DOC, uri).with_mime_type("text/markdown")
+            }
             _ => {
                 return Err(McpError::resource_not_found(
                     format!("unknown resource URI: {uri}"),
@@ -449,8 +463,9 @@ impl ServerHandler for MiniAppMcpServer {
         info.server_info.description = Some(
             "Agent-First CRUD store backed by SQLite. \
              Supports multiple tables via User→Project schema chain. \
-             12 tools: info, create, get, list, update, delete, reload, \
-             schema_create, schema_update, schema_delete, schema_batch, data_snapshot."
+             17 tools: info, create, get, list, update, delete, reload, \
+             schema_create, schema_update, schema_delete, schema_batch, data_snapshot, \
+             row_materialize, alias_create, alias_list, alias_run, alias_delete."
                 .to_string(),
         );
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
@@ -1962,18 +1977,23 @@ fields:\n\
     #[tokio::test]
     async fn list_resources_legacy_mode_has_schema_and_docs() {
         // In legacy (single-table) mode, resource_list() emits 3 schema URIs
-        // (with ?table=<name> query) + 3 docs URIs = 6 total.
+        // (with ?table=<name> query) + 4 docs URIs = 7 total.
         let (server, _tmp) = make_server().await;
         let resources = server.resource_list();
         assert_eq!(
             resources.len(),
-            6,
-            "expected exactly 6 resources in legacy mode, got: {:?}",
+            7,
+            "expected exactly 7 resources in legacy mode, got: {:?}",
             resources.iter().map(|r| &r.uri).collect::<Vec<_>>()
         );
         // Docs URIs must be present without query string.
         let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
-        for expected in &["docs://readme", "docs://tools", "docs://errors"] {
+        for expected in &[
+            "docs://readme",
+            "docs://tools",
+            "docs://errors",
+            "docs://filters",
+        ] {
             assert!(
                 uris.contains(expected),
                 "URI '{expected}' missing from list"
@@ -2203,11 +2223,11 @@ fields:\n\
     async fn multi_table_resource_list_has_entries_for_each_table() {
         let server = make_multi_table_server().await;
         let resources = server.resource_list();
-        // 2 tables × 3 schema resources + 3 docs = 9
+        // 2 tables × 3 schema resources + 4 docs = 10
         assert_eq!(
             resources.len(),
-            9,
-            "expected 9 resources for 2 tables (2×3 schema + 3 docs), got: {:?}",
+            10,
+            "expected 10 resources for 2 tables (2×3 schema + 4 docs), got: {:?}",
             resources.iter().map(|r| &r.uri).collect::<Vec<_>>()
         );
         let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();

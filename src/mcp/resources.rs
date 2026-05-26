@@ -11,7 +11,7 @@ use crate::schema::{FieldType, SchemaConfig};
 /// README.md embedded at compile time so it ships in the binary.
 pub const README: &str = include_str!("../../README.md");
 
-/// Hand-written cheat sheet listing all 12 tools with descriptions / shapes.
+/// Hand-written cheat sheet listing all 17 tools with descriptions / shapes.
 pub const TOOLS_DOC: &str = r#"# mini-app-mcp — Tools Reference
 
 ## `table` argument (all tools)
@@ -95,6 +95,73 @@ Write row data from a table to absolute filesystem path(s) with multi-format ser
   - `sha256` is always a 64-character lower-hex SHA-256 digest (never empty, even with `dry_run=true`).
   - `row_id` is `null` when `concat=true`; the source row UUID when `concat=false`.
 - Annotations: `readOnlyHint=false`, `destructiveHint=true`, `idempotentHint=true`
+
+## `schema_create`
+Create a new table schema (`schema.yaml` + SQLite DB) in the given scope. No automatic DDL migrations are applied — the DB is created empty.
+- **Input**: `{ "table": "<name>", "scope": "project"|"user", "fields": [{"name": "...", "type": "string|number|boolean|array|object", "required": true|false, "description": "..." (optional)}, ...], "dry_run": true|false (optional) }`
+  - `scope`: `"project"` (`MINI_APP_PROJECT_DIR`) or `"user"` (`MINI_APP_USER_DIR`).
+  - `dry_run=true`: verify path is absent and return `affects` without writing.
+- **Output**: `{ "created": "<table>", "path": "<schema_path>", "affects": {"would_create_yaml": true} }` (or `dry_run` shape when `dry_run=true`)
+- Returns `SCHEMA_EXISTS` (`data.code`) if the schema already exists.
+- Annotations: `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=false`
+
+## `schema_update`
+Overwrite an existing table schema with new field definitions. **No DDL is applied** to the existing SQLite table — column structure changes are the operator's responsibility.
+- **Input**: `{ "table": "<name>", "scope": "project"|"user", "fields": [...], "dry_run": true|false (optional) }`
+  - `dry_run=true`: return field diff (`fields_added`, `fields_removed`, `type_changed`) without writing.
+- **Output**: `{ "updated": "<table>", "path": "<schema_path>", "diff": {...} }` (or `dry_run` diff shape)
+- Returns `TABLE_NOT_FOUND` (`data.code`) when `table` is not mounted.
+- Annotations: `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=true`
+
+## `schema_delete`
+Remove a table schema (`schema.yaml`) and unmount it from the registry. **The DB file is not deleted** — remove `{scope_root}/{table}/{table}.db` manually if needed. Use `dry_run=true` first — rows become inaccessible after deletion.
+- **Input**: `{ "table": "<name>", "scope": "project"|"user", "dry_run": true|false (optional) }`
+  - `dry_run=true`: return `rows_orphaned` + `would_remove_yaml` without deleting.
+- **Output**: `{ "deleted": "<table>", "rows_orphaned": N }` (or `dry_run` shape)
+- Returns `TABLE_NOT_FOUND` (`data.code`) when `table` is not mounted.
+- Annotations: `readOnlyHint=false`, `destructiveHint=true`, `idempotentHint=true`
+
+## `schema_batch`
+Execute a list of schema operations atomically under a single SQLite SAVEPOINT. All ops must target the same table. On any op failure the SAVEPOINT is rolled back; YAML is never written (all-or-nothing).
+- **Input**: `{ "table": "<name>", "ops": [{"op": "query"|"schema_create"|"schema_update"|"schema_delete", ...}] }`
+  - Op types: `query` (raw SQL inside SAVEPOINT — schema validation bypassed), `schema_create`, `schema_update`, `schema_delete`.
+- **Output**: `{ "results": [{"op": "...", "ok": true, "affected": N, "affects": {"deleted": N, "inserted": N} (Replace only)}], "committed": true|false }`
+- Annotations: `readOnlyHint=false`, `destructiveHint=true`, `idempotentHint=false`
+
+## `alias_create`
+Register a named query alias for a table. The alias stores a `filter` expression and an optional `default_limit`. Alias names are unique per table; the alias namespace is isolated to `table` — aliases belonging to other tables are never affected.
+- **Input**: `{ "table": "<name>", "name": "<alias>", "filter": {...}, "limit": <u32 optional>, "description": "<str optional>" }`
+  - `filter`: the same filter object accepted by the `list` tool (see `docs://filters`).
+  - `limit`: stored as the default row cap when the alias is executed via `alias_run`.
+- **Output**: `{ "created": "<alias>" }`
+- Returns `ALIAS_ALREADY_EXISTS` (`data.code`) if an alias with the same name already exists for this table.
+- In multi-table mode `table` is required; omitting it returns `TABLE_REQUIRED`.
+- Annotations: `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=false`
+
+## `alias_list`
+List all named query aliases registered for a table. Each record includes `name`, `filter`, `default_limit`, and `description`. Aliases are scoped exclusively to the named `table`.
+- **Input**: `{ "table": "<name>" }` (table optional in legacy mode)
+- **Output**: array of alias records `[{ "name": "...", "filter": {...}, "default_limit": <number>|null, "description": "<str>"|null }, ...]`
+- In multi-table mode `table` is required; omitting it returns `TABLE_REQUIRED`.
+- Annotations: `readOnlyHint=true`, `idempotentHint=true`
+
+## `alias_run`
+Execute a named query alias and return matching rows. The stored filter is replayed against `Store::list`. Supply a runtime `limit` to override the alias's stored `default_limit`, and/or an `offset` for pagination. The alias is scoped exclusively to the named `table`.
+- **Input**: `{ "table": "<name>", "name": "<alias>", "limit": <u32 optional>, "offset": <u32 optional> }`
+  - `limit`: overrides the stored `default_limit` at execution time (Crux: runtime override is required — this is not a static macro replay).
+  - `offset`: pagination offset; never stored in the alias.
+- **Output**: array of records matching the alias filter (same shape as `list`)
+- Returns `ALIAS_NOT_FOUND` (`data.code`) if the alias does not exist.
+- In multi-table mode `table` is required; omitting it returns `TABLE_REQUIRED`.
+- Annotations: `readOnlyHint=true`, `idempotentHint=true`
+
+## `alias_delete`
+Delete a named query alias from a table. The alias is scoped exclusively to the named `table`; aliases belonging to other tables are never affected.
+- **Input**: `{ "table": "<name>", "name": "<alias>" }` (table optional in legacy mode)
+- **Output**: `{ "deleted": "<alias>" }`
+- Returns `ALIAS_NOT_FOUND` (`data.code`) if the alias does not exist.
+- In multi-table mode `table` is required; omitting it returns `TABLE_REQUIRED`.
+- Annotations: `readOnlyHint=false`, `destructiveHint=true`, `idempotentHint=true`
 "#;
 
 /// Hand-written reference table of all error codes from `src/error.rs`.
@@ -127,6 +194,8 @@ All MCP errors carry a structured JSON `data` object with at minimum:
 | `MATERIALIZE_FORMAT_ERROR` | 500 | Serialisation to the requested format failed during `row_materialize`. |
 | `MATERIALIZE_FIELD_UNKNOWN` | 422 | A projected field name is not present in the table schema. Also includes `"field": "<name>"` in `data`. |
 | `MATERIALIZE_INVALID_PARAM` | 422 | `row_materialize` parameters are structurally invalid (e.g. `concat=true` with `selector=by_id`). Also includes `"field"` and `"reason"` in `data`. |
+| `ALIAS_NOT_FOUND` | 404 | The named alias does not exist in the table's `_aliases` storage. Also includes `"name": "<alias>"` in `data`. |
+| `ALIAS_ALREADY_EXISTS` | 409 | `alias_create` was called but an alias with the same name already exists for this table. Also includes `"name": "<alias>"` in `data`. |
 
 ## Validation Error Example
 ```json
@@ -161,6 +230,114 @@ All MCP errors carry a structured JSON `data` object with at minimum:
   "code": "TABLE_REQUIRED",
   "message": "table argument is required in multi-table mode"
 }
+```
+"#;
+
+/// Guide for constructing `filter` objects used by the `list` tool, `alias_create`, and `row_materialize`.
+pub const FILTERS_DOC: &str = r#"# mini-app-mcp — Filter Construction Guide
+
+Filters are JSON objects passed to the `list` tool's `filter` argument, stored in `alias_create`,
+and used in `row_materialize`'s `by_filter` selector.  All filter types are schema-validated
+before any SQL executes.
+
+## `Eq` — exact equality
+
+Match rows where `field` equals `value`.
+
+```json
+{ "type": "eq", "field": "status", "value": "open" }
+```
+
+- `field`: must be a field name defined in `schema.yaml`.
+- `value`: must match the field's declared JSON type (`string`, `number`, `boolean`).
+
+## `In` — membership test
+
+Match rows where `field` equals any element in `values`.
+
+```json
+{ "type": "in", "field": "status", "values": ["open", "pending"] }
+```
+
+- `values`: non-empty array; all elements must match the field's declared type.
+
+## `Like` — SQL LIKE pattern match
+
+Match rows where `field` matches a SQL LIKE pattern.  Only `string`-typed fields are accepted.
+
+```json
+{ "type": "like", "field": "title", "pattern": "%migration%" }
+```
+
+- `%`: matches any sequence of characters.
+- `_`: matches any single character.
+- Restricted to `string`-typed fields; non-string fields are rejected with `VALIDATION_ERROR`.
+
+## `Or` — logical OR
+
+Match rows that satisfy **at least one** of the nested filters.
+
+```json
+{
+  "type": "or",
+  "filters": [
+    { "type": "eq", "field": "status", "value": "open" },
+    { "type": "eq", "field": "status", "value": "pending" }
+  ]
+}
+```
+
+## `And` — logical AND
+
+Match rows that satisfy **all** of the nested filters.
+
+```json
+{
+  "type": "and",
+  "filters": [
+    { "type": "eq", "field": "project", "value": "my-project" },
+    { "type": "in", "field": "status", "values": ["open", "pending"] }
+  ]
+}
+```
+
+## Composition example
+
+```json
+{
+  "type": "and",
+  "filters": [
+    { "type": "eq", "field": "project", "value": "my-project" },
+    {
+      "type": "or",
+      "filters": [
+        { "type": "eq", "field": "status", "value": "open" },
+        { "type": "like", "field": "title", "pattern": "%urgent%" }
+      ]
+    }
+  ]
+}
+```
+
+## Storing filters as aliases
+
+Use `alias_create` to store a filter for reuse:
+
+```json
+{
+  "tool": "alias_create",
+  "table": "issues",
+  "name": "recent_open",
+  "filter": { "type": "eq", "field": "status", "value": "open" },
+  "limit": 20,
+  "description": "Open issues, capped at 20"
+}
+```
+
+Then execute it with `alias_run`, optionally overriding `limit` and `offset` at runtime:
+
+```json
+{ "tool": "alias_run", "table": "issues", "name": "recent_open", "limit": 50, "offset": 0 }
 ```
 "#;
 
@@ -308,9 +485,25 @@ mod tests {
     }
 
     #[test]
-    fn tools_doc_contains_all_seven_tools() {
+    fn tools_doc_contains_all_seventeen_tools() {
         for tool in &[
-            "info", "create", "get", "list", "update", "delete", "reload",
+            "info",
+            "create",
+            "get",
+            "list",
+            "update",
+            "delete",
+            "reload",
+            "data_snapshot",
+            "row_materialize",
+            "schema_create",
+            "schema_update",
+            "schema_delete",
+            "schema_batch",
+            "alias_create",
+            "alias_list",
+            "alias_run",
+            "alias_delete",
         ] {
             assert!(
                 TOOLS_DOC.contains(&format!("## `{tool}`")),
@@ -340,6 +533,8 @@ mod tests {
             "MATERIALIZE_FORMAT_ERROR",
             "MATERIALIZE_FIELD_UNKNOWN",
             "MATERIALIZE_INVALID_PARAM",
+            "ALIAS_NOT_FOUND",
+            "ALIAS_ALREADY_EXISTS",
         ] {
             assert!(
                 ERRORS_DOC.contains(code),
@@ -361,6 +556,24 @@ mod tests {
         assert!(
             TOOLS_DOC.contains("## `row_materialize`"),
             "TOOLS_DOC must contain section for 'row_materialize'"
+        );
+    }
+
+    #[test]
+    fn filters_doc_contains_all_filter_types() {
+        for filter_type in &["Eq", "In", "Like", "Or", "And"] {
+            assert!(
+                FILTERS_DOC.contains(&format!("## `{filter_type}`")),
+                "FILTERS_DOC must contain section for '{filter_type}'"
+            );
+        }
+    }
+
+    #[test]
+    fn filters_doc_mentions_alias_create() {
+        assert!(
+            FILTERS_DOC.contains("alias_create"),
+            "FILTERS_DOC must mention alias_create"
         );
     }
 }

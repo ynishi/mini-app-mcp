@@ -86,7 +86,7 @@ All tools accept an optional `table` argument that selects the target table. In 
 
 ## MCP resources
 
-In addition to the 17 tools above, the server exposes 6 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
+In addition to the 17 tools above, the server exposes 7 read-only **Resources** addressable by URI. Resources are intended for agents that want to fetch the schema definition or reference documentation without invoking a mutating tool.
 
 | URI | MIME | Content |
 |---|---|---|
@@ -94,8 +94,9 @@ In addition to the 17 tools above, the server exposes 6 read-only **Resources** 
 | `schema://json` | `application/json` | Parsed `SchemaConfig` as JSON (same shape the `info` tool returns) |
 | `schema://json-schema` | `application/schema+json` | JSON Schema (draft-07) derived from the schema's fields. Use this to validate `data` arguments before calling `create` / `update` |
 | `docs://readme` | `text/markdown` | This README, compiled into the binary |
-| `docs://tools` | `text/markdown` | Cheat sheet of the 17 MCP tools and their input shapes |
+| `docs://tools` | `text/markdown` | Cheat sheet of all 17 MCP tools and their input shapes |
 | `docs://errors` | `text/markdown` | Reference table of error codes returned by the server |
+| `docs://filters` | `text/markdown` | Guide for constructing filter objects (Eq/In/Like/Or/And) used by `list`, `alias_create`, and `row_materialize` |
 
 The `info` tool and `schema://json` resource return equivalent content but serve different purposes: `info` is a callable tool (good for one-off introspection in a conversation), while resources are URI-addressable and can be subscribed to or cached by the client.
 
