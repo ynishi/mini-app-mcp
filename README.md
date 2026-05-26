@@ -481,6 +481,27 @@ Replace mode performs a full replacement: `data` is validated against the schema
 
 SQLite databases are opened in WAL journal mode for safe concurrent access during `reload`. Sidecar files `<db>.db-wal` and `<db>.db-shm` are created next to each `.db` file — these are managed by SQLite and should not be deleted manually.
 
+## MCP Registry
+
+`mini-app-mcp` is listed on the [MCP Registry](https://registry.modelcontextprotocol.io). The OCI image is published to GitHub Container Registry on every tagged release.
+
+#### Docker (no Rust toolchain required)
+
+```json
+{
+  "mcpServers": {
+    "mini-app": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "/path/to/data:/data",
+        "ghcr.io/ynishi/mini-app-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
 ## License
 
 MIT OR Apache-2.0

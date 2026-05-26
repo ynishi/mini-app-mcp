@@ -1,0 +1,19 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.ynishi/mini-app-mcp",
+  "description": "Agent-First CRUD store MCP server — 1 daemon per table, schema.yaml driven, SQLite backend",
+  "version": "0.9.0",
+  "repository": {
+    "url": "https://github.com/ynishi/mini-app-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/ynishi/mini-app-mcp:0.9.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
