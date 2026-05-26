@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Like` variant in `ListFilter`** (`src/filter.rs`) — adds partial-match filtering to the `list` tool. Serialises as `{"type": "like", "field": "...", "pattern": "..."}` where `%` matches any substring and `_` matches any single character, delegating to SQLite's native `LIKE` operator via `json_extract(data, '$.{field}') LIKE ?`. Restricted to `string`-typed schema fields; non-string fields are rejected with `VALIDATION_ERROR` before any SQL executes. The variant is automatically reflected in the MCP list tool's JSON schema through the existing `#[derive(Deserialize, Serialize, JsonSchema)]` and `#[serde(tag = "type", rename_all = "snake_case")]` attributes — no edits to `store.rs`, `mcp/server.rs`, or any other source file are required.
+- **6 new tests** (`src/filter.rs`) — `like_validate_ok`, `like_unknown_field_reject`, `like_non_string_field_reject` (validate path); `like_build_sql`, `like_in_and_composition_build_sql` (build_sql path); `like_serde_roundtrip` (serde round-trip).
+
 ## [0.9.0] - 2026-05-26
 
 > **BREAKING CHANGE**: The `update` tool now defaults to **merge** (RFC 7396 shallow merge) instead of full replacement. Callers that depend on the old full-replacement behaviour must pass `"mode": "replace"` explicitly to restore it. Callers that omit `mode` will now receive merge semantics, which preserves fields absent from the patch and deletes fields whose patch value is `null` (subject to `required` constraints).
