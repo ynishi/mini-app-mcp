@@ -91,6 +91,40 @@ const CREATE_TABLE_SQL: &str = "
     )
 ";
 
+/// DDL for the per-table named query alias store.
+///
+/// `_aliases` lives inside the same `.db` file as `rows`, ensuring per-table
+/// namespace isolation: each [`Store`] instance only ever accesses the
+/// `_aliases` table in its own database connection.
+///
+/// `name` is the PRIMARY KEY — UNIQUE constraint is implicit.
+/// `filter` stores the serialized [`crate::filter::ListFilter`] JSON.
+/// `default_limit` is optional and may be overridden at `alias_run` call time.
+const CREATE_ALIASES_TABLE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS _aliases (
+        name           TEXT    PRIMARY KEY,
+        filter         TEXT    NOT NULL,
+        default_limit  INTEGER,
+        description    TEXT
+    )
+";
+
+/// A row returned from the `_aliases` table.
+///
+/// `filter` is stored as raw JSON text; callers (`alias_run` in server.rs) are
+/// responsible for deserialising it back to a [`crate::filter::ListFilter`].
+#[derive(Debug, Clone)]
+pub struct AliasRecord {
+    /// Alias name (PRIMARY KEY in `_aliases`).
+    pub name: String,
+    /// Serialised [`crate::filter::ListFilter`] JSON string.
+    pub filter: String,
+    /// Optional default limit to apply when `alias_run` does not supply one.
+    pub default_limit: Option<u32>,
+    /// Optional human-readable description.
+    pub description: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -233,6 +267,7 @@ impl Store {
                     );
                 }
                 c.execute_batch(CREATE_TABLE_SQL)?;
+                c.execute_batch(CREATE_ALIASES_TABLE_SQL)?;
                 Ok(c)
             })
             .await
@@ -704,6 +739,174 @@ impl Store {
         crate::dump::on_delete(&self.schema, &id_for_hook).await?;
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Alias CRUD
+    // -----------------------------------------------------------------------
+
+    /// Register a named query alias in `_aliases`.
+    ///
+    /// The `filter` value is serialised to JSON text and stored verbatim.
+    /// `default_limit` and `description` are optional.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::AliasAlreadyExists`] — an alias with `name` already
+    ///   exists.  Delete it first or choose a different name.
+    /// - [`MiniAppError::Storage`] — rusqlite error.
+    /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError), or
+    ///   `filter` serialisation failed.
+    ///
+    /// # Panic
+    /// Does not panic.
+    pub async fn alias_create(
+        &self,
+        name: &str,
+        filter: &crate::filter::ListFilter,
+        default_limit: Option<u32>,
+        description: Option<String>,
+    ) -> Result<(), MiniAppError> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+        let filter_json = serde_json::to_string(filter)
+            .map_err(|e| MiniAppError::Schema(format!("filter serialisation: {e}")))?;
+
+        tokio::task::spawn_blocking(move || -> Result<(), MiniAppError> {
+            let conn = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO _aliases (name, filter, default_limit, description) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![name, filter_json, default_limit, description],
+            )?;
+            if conn.changes() == 0 {
+                return Err(MiniAppError::AliasAlreadyExists { name });
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
+    }
+
+    /// Retrieve a single alias by name.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::AliasNotFound`] — no alias with `name` exists.
+    /// - [`MiniAppError::Storage`] — rusqlite error.
+    /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
+    ///
+    /// # Panic
+    /// Does not panic.
+    pub async fn alias_get(&self, name: &str) -> Result<AliasRecord, MiniAppError> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+
+        tokio::task::spawn_blocking(move || -> Result<AliasRecord, MiniAppError> {
+            let conn = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let mut stmt = conn.prepare(
+                "SELECT name, filter, default_limit, description \
+                 FROM _aliases WHERE name = ?1",
+            )?;
+            let record = stmt
+                .query_row(rusqlite::params![name], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<u32>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .optional()?
+                .ok_or_else(|| MiniAppError::AliasNotFound { name: name.clone() })?;
+
+            Ok(AliasRecord {
+                name: record.0,
+                filter: record.1,
+                default_limit: record.2,
+                description: record.3,
+            })
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
+    }
+
+    /// List all aliases registered for this table, ordered by name.
+    ///
+    /// Returns an empty `Vec` when no aliases exist.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::Storage`] — rusqlite error.
+    /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
+    ///
+    /// # Panic
+    /// Does not panic.
+    pub async fn alias_list(&self) -> Result<Vec<AliasRecord>, MiniAppError> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<AliasRecord>, MiniAppError> {
+            let conn = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let mut stmt = conn.prepare(
+                "SELECT name, filter, default_limit, description \
+                 FROM _aliases ORDER BY name ASC",
+            )?;
+            let records = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<u32>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(records
+                .into_iter()
+                .map(|(name, filter, default_limit, description)| AliasRecord {
+                    name,
+                    filter,
+                    default_limit,
+                    description,
+                })
+                .collect())
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
+    }
+
+    /// Delete the alias with the given `name`.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::AliasNotFound`] — no alias with `name` exists.
+    /// - [`MiniAppError::Storage`] — rusqlite error.
+    /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
+    ///
+    /// # Panic
+    /// Does not panic.
+    pub async fn alias_delete(&self, name: &str) -> Result<(), MiniAppError> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+
+        tokio::task::spawn_blocking(move || -> Result<(), MiniAppError> {
+            let conn = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let n = conn.execute(
+                "DELETE FROM _aliases WHERE name = ?1",
+                rusqlite::params![name],
+            )?;
+            if n == 0 {
+                return Err(MiniAppError::AliasNotFound { name });
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
     }
 }
 
@@ -1474,6 +1677,206 @@ mod tests {
         assert!(
             matches!(err, MiniAppError::Validation { .. }),
             "expected Validation error, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Alias CRUD tests
+    // -----------------------------------------------------------------------
+
+    use crate::filter::ListFilter;
+
+    /// Build a trivial ListFilter suitable for alias tests.
+    fn make_filter() -> ListFilter {
+        ListFilter::Eq {
+            field: "state".to_string(),
+            value: serde_json::json!("open"),
+        }
+    }
+
+    /// AC#5: alias_create → alias_get round-trip preserves all fields.
+    #[tokio::test]
+    async fn alias_create_and_get_round_trip() {
+        let store = make_test_store().await;
+        let filter = make_filter();
+
+        store
+            .alias_create("recent_open", &filter, Some(20), Some("desc".to_string()))
+            .await
+            .expect("alias_create must succeed");
+
+        let record = store
+            .alias_get("recent_open")
+            .await
+            .expect("alias_get must succeed");
+
+        assert_eq!(record.name, "recent_open");
+        assert_eq!(record.default_limit, Some(20));
+        assert_eq!(record.description.as_deref(), Some("desc"));
+
+        // filter round-trip: deserialise from the stored JSON text
+        let restored: ListFilter =
+            serde_json::from_str(&record.filter).expect("filter must deserialise");
+        let stored_back = serde_json::to_string(&filter).unwrap();
+        let stored_back2 = serde_json::to_string(&restored).unwrap();
+        assert_eq!(
+            stored_back, stored_back2,
+            "filter must survive a JSON round-trip"
+        );
+    }
+
+    /// AC#5 (nulls): alias_create with None default_limit and None description.
+    #[tokio::test]
+    async fn alias_create_with_optional_nulls() {
+        let store = make_test_store().await;
+        let filter = make_filter();
+
+        store
+            .alias_create("no_opts", &filter, None, None)
+            .await
+            .expect("alias_create must succeed with None optionals");
+
+        let record = store
+            .alias_get("no_opts")
+            .await
+            .expect("alias_get must succeed");
+        assert_eq!(record.name, "no_opts");
+        assert!(record.default_limit.is_none());
+        assert!(record.description.is_none());
+    }
+
+    /// AC#6: alias_list returns all registered aliases.
+    #[tokio::test]
+    async fn alias_list_returns_all() {
+        let store = make_test_store().await;
+        let filter = make_filter();
+
+        // Initially empty.
+        let list = store
+            .alias_list()
+            .await
+            .expect("alias_list must succeed on empty store");
+        assert!(list.is_empty(), "empty store should return empty list");
+
+        store
+            .alias_create("b_alias", &filter, None, None)
+            .await
+            .unwrap();
+        store
+            .alias_create("a_alias", &filter, None, None)
+            .await
+            .unwrap();
+
+        let list = store.alias_list().await.expect("alias_list must succeed");
+        assert_eq!(list.len(), 2, "must return 2 aliases");
+        // Ordered by name ASC.
+        assert_eq!(list[0].name, "a_alias");
+        assert_eq!(list[1].name, "b_alias");
+    }
+
+    /// AC#7: alias_delete removes the alias, subsequent alias_get returns AliasNotFound.
+    #[tokio::test]
+    async fn alias_delete_removes_alias() {
+        let store = make_test_store().await;
+        let filter = make_filter();
+
+        store
+            .alias_create("to_delete", &filter, None, None)
+            .await
+            .unwrap();
+
+        store
+            .alias_delete("to_delete")
+            .await
+            .expect("alias_delete must succeed");
+
+        let err = store
+            .alias_get("to_delete")
+            .await
+            .expect_err("alias_get after delete must fail");
+
+        assert!(
+            matches!(err, MiniAppError::AliasNotFound { ref name } if name == "to_delete"),
+            "expected AliasNotFound, got: {err:?}"
+        );
+    }
+
+    /// AC#8: duplicate alias_create returns AliasAlreadyExists.
+    #[tokio::test]
+    async fn alias_create_duplicate_returns_already_exists() {
+        let store = make_test_store().await;
+        let filter = make_filter();
+
+        store
+            .alias_create("dup", &filter, None, None)
+            .await
+            .expect("first alias_create must succeed");
+
+        let err = store
+            .alias_create("dup", &filter, None, None)
+            .await
+            .expect_err("second alias_create must fail");
+
+        assert!(
+            matches!(err, MiniAppError::AliasAlreadyExists { ref name } if name == "dup"),
+            "expected AliasAlreadyExists, got: {err:?}"
+        );
+    }
+
+    /// AC#9: alias_get for non-existent name returns AliasNotFound.
+    #[tokio::test]
+    async fn alias_get_missing_returns_not_found() {
+        let store = make_test_store().await;
+
+        let err = store
+            .alias_get("nonexistent")
+            .await
+            .expect_err("alias_get on missing alias must fail");
+
+        assert!(
+            matches!(err, MiniAppError::AliasNotFound { ref name } if name == "nonexistent"),
+            "expected AliasNotFound, got: {err:?}"
+        );
+    }
+
+    /// AC#9: alias_delete for non-existent name returns AliasNotFound.
+    #[tokio::test]
+    async fn alias_delete_missing_returns_not_found() {
+        let store = make_test_store().await;
+
+        let err = store
+            .alias_delete("nonexistent")
+            .await
+            .expect_err("alias_delete on missing alias must fail");
+
+        assert!(
+            matches!(err, MiniAppError::AliasNotFound { ref name } if name == "nonexistent"),
+            "expected AliasNotFound, got: {err:?}"
+        );
+    }
+
+    /// Verify per-table isolation: two separate Store instances (each with their
+    /// own :memory: DB) have independent _aliases tables.
+    #[tokio::test]
+    async fn alias_namespace_isolation_between_stores() {
+        let store_a = make_test_store().await;
+        let store_b = make_test_store().await;
+        let filter = make_filter();
+
+        store_a
+            .alias_create("shared_name", &filter, None, None)
+            .await
+            .expect("store_a alias_create must succeed");
+
+        // store_b has a completely separate _aliases table — the alias must not be visible.
+        let err = store_b
+            .alias_get("shared_name")
+            .await
+            .expect_err("alias created in store_a must not be visible in store_b");
+
+        assert!(
+            matches!(err, MiniAppError::AliasNotFound { .. }),
+            "expected AliasNotFound in store_b, got: {err:?}"
         );
     }
 }
