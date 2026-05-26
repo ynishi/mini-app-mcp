@@ -252,7 +252,7 @@ row_materialize(table="notes", selector={"type": "ById", "id": "<uuid>"}, ...)
 row_materialize(table="notes", selector={"type": "ByFilter", "filter": {"type": "eq", "field": "state", "value": "done"}}, ...)
 ```
 
-`ById` fetches exactly one row by primary key. `ByFilter` accepts any `ListFilter` expression (the same `eq` / `in` / `or` / `and` combinators available in `list`).
+`ById` fetches exactly one row by primary key. `ByFilter` accepts any `ListFilter` expression (the same `eq` / `in` / `like` / `or` / `and` combinators available in `list`).
 
 ### Output formats
 
@@ -409,6 +409,7 @@ The `list` tool returns rows in `created_at DESC` order with `limit` capped at 1
 |---|---|
 | `eq` | Equality match: `{"type": "eq", "field": "...", "value": ...}` |
 | `in` | Set membership: `{"type": "in", "field": "...", "values": [...]}` |
+| `like` | Partial-match on string fields: `{"type": "like", "field": "...", "pattern": "..."}`. `%` matches any substring; `_` matches any single character. Restricted to `string`-typed fields. |
 | `or` | OR composition: `{"type": "or", "filters": [...]}` |
 | `and` | AND composition: `{"type": "and", "filters": [...]}` |
 
