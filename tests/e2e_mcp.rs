@@ -237,6 +237,10 @@ fn tools_list_contains_all_advertised_tools() {
         "schema_delete",
         "schema_batch",
         "data_snapshot",
+        "alias_create",
+        "alias_list",
+        "alias_run",
+        "alias_delete",
     ] {
         assert!(names.contains(&expected), "{expected} missing: {names:?}");
     }
@@ -340,5 +344,233 @@ fn create_with_stringified_data_is_rejected() {
     assert!(
         is_tool_error || has_rpc_error,
         "stringified data should be rejected, got: {resp}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Alias CRUD round-trip
+// ---------------------------------------------------------------------------
+
+/// Exercises alias_create → alias_list → alias_run → alias_delete in order,
+/// then verifies that alias_run after deletion returns ALIAS_NOT_FOUND.
+#[test]
+fn alias_crud_round_trip() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    // Seed a row so alias_run has something to return.
+    client.call_tool(
+        "create",
+        json!({
+            "table": "emo",
+            "data": {"text": "alias seed row"},
+        }),
+    );
+
+    // 1. alias_create — register an alias filtering on the text field.
+    // Uses the tagged-enum ListFilter format: {"type": "like", "field": "text", "pattern": "%alias seed%"}.
+    let created = client.call_tool(
+        "alias_create",
+        json!({
+            "table": "emo",
+            "name": "alias_test",
+            "filter": {"type": "like", "field": "text", "pattern": "%alias seed%"},
+            "limit": 10,
+            "description": "test alias"
+        }),
+    );
+    assert_eq!(
+        created.get("created").and_then(Value::as_str),
+        Some("alias_test"),
+        "alias_create should return created name, got: {created:?}"
+    );
+
+    // 2. alias_list — the alias we just created must appear in the list.
+    let listed: Vec<Value> =
+        serde_json::from_value(client.call_tool("alias_list", json!({"table": "emo"})))
+            .expect("alias_list should return a JSON array");
+    let names: Vec<&str> = listed
+        .iter()
+        .filter_map(|a| a.get("name").and_then(Value::as_str))
+        .collect();
+    assert!(
+        names.contains(&"alias_test"),
+        "alias_test not found in alias_list, got: {names:?}"
+    );
+
+    // 3. alias_run — should return rows matching the stored filter.
+    let rows: Vec<Value> = serde_json::from_value(
+        client.call_tool("alias_run", json!({"table": "emo", "name": "alias_test"})),
+    )
+    .expect("alias_run should return a JSON array");
+    assert!(
+        !rows.is_empty(),
+        "alias_run should return at least one row for filter matching 'alias seed' text"
+    );
+
+    // 4. alias_delete — remove the alias.
+    let deleted = client.call_tool(
+        "alias_delete",
+        json!({"table": "emo", "name": "alias_test"}),
+    );
+    assert_eq!(
+        deleted.get("deleted").and_then(Value::as_str),
+        Some("alias_test"),
+        "alias_delete should return deleted name, got: {deleted:?}"
+    );
+
+    // 5. alias_run after deletion must return a tool error (ALIAS_NOT_FOUND).
+    // The error text contains "alias not found" from the Display impl.
+    let id = client.next_id();
+    client.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "alias_run",
+            "arguments": {"table": "emo", "name": "alias_test"}
+        }
+    }));
+    let resp = client.recv_for(id);
+    let is_tool_error = resp
+        .pointer("/result/isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        is_tool_error,
+        "alias_run after delete should return tool error, got: {resp}"
+    );
+    // Verify the error message contains "alias not found" (from MiniAppError::AliasNotFound Display).
+    let text = resp
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        text.contains("alias not found"),
+        "expected 'alias not found' in error text, got: {text:?}"
+    );
+}
+
+/// Verifies that duplicate alias_create returns ALIAS_ALREADY_EXISTS.
+#[test]
+fn alias_create_duplicate_returns_already_exists() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    // First create should succeed. Filter on text field using Eq.
+    client.call_tool(
+        "alias_create",
+        json!({
+            "table": "emo",
+            "name": "dup_alias",
+            "filter": {"type": "eq", "field": "text", "value": "dup text"}
+        }),
+    );
+
+    // Second create with the same name must return ALIAS_ALREADY_EXISTS.
+    let id = client.next_id();
+    client.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "alias_create",
+            "arguments": {
+                "table": "emo",
+                "name": "dup_alias",
+                "filter": {"type": "eq", "field": "text", "value": "dup text"}
+            }
+        }
+    }));
+    let resp = client.recv_for(id);
+    let is_tool_error = resp
+        .pointer("/result/isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        is_tool_error,
+        "duplicate alias_create should return tool error, got: {resp}"
+    );
+    // Verify the error message contains "alias already exists" (from MiniAppError::AliasAlreadyExists Display).
+    let text = resp
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        text.contains("alias already exists"),
+        "expected 'alias already exists' in error text, got: {text:?}"
+    );
+}
+
+/// Verifies that alias_run with a runtime limit overrides the stored default_limit.
+/// Also verifies runtime offset is passed through.
+///
+/// Crux: alias_run must accept runtime limit/offset that override stored defaults
+/// and pass the resolved values through to Store::list rather than replaying
+/// the stored parameters verbatim.
+#[test]
+fn alias_run_limit_override() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    // Seed 3 rows with a distinctive text prefix.
+    for i in 0..3 {
+        client.call_tool(
+            "create",
+            json!({
+                "table": "emo",
+                "data": {"text": format!("limit_override_row_{i}")},
+            }),
+        );
+    }
+
+    // Create alias with stored default_limit = 1, filter matches the 3 seeded rows.
+    client.call_tool(
+        "alias_create",
+        json!({
+            "table": "emo",
+            "name": "limit_test_alias",
+            "filter": {"type": "like", "field": "text", "pattern": "limit_override_row_%"},
+            "limit": 1
+        }),
+    );
+
+    // alias_run without runtime limit → uses stored default_limit = 1 → 1 row.
+    let rows_default: Vec<Value> = serde_json::from_value(client.call_tool(
+        "alias_run",
+        json!({"table": "emo", "name": "limit_test_alias"}),
+    ))
+    .expect("alias_run (default limit) should return a JSON array");
+    assert_eq!(
+        rows_default.len(),
+        1,
+        "stored default_limit=1 should return 1 row, got: {}",
+        rows_default.len()
+    );
+
+    // alias_run with runtime limit=3 → overrides stored default_limit → 3 rows.
+    let rows_override: Vec<Value> = serde_json::from_value(client.call_tool(
+        "alias_run",
+        json!({"table": "emo", "name": "limit_test_alias", "limit": 3}),
+    ))
+    .expect("alias_run (runtime limit=3) should return a JSON array");
+    assert_eq!(
+        rows_override.len(),
+        3,
+        "runtime limit=3 should override stored default_limit=1 and return 3 rows, got: {}",
+        rows_override.len()
+    );
+
+    // alias_run with runtime offset=2 → skip first 2 rows → 1 row remaining.
+    let rows_offset: Vec<Value> = serde_json::from_value(client.call_tool(
+        "alias_run",
+        json!({"table": "emo", "name": "limit_test_alias", "limit": 3, "offset": 2}),
+    ))
+    .expect("alias_run (limit=3, offset=2) should return a JSON array");
+    assert_eq!(
+        rows_offset.len(),
+        1,
+        "limit=3 offset=2 with 3 total rows should return 1 row, got: {}",
+        rows_offset.len()
     );
 }
