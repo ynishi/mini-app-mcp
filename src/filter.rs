@@ -63,6 +63,8 @@ impl rusqlite::ToSql for FilterParam {
 /// - `In` — membership: `json_extract(data, '$.field') IN (?, …)`
 /// - `Or` — logical OR of a non-empty list of sub-filters (parenthesised)
 /// - `And` — logical AND of a non-empty list of sub-filters (parenthesised)
+/// - `Like` — SQL LIKE pattern match: `json_extract(data, '$.field') LIKE ?`
+///   (`%` matches any substring, `_` matches any single character)
 ///
 /// # Example JSON
 /// ```json
@@ -70,6 +72,10 @@ impl rusqlite::ToSql for FilterParam {
 ///   {"type": "eq", "field": "mailbox", "value": "inbox"},
 ///   {"type": "eq", "field": "mailbox", "value": "sent"}
 /// ]}
+/// ```
+///
+/// ```json
+/// {"type": "like", "field": "subject", "pattern": "%hello%"}
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -99,6 +105,23 @@ pub enum ListFilter {
     And {
         /// Non-empty list of sub-filters combined with `AND`.
         filters: Vec<ListFilter>,
+    },
+    /// SQL LIKE pattern match: `json_extract(data, '$.field') LIKE ?`.
+    ///
+    /// Only supported on `string`-typed schema fields.  The pattern follows
+    /// standard SQL LIKE semantics:
+    /// - `%` matches any sequence of zero or more characters.
+    /// - `_` matches any single character.
+    ///
+    /// The pattern is passed as a bound parameter; no string interpolation
+    /// occurs.  SQLite native LIKE semantics apply (ASCII range is
+    /// case-insensitive by default).
+    Like {
+        /// Schema field name to match against.  Must be a `string`-typed field.
+        field: String,
+        /// SQL LIKE pattern.  Use `%` for any substring and `_` for any single
+        /// character (e.g. `"%hello%"`, `"prefix_%"`).
+        pattern: String,
     },
 }
 
@@ -167,6 +190,25 @@ impl ListFilter {
                     f.validate(schema)?;
                 }
             }
+            ListFilter::Like { field, pattern: _ } => {
+                let field_def = schema.fields.iter().find(|f| &f.name == field);
+                let fd = field_def.ok_or_else(|| MiniAppError::Validation {
+                    field: field.clone(),
+                    reason: format!(
+                        "unknown field '{field}' — only schema-registered fields are allowed in filter"
+                    ),
+                })?;
+                if fd.ty != crate::schema::FieldType::String {
+                    return Err(MiniAppError::Validation {
+                        field: field.clone(),
+                        reason: format!(
+                            "like filter is only supported on string fields, \
+                             but field '{field}' has type {}",
+                            fd.ty.as_str(),
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -204,6 +246,10 @@ impl ListFilter {
             }
             ListFilter::Or { filters } => build_composite_sql(filters, "OR"),
             ListFilter::And { filters } => build_composite_sql(filters, "AND"),
+            ListFilter::Like { field, pattern } => {
+                let sql = format!("json_extract(data, '$.{field}') LIKE ?");
+                Ok((sql, vec![FilterParam::Text(pattern.clone())]))
+            }
         }
     }
 }
@@ -712,5 +758,123 @@ mod tests {
     fn schema_for_list_filter_succeeds() {
         // This must not panic.
         let _schema = schemars::schema_for!(ListFilter);
+    }
+
+    // -----------------------------------------------------------------------
+    // Like variant tests
+    // -----------------------------------------------------------------------
+
+    /// Like filter against a known string field validates successfully.
+    #[test]
+    fn like_validate_ok() {
+        let schema = make_schema(vec![("subject", FieldType::String)]);
+        let f = ListFilter::Like {
+            field: "subject".to_string(),
+            pattern: "%hello%".to_string(),
+        };
+        assert!(f.validate(&schema).is_ok());
+    }
+
+    /// Like filter with a field not in schema is rejected with Validation error.
+    #[test]
+    fn like_unknown_field_reject() {
+        let schema = make_schema(vec![("subject", FieldType::String)]);
+        let f = ListFilter::Like {
+            field: "nonexistent_field".to_string(),
+            pattern: "%hello%".to_string(),
+        };
+        let err = f.validate(&schema).unwrap_err();
+        match err {
+            MiniAppError::Validation { field, reason } => {
+                assert_eq!(field, "nonexistent_field");
+                assert!(reason.contains("unknown field"), "got: {reason}");
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// Like filter against a non-string (Number) field is rejected.
+    #[test]
+    fn like_non_string_field_reject() {
+        let schema = make_schema(vec![("count", FieldType::Number)]);
+        let f = ListFilter::Like {
+            field: "count".to_string(),
+            pattern: "%42%".to_string(),
+        };
+        let err = f.validate(&schema).unwrap_err();
+        match err {
+            MiniAppError::Validation { field, reason } => {
+                assert_eq!(field, "count");
+                assert!(
+                    reason.contains("string"),
+                    "expected reason to contain 'string', got: {reason}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// Like filter builds correct SQL fragment and params.
+    #[test]
+    fn like_build_sql() {
+        let f = ListFilter::Like {
+            field: "subject".to_string(),
+            pattern: "%hello%".to_string(),
+        };
+        let (sql, params) = f.build_sql().unwrap();
+        assert_eq!(sql, "json_extract(data, '$.subject') LIKE ?");
+        assert_eq!(params, vec![FilterParam::Text("%hello%".to_string())]);
+    }
+
+    /// And { Like, Eq } builds correct composite SQL fragment and params.
+    #[test]
+    fn like_in_and_composition_build_sql() {
+        let f = ListFilter::And {
+            filters: vec![
+                ListFilter::Like {
+                    field: "subject".to_string(),
+                    pattern: "%urgent%".to_string(),
+                },
+                ListFilter::Eq {
+                    field: "mailbox".to_string(),
+                    value: serde_json::json!("inbox"),
+                },
+            ],
+        };
+        let (sql, params) = f.build_sql().unwrap();
+        assert_eq!(
+            sql,
+            "(json_extract(data, '$.subject') LIKE ? AND json_extract(data, '$.mailbox') = ?)"
+        );
+        assert_eq!(
+            params,
+            vec![
+                FilterParam::Text("%urgent%".to_string()),
+                FilterParam::Text("inbox".to_string()),
+            ]
+        );
+    }
+
+    /// Like variant serializes to `"type": "like"` and round-trips through
+    /// serde correctly.
+    #[test]
+    fn like_serde_roundtrip() {
+        let f = ListFilter::Like {
+            field: "subject".to_string(),
+            pattern: "%test%".to_string(),
+        };
+        let val = serde_json::to_value(&f).unwrap();
+        assert_eq!(val["type"], "like");
+        assert_eq!(val["field"], "subject");
+        assert_eq!(val["pattern"], "%test%");
+        let roundtrip: ListFilter = serde_json::from_value(val).unwrap();
+        // Verify the round-tripped variant has the expected field values.
+        match roundtrip {
+            ListFilter::Like { field, pattern } => {
+                assert_eq!(field, "subject");
+                assert_eq!(pattern, "%test%");
+            }
+            other => panic!("expected Like variant, got {other:?}"),
+        }
     }
 }
