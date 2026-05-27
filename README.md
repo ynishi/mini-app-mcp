@@ -68,8 +68,8 @@ All tools accept an optional `table` argument that selects the target table. In 
 |---|---|
 | `info` | Returns the parsed schema (table name, field definitions) as JSON |
 | `create` | Inserts a new row; validates the `data` object against the schema |
-| `get` | Retrieves a single row by `id` |
-| `list` | Returns rows with optional `limit` / `offset` pagination |
+| `get` | Retrieves a single row by `id`. Accepts an optional `fields` selector to project the returned `data` object to a named subset of schema fields. |
+| `list` | Returns rows with optional `limit` / `offset` pagination. Accepts an optional `fields` selector to project the returned `data` objects to a named subset of schema fields. |
 | `update` | Updates an existing row by `id`. Default mode is **merge** (RFC 7396): absent fields are preserved from the stored row, `null` values delete optional fields or raise a Validation error for required ones. Pass `"mode": "replace"` for full replacement (pre-0.9 behaviour). |
 | `delete` | Removes a row by `id` |
 | `reload` | Re-scan `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and atomically replace the table registry. Legacy `MINI_APP_SCHEMA` + `MINI_APP_DB` are re-applied if set. Returns `{ mounted, added, removed }`. Limitations: no file watcher (explicit invocation only); whole-registry replace (no per-table partial reload); no schema migration for existing rows; concurrent `reload` calls are last-write-wins. |
@@ -81,7 +81,7 @@ All tools accept an optional `table` argument that selects the target table. In 
 | `row_materialize` | Write one or more rows to arbitrary absolute paths on the local filesystem. Select rows by `id` or by a `ListFilter` expression. Choose output format (`raw`, `markdown`, `json`, `yaml`), field projection (`All` or a named subset), and whether to write one file per row (`concat=false`, default) or concatenate all rows into a single file (`concat=true`). Returns `{ count, files: [{path, bytes, sha256, row_id}] }` — every file entry includes a SHA-256 hex digest of the written bytes. Pass `dry_run: true` to compute results without writing. |
 | `alias_create` | Register a named query alias for a table. Accepts `name`, either `filter` (a `ListFilter` expression) or `filter_template` (a MiniJinja template string — mutually exclusive with `filter`), optional `params_schema` (array of parameter name strings for a templated alias), optional `default_limit`, and optional `description`. Alias names are unique per table; duplicate names return `ALIAS_ALREADY_EXISTS`. Aliases are scoped per table and stored in the table's own SQLite database. |
 | `alias_list` | Return all aliases registered for a table as a JSON array of `{ name, filter, default_limit, description, params_schema }` objects. |
-| `alias_run` | Execute a stored alias by name. Accepts optional runtime `limit` and `offset` that override the stored `default_limit` at call time. For parameterized aliases (those created with `filter_template`), also accepts a `params` object whose key-value pairs are injected into the template. If `params_schema` is set and `params` is omitted, returns `ALIAS_PARAMS_REQUIRED`. Template render failures return `ALIAS_TEMPLATE_ERROR`. Returns the same shape as the `list` tool. Returns `ALIAS_NOT_FOUND` for an unknown name. |
+| `alias_run` | Execute a stored alias by name. Accepts optional runtime `limit` and `offset` that override the stored `default_limit` at call time. For parameterized aliases (those created with `filter_template`), also accepts a `params` object whose key-value pairs are injected into the template. Accepts an optional `fields` selector to project the returned `data` objects to a named subset of schema fields. If `params_schema` is set and `params` is omitted, returns `ALIAS_PARAMS_REQUIRED`. Template render failures return `ALIAS_TEMPLATE_ERROR`. Returns the same shape as the `list` tool. Returns `ALIAS_NOT_FOUND` for an unknown name. |
 | `alias_delete` | Delete a named alias for a table. Returns `ALIAS_NOT_FOUND` if the alias does not exist. |
 
 ## MCP resources
@@ -482,6 +482,31 @@ Replace mode performs a full replacement: `data` is validated against the schema
 |---|---|
 | `merge` (default) | Partial updates — only send the fields you want to change. Existing fields you omit are untouched. |
 | `replace` | Full rewrites — you supply the complete intended state of the row. Omitted fields are deleted. |
+
+## Field projection
+
+`list`, `get`, and `alias_run` all accept an optional `fields` argument that limits which schema fields appear in the returned `data` object. `id`, `created_at`, and `updated_at` are always included in the response envelope regardless of the selector.
+
+### Selector shapes
+
+```json
+{"mode": "all"}                              // default: return all schema fields
+{"mode": "list", "fields": ["title", "state"]}   // return only the named fields
+```
+
+Omitting `fields` is fully backward-compatible — existing callers receive complete rows without any change.
+
+### Usage examples
+
+```
+list(table="issues", fields={"mode": "list", "fields": ["title", "state"]})
+get(table="issues", id="<uuid>", fields={"mode": "list", "fields": ["title"]})
+alias_run(table="issues", name="recent_open", fields={"mode": "list", "fields": ["title", "state"]})
+```
+
+### Validation
+
+Unknown field names are rejected with `VALIDATION_ERROR` before any query executes. Field name validation consults `schema.yaml`'s canonical field definitions — not the actual keys present in stored rows — so projection errors are caught reliably even when the field is simply absent from a particular row.
 
 ## Query aliases
 
