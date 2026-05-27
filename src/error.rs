@@ -73,6 +73,9 @@ pub mod codes {
     /// Returned when MiniJinja template rendering fails (syntax error or
     /// missing variable) during `alias_run`.
     pub const ALIAS_TEMPLATE_ERROR: &str = "ALIAS_TEMPLATE_ERROR";
+    /// Returned when an id prefix matches more than one row and the caller
+    /// must disambiguate by using a longer prefix or the full UUID.
+    pub const AMBIGUOUS_ID: &str = "AMBIGUOUS_ID";
 }
 
 /// All errors that can arise inside mini-app-mcp.
@@ -317,6 +320,19 @@ pub enum MiniAppError {
     /// avoids `#[from]` conflicts with other error origins (K-79).
     #[error("alias template render error: {0}")]
     AliasTemplateError(String),
+
+    /// An id prefix matched more than one row.
+    ///
+    /// The caller must use a longer prefix or the full UUID to disambiguate.
+    ///
+    /// # Fields
+    /// - `id_prefix`: the prefix that was supplied.
+    /// - `candidates`: the full UUIDs of all matching rows.
+    #[error("ambiguous id prefix '{id_prefix}': {n} candidates", n = candidates.len())]
+    AmbiguousId {
+        id_prefix: String,
+        candidates: Vec<String>,
+    },
 }
 
 impl MiniAppError {
@@ -355,6 +371,7 @@ impl MiniAppError {
             MiniAppError::AliasAlreadyExists { .. } => codes::ALIAS_ALREADY_EXISTS,
             MiniAppError::AliasParamsRequired { .. } => codes::ALIAS_PARAMS_REQUIRED,
             MiniAppError::AliasTemplateError(_) => codes::ALIAS_TEMPLATE_ERROR,
+            MiniAppError::AmbiguousId { .. } => codes::AMBIGUOUS_ID,
         }
     }
 }
@@ -469,6 +486,17 @@ impl From<MiniAppError> for McpError {
                     "code": code,
                     "message": message,
                     "name": name,
+                })
+            }
+            MiniAppError::AmbiguousId {
+                id_prefix,
+                candidates,
+            } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "id_prefix": id_prefix,
+                    "candidates": candidates,
                 })
             }
             _ => {
@@ -691,6 +719,13 @@ mod tests {
                 codes::ALIAS_TEMPLATE_ERROR,
                 MiniAppError::AliasTemplateError("template syntax error".into()),
             ),
+            (
+                codes::AMBIGUOUS_ID,
+                MiniAppError::AmbiguousId {
+                    id_prefix: "abc".into(),
+                    candidates: vec!["abc-1".into(), "abc-2".into()],
+                },
+            ),
         ];
         for (expected_code, err) in cases {
             assert_eq!(
@@ -754,6 +789,10 @@ mod tests {
                 name: "my_alias".into(),
             },
             MiniAppError::AliasTemplateError("template syntax error".into()),
+            MiniAppError::AmbiguousId {
+                id_prefix: "abc".into(),
+                candidates: vec!["abc-1".into(), "abc-2".into()],
+            },
         ];
         for err in errs {
             let mcp: McpError = err.into();
@@ -1011,5 +1050,36 @@ mod tests {
         );
         assert_eq!(data["name"], Value::String("recent_open".to_string()));
         assert!(data["message"].is_string());
+    }
+
+    // T1: AmbiguousId has code AMBIGUOUS_ID, carries id_prefix and candidates array
+    #[test]
+    fn ambiguous_id_error_has_structured_data() {
+        let err = MiniAppError::AmbiguousId {
+            id_prefix: "abc1".to_string(),
+            candidates: vec![
+                "abc1def2-0000-0000-0000-000000000001".to_string(),
+                "abc1def2-0000-0000-0000-000000000002".to_string(),
+            ],
+        };
+        assert_eq!(err.code(), codes::AMBIGUOUS_ID);
+        let mcp: McpError = err.into();
+        let data = mcp.data.expect("data must be Some for AmbiguousId");
+        assert_eq!(data["code"], Value::String("AMBIGUOUS_ID".to_string()));
+        assert_eq!(data["id_prefix"], Value::String("abc1".to_string()));
+        assert!(data["message"].is_string());
+        // candidates must be a JSON array
+        let candidates = data["candidates"]
+            .as_array()
+            .expect("candidates must be a JSON array");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0],
+            Value::String("abc1def2-0000-0000-0000-000000000001".to_string())
+        );
+        assert_eq!(
+            candidates[1],
+            Value::String("abc1def2-0000-0000-0000-000000000002".to_string())
+        );
     }
 }

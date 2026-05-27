@@ -151,6 +151,45 @@ fn parse_data(json_str: &str) -> Result<serde_json::Value, MiniAppError> {
     serde_json::from_str(json_str).map_err(|e| MiniAppError::Schema(format!("data column: {e}")))
 }
 
+/// Resolves a possibly-shortened id prefix to the full UUID stored in `rows`.
+///
+/// - If `id.len() == 36`: full UUID bypass — returns `Ok(id.to_string())`
+///   immediately without querying the database.
+/// - Otherwise: executes `SELECT id FROM rows WHERE id LIKE ?1` with param
+///   `format!("{}%", id)`.
+///   - 0 results  → `Err(MiniAppError::NotFound { id: id.to_string() })`
+///   - 1 result   → `Ok(candidates[0].clone())`
+///   - 2+ results → `Err(MiniAppError::AmbiguousId { id_prefix, candidates })`
+///
+/// # Security
+/// The `%` wildcard is appended to the *parameter value*, not to the SQL
+/// template, so this is safe against SQL injection (rusqlite parameterized
+/// query).  UUID character set (0-9, a-f, hyphens) contains no LIKE metachar
+/// (`%` or `_`), so no LIKE escaping is needed in practice.
+fn resolve_id(conn: &rusqlite::Connection, id: &str) -> Result<String, MiniAppError> {
+    if id.len() == 36 {
+        // Full UUID bypass: skip LIKE query entirely (Crux constraint).
+        return Ok(id.to_string());
+    }
+    let mut stmt = conn.prepare("SELECT id FROM rows WHERE id LIKE ?1")?;
+    let candidates: Vec<String> = stmt
+        .query_map(rusqlite::params![format!("{}%", id)], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    match candidates.len() {
+        0 => Err(MiniAppError::NotFound { id: id.to_string() }),
+        1 => {
+            // SAFETY: len == 1 guarantees next() returns Some.
+            Ok(candidates.into_iter().next().unwrap())
+        }
+        _ => Err(MiniAppError::AmbiguousId {
+            id_prefix: id.to_string(),
+            candidates,
+        }),
+    }
+}
+
 /// RFC 7396 shallow merge: apply `patch` on top of `current`, consulting
 /// `schema` for required-field null-deletion checks.
 ///
@@ -390,6 +429,7 @@ impl Store {
             let conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let id = resolve_id(&conn, &id)?;
             let mut stmt =
                 conn.prepare("SELECT id, data, created_at, updated_at FROM rows WHERE id = ?1")?;
             let row = stmt
@@ -585,6 +625,7 @@ impl Store {
             let conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let id_str = resolve_id(&conn, &id_str)?;
 
             // Fetch both data and created_at in one query.
             // For Replace mode, the data column is read but unused; this keeps
@@ -739,25 +780,29 @@ impl Store {
     /// Does not panic.
     pub async fn delete(&self, id: &str) -> Result<(), MiniAppError> {
         let conn = self.conn.clone();
-        // Clone id for use after spawn_blocking (id is moved into the closure).
-        let id_for_hook = id.to_string();
         let id = id.to_string();
 
-        tokio::task::spawn_blocking(move || -> Result<(), MiniAppError> {
+        // The closure returns the resolved (full) UUID so that on_delete
+        // receives a complete UUID rather than a prefix string (CF-1).
+        let resolved_id = tokio::task::spawn_blocking(move || -> Result<String, MiniAppError> {
             let conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
-            let n = conn.execute("DELETE FROM rows WHERE id = ?1", rusqlite::params![id])?;
+            let resolved = resolve_id(&conn, &id)?;
+            let n = conn.execute(
+                "DELETE FROM rows WHERE id = ?1",
+                rusqlite::params![resolved],
+            )?;
             if n == 0 {
-                return Err(MiniAppError::NotFound { id });
+                return Err(MiniAppError::NotFound { id: resolved });
             }
-            Ok(())
+            Ok(resolved)
         })
         .await
         .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))??;
 
         // MutexGuard is already dropped (held only inside the spawn_blocking closure above).
-        crate::dump::on_delete(&self.schema, &id_for_hook).await?;
+        crate::dump::on_delete(&self.schema, &resolved_id).await?;
 
         Ok(())
     }
@@ -1918,6 +1963,193 @@ mod tests {
         assert!(
             matches!(err, MiniAppError::AliasNotFound { .. }),
             "expected AliasNotFound in store_b, got: {err:?}"
+        );
+    }
+
+    // --- UUID prefix match tests ---
+
+    /// prefix match: single hit → returns that row
+    #[tokio::test]
+    async fn test_get_prefix_match_single() {
+        let store = make_test_store().await;
+        let row = store
+            .create(serde_json::json!({"title": "prefix-test"}))
+            .await
+            .unwrap();
+        // Use first 8 characters as prefix (UUID v4 is sufficiently random).
+        let prefix = &row.id[..8];
+        let fetched = store.get(prefix).await.unwrap();
+        assert_eq!(fetched.id, row.id);
+        assert_eq!(fetched.data["title"], "prefix-test");
+    }
+
+    /// prefix match: 0 hits → NotFound
+    #[tokio::test]
+    async fn test_get_prefix_match_not_found() {
+        let store = make_test_store().await;
+        // "zzzzzzzz" is not a valid UUID hex prefix, will match nothing.
+        let err = store.get("zzzzzzzz").await.unwrap_err();
+        assert!(
+            matches!(err, MiniAppError::NotFound { .. }),
+            "expected NotFound, got: {err:?}"
+        );
+    }
+
+    /// prefix match: 2+ hits → AmbiguousId with candidate list
+    #[tokio::test]
+    async fn test_get_prefix_match_ambiguous() {
+        let store = make_test_store().await;
+        // Insert two rows whose IDs start with a known prefix by manipulating
+        // the DB directly.  We use the internal connection via execute_under_savepoint.
+        let id1 = "aaaaaaaa-0000-4000-8000-000000000001".to_string();
+        let id2 = "aaaaaaaa-0000-4000-8000-000000000002".to_string();
+        let id1_clone = id1.clone();
+        let id2_clone = id2.clone();
+        store
+            .execute_under_savepoint(move |sp| {
+                sp.execute(
+                    "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, 0, 0)",
+                    rusqlite::params![id1_clone, r#"{"title":"a1"}"#],
+                )?;
+                sp.execute(
+                    "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, 0, 0)",
+                    rusqlite::params![id2_clone, r#"{"title":"a2"}"#],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let err = store.get("aaaaaaaa").await.unwrap_err();
+        match err {
+            MiniAppError::AmbiguousId {
+                ref id_prefix,
+                ref candidates,
+            } => {
+                assert_eq!(id_prefix, "aaaaaaaa");
+                assert_eq!(candidates.len(), 2);
+                let mut sorted = candidates.clone();
+                sorted.sort();
+                assert_eq!(sorted[0], id1);
+                assert_eq!(sorted[1], id2);
+            }
+            other => panic!("expected AmbiguousId, got: {other:?}"),
+        }
+    }
+
+    /// full UUID (36 chars) bypasses prefix match and uses exact query
+    #[tokio::test]
+    async fn test_get_full_uuid_bypass() {
+        let store = make_test_store().await;
+        let row = store
+            .create(serde_json::json!({"title": "bypass-test"}))
+            .await
+            .unwrap();
+        assert_eq!(row.id.len(), 36, "UUID must be 36 chars");
+        // Pass the full UUID — must resolve via exact match, not LIKE.
+        let fetched = store.get(&row.id).await.unwrap();
+        assert_eq!(fetched.id, row.id);
+    }
+
+    /// update with prefix match: single hit → update succeeds
+    #[tokio::test]
+    async fn test_update_prefix_match_single() {
+        let store = make_test_store().await;
+        let row = store
+            .create(serde_json::json!({"title": "before"}))
+            .await
+            .unwrap();
+        let prefix = &row.id[..8];
+        let updated = store
+            .update(
+                prefix,
+                serde_json::json!({"title": "after"}),
+                UpdateMode::Replace,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.id, row.id);
+        assert_eq!(updated.data["title"], "after");
+    }
+
+    /// update with prefix match: 2+ hits → AmbiguousId
+    #[tokio::test]
+    async fn test_update_prefix_match_ambiguous() {
+        let store = make_test_store().await;
+        let id1 = "bbbbbbbb-0000-4000-8000-000000000001".to_string();
+        let id2 = "bbbbbbbb-0000-4000-8000-000000000002".to_string();
+        store
+            .execute_under_savepoint(move |sp| {
+                sp.execute(
+                    "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, 0, 0)",
+                    rusqlite::params![id1, r#"{"title":"b1"}"#],
+                )?;
+                sp.execute(
+                    "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, 0, 0)",
+                    rusqlite::params![id2, r#"{"title":"b2"}"#],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let err = store
+            .update(
+                "bbbbbbbb",
+                serde_json::json!({"title": "x"}),
+                UpdateMode::Replace,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MiniAppError::AmbiguousId { .. }),
+            "expected AmbiguousId, got: {err:?}"
+        );
+    }
+
+    /// delete with prefix match: single hit → delete succeeds
+    #[tokio::test]
+    async fn test_delete_prefix_match_single() {
+        let store = make_test_store().await;
+        let row = store
+            .create(serde_json::json!({"title": "to-delete-prefix"}))
+            .await
+            .unwrap();
+        let prefix = &row.id[..8];
+        store.delete(prefix).await.unwrap();
+        // Confirm deletion via full UUID
+        let err = store.get(&row.id).await.unwrap_err();
+        assert!(
+            matches!(err, MiniAppError::NotFound { .. }),
+            "expected NotFound after delete, got: {err:?}"
+        );
+    }
+
+    /// delete with prefix match: 2+ hits → AmbiguousId
+    #[tokio::test]
+    async fn test_delete_prefix_match_ambiguous() {
+        let store = make_test_store().await;
+        let id1 = "cccccccc-0000-4000-8000-000000000001".to_string();
+        let id2 = "cccccccc-0000-4000-8000-000000000002".to_string();
+        store
+            .execute_under_savepoint(move |sp| {
+                sp.execute(
+                    "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, 0, 0)",
+                    rusqlite::params![id1, r#"{"title":"c1"}"#],
+                )?;
+                sp.execute(
+                    "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, 0, 0)",
+                    rusqlite::params![id2, r#"{"title":"c2"}"#],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let err = store.delete("cccccccc").await.unwrap_err();
+        assert!(
+            matches!(err, MiniAppError::AmbiguousId { .. }),
+            "expected AmbiguousId, got: {err:?}"
         );
     }
 }
