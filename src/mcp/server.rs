@@ -1352,12 +1352,14 @@ impl MiniAppMcpServer {
             .map_err(|e| e.to_string())?;
         // Validate the filter against the table schema before persisting.
         params.filter.validate(&schema).map_err(|e| e.to_string())?;
+        let filter_json = serde_json::to_string(&params.filter).map_err(|e| e.to_string())?;
         store
             .alias_create(
                 &params.name,
-                &params.filter,
+                &filter_json,
                 params.limit,
                 params.description,
+                None, // params_schema: set in Subtask 2
             )
             .await
             .map_err(|e| e.to_string())?;
