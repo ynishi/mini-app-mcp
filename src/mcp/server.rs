@@ -665,8 +665,18 @@ struct AliasCreateParams {
     table: Option<String>,
     /// Unique name for this alias within the table's alias namespace.
     name: String,
-    /// The filter to store for this alias.
-    filter: ListFilter,
+    /// The filter to store for this alias.  Mutually exclusive with
+    /// `filter_template`; exactly one of the two must be supplied.
+    filter: Option<ListFilter>,
+    /// A MiniJinja template string that renders to a valid filter JSON object.
+    /// Use `{{ param_name }}` placeholders for values injected at run time via
+    /// `alias_run`'s `params` argument.  Mutually exclusive with `filter`;
+    /// exactly one of the two must be supplied.
+    filter_template: Option<String>,
+    /// Ordered list of parameter names that `alias_run` must supply in its
+    /// `params` object when executing this alias.  Only meaningful when
+    /// `filter_template` is set; ignored for plain `filter` aliases.
+    params_schema: Option<Vec<String>>,
     /// Default limit applied when `alias_run` is called without a runtime
     /// `limit` override.  If omitted, `Store::list` applies its own default
     /// (100 rows).
@@ -707,6 +717,11 @@ struct AliasRunParams {
     /// Runtime offset (number of rows to skip).  Not stored in the alias;
     /// must be supplied at execution time when pagination is needed.
     offset: Option<u32>,
+    /// Parameter values to inject into a parameterized alias's
+    /// `filter_template`.  Must be a JSON object whose keys match the names
+    /// declared in the alias's `params_schema`.  Required when the alias was
+    /// created with `filter_template`; ignored for plain `filter` aliases.
+    params: Option<serde_json::Value>,
 }
 
 /// Parameters for the `alias_delete` tool.
@@ -1329,13 +1344,19 @@ impl MiniAppMcpServer {
     /// returns a TABLE_REQUIRED error (data.code="TABLE_REQUIRED").
     #[tool(
         name = "alias_create",
-        description = "Register a named query alias for a table.  Supply a `filter` \
-                       (the same filter object accepted by the `list` tool) and an \
-                       optional `limit` (stored as the default row cap when the alias \
-                       is run).  The alias is scoped exclusively to the named `table`. \
-                       Returns ALIAS_ALREADY_EXISTS if the name is already taken. \
-                       In multi-table mode `table` is required; omitting it returns \
-                       TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\").",
+        description = "Register a named query alias for a table.  Supply either a \
+                       `filter` (the same filter object accepted by the `list` tool) \
+                       or a `filter_template` (a MiniJinja template string that renders \
+                       to a valid filter JSON object using `{{ param_name }}` placeholders). \
+                       Exactly one of `filter` or `filter_template` must be supplied; \
+                       providing both or neither is an error.  When using \
+                       `filter_template`, supply `params_schema` (an array of parameter \
+                       name strings) to declare which parameters `alias_run` must \
+                       receive.  An optional `limit` is stored as the default row cap \
+                       when the alias is run.  The alias is scoped exclusively to the \
+                       named `table`.  Returns ALIAS_ALREADY_EXISTS if the name is \
+                       already taken.  In multi-table mode `table` is required; \
+                       omitting it returns TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\").",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1350,16 +1371,39 @@ impl MiniAppMcpServer {
         let (store, schema) = self
             .resolve_table(params.table.as_deref())
             .map_err(|e| e.to_string())?;
-        // Validate the filter against the table schema before persisting.
-        params.filter.validate(&schema).map_err(|e| e.to_string())?;
-        let filter_json = serde_json::to_string(&params.filter).map_err(|e| e.to_string())?;
+
+        let (filter_json, params_schema_json): (String, Option<String>) =
+            match (params.filter, params.filter_template) {
+                (Some(f), None) => {
+                    // Conventional path: validate filter against schema, then serialize.
+                    f.validate(&schema).map_err(|e| e.to_string())?;
+                    let json = serde_json::to_string(&f).map_err(|e| e.to_string())?;
+                    (json, None)
+                }
+                (None, Some(tmpl)) => {
+                    // Template path: store template string verbatim; serialize params_schema.
+                    let schema_json = params
+                        .params_schema
+                        .map(|s| serde_json::to_string(&s))
+                        .transpose()
+                        .map_err(|e: serde_json::Error| e.to_string())?;
+                    (tmpl, schema_json)
+                }
+                (Some(_), Some(_)) => {
+                    return Err("filter and filter_template are mutually exclusive".to_string());
+                }
+                (None, None) => {
+                    return Err("either filter or filter_template is required".to_string());
+                }
+            };
+
         store
             .alias_create(
                 &params.name,
                 &filter_json,
                 params.limit,
                 params.description,
-                None, // params_schema: set in Subtask 2
+                params_schema_json,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -1406,6 +1450,7 @@ impl MiniAppMcpServer {
                     "filter": a.filter,
                     "default_limit": a.default_limit,
                     "description": a.description,
+                    "params_schema": a.params_schema,
                 })
             })
             .collect();
@@ -1427,11 +1472,15 @@ impl MiniAppMcpServer {
     #[tool(
         name = "alias_run",
         description = "Execute a named query alias and return matching rows.  \
-                       The stored filter is replayed against `Store::list`.  \
-                       Supply a runtime `limit` to override the alias's stored \
-                       default_limit, and/or an `offset` for pagination (offset is \
-                       never stored in the alias).  The alias is scoped exclusively \
-                       to the named `table`. \
+                       The stored filter (or rendered filter template) is replayed \
+                       against `Store::list`.  For parameterized aliases created with \
+                       `filter_template`, supply `params` (a JSON object) whose keys \
+                       match the alias's `params_schema`; omitting `params` for such \
+                       aliases returns ALIAS_PARAMS_REQUIRED.  For plain `filter` \
+                       aliases `params` is ignored.  Supply a runtime `limit` to \
+                       override the alias's stored default_limit, and/or an `offset` \
+                       for pagination (offset is never stored in the alias).  The alias \
+                       is scoped exclusively to the named `table`. \
                        Returns ALIAS_NOT_FOUND if the alias does not exist. \
                        In multi-table mode `table` is required; omitting it returns \
                        TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\").",
@@ -1453,8 +1502,28 @@ impl MiniAppMcpServer {
             .alias_get(&params.name)
             .await
             .map_err(|e| e.to_string())?;
-        let filter: crate::filter::ListFilter =
-            serde_json::from_str(&alias.filter).map_err(|e| e.to_string())?;
+
+        // Crux #1: render → parse → validate pipeline (params_schema=Some path).
+        // Crux #2: params_schema=None path skips render entirely (backward compat).
+        let filter: crate::filter::ListFilter = if alias.params_schema.is_some() {
+            // Parameterized alias: require params, render template, then parse.
+            let params_value = params
+                .params
+                .ok_or_else(|| crate::error::MiniAppError::AliasParamsRequired {
+                    name: params.name.clone(),
+                })
+                .map_err(|e| e.to_string())?;
+            let env = minijinja::Environment::new();
+            let rendered = env
+                .render_str(&alias.filter, &params_value)
+                .map_err(|e| crate::error::MiniAppError::AliasTemplateError(e.to_string()))
+                .map_err(|e| e.to_string())?;
+            serde_json::from_str(&rendered).map_err(|e| e.to_string())?
+        } else {
+            // Plain filter alias: skip render step (Crux #2 no-op path).
+            serde_json::from_str(&alias.filter).map_err(|e| e.to_string())?
+        };
+
         filter.validate(&schema).map_err(|e| e.to_string())?;
         // Crux: runtime limit/offset override stored defaults; never replay
         // stored parameters verbatim.
