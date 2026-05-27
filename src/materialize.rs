@@ -28,6 +28,8 @@ use crate::config::Config;
 use crate::error::MiniAppError;
 use crate::filter::ListFilter;
 use crate::mcp::registry::TableRegistry;
+use crate::schema::SchemaConfig;
+use crate::store::RowRecord;
 
 // =============================================================================
 // Public parameter / result types
@@ -72,6 +74,36 @@ pub enum FieldSelector {
         /// The field names to include.
         fields: Vec<String>,
     },
+}
+
+impl FieldSelector {
+    /// Validate field names against the schema's canonical field definitions.
+    ///
+    /// # Errors
+    /// Returns `MiniAppError::Validation` (code: `VALIDATION_ERROR`) if any
+    /// field name in `FieldSelector::List` is not present in the schema.
+    ///
+    /// # Crux compliance
+    /// Validates against `schema.fields` (canonical definitions), never
+    /// against actual keys present in materialized data (Crux #2).
+    pub fn validate(&self, schema: &SchemaConfig) -> Result<(), MiniAppError> {
+        if let FieldSelector::List { fields } = self {
+            let schema_names: std::collections::HashSet<&str> =
+                schema.fields.iter().map(|f| f.name.as_str()).collect();
+            for f in fields {
+                if !schema_names.contains(f.as_str()) {
+                    return Err(MiniAppError::Validation {
+                        field: f.clone(),
+                        reason: format!(
+                            "unknown field '{}' — only schema-registered fields are allowed in field projection",
+                            f
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Output serialisation format.
@@ -193,6 +225,50 @@ fn project_row(
         map.insert(name.clone(), v);
     }
     map
+}
+
+/// Apply field projection to a list of [`RowRecord`]s.
+///
+/// This is the **single shared post-materialization, pre-serialization boundary**
+/// for field projection across the `list`, `get`, and `alias_run` operations
+/// (Crux #1: one function, called by all three handlers).
+///
+/// - `None` or `Some(FieldSelector::All)` → returns `records` unchanged (backward-compatible).
+/// - `Some(FieldSelector::List { fields })` → validates field names against
+///   `schema` (Crux #2), then projects each row's `data` object to the listed
+///   fields.  The row's `id`, `created_at`, and `updated_at` are always preserved.
+///
+/// # Errors
+/// Returns `MiniAppError::Validation` (`VALIDATION_ERROR`) if any field name in
+/// `FieldSelector::List` is not present in the schema's canonical field definitions.
+pub fn apply_projection(
+    records: Vec<RowRecord>,
+    fields: &Option<FieldSelector>,
+    schema: &SchemaConfig,
+) -> Result<Vec<RowRecord>, MiniAppError> {
+    let field_selector = match fields {
+        None => return Ok(records),
+        Some(fs) => fs,
+    };
+    match field_selector {
+        FieldSelector::All => Ok(records),
+        FieldSelector::List {
+            fields: field_names,
+        } => {
+            field_selector.validate(schema)?;
+            let projected = records
+                .into_iter()
+                .map(|row| {
+                    let projected_map = project_row(&row.data, field_names);
+                    RowRecord {
+                        data: serde_json::Value::Object(projected_map),
+                        ..row
+                    }
+                })
+                .collect();
+            Ok(projected)
+        }
+    }
 }
 
 /// Serialise a single projected row into bytes for the given format.
@@ -1573,5 +1649,187 @@ mod tests {
 
         let result = do_materialize(&config, &tables, params).await.unwrap();
         assert_eq!(result.files[0].row_id, None);
+    }
+
+    // -------------------------------------------------------------------------
+    // FieldSelector::validate — unit tests (Crux #2: schema-based validation)
+    // -------------------------------------------------------------------------
+
+    fn make_schema() -> SchemaConfig {
+        SchemaConfig {
+            table: "test".to_string(),
+            title: None,
+            description: None,
+            fields: vec![
+                FieldDef {
+                    name: "title".to_string(),
+                    ty: FieldType::String,
+                    required: true,
+                    description: None,
+                },
+                FieldDef {
+                    name: "body".to_string(),
+                    ty: FieldType::String,
+                    required: false,
+                    description: None,
+                },
+            ],
+            dump: None,
+        }
+    }
+
+    fn make_row(data: serde_json::Value) -> RowRecord {
+        RowRecord {
+            id: "test-id".to_string(),
+            data,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn validate_field_selector_all_is_ok() {
+        let schema = make_schema();
+        let fs = FieldSelector::All;
+        assert!(fs.validate(&schema).is_ok());
+    }
+
+    #[test]
+    fn validate_field_selector_list_known_fields_ok() {
+        let schema = make_schema();
+        let fs = FieldSelector::List {
+            fields: vec!["title".to_string(), "body".to_string()],
+        };
+        assert!(fs.validate(&schema).is_ok());
+    }
+
+    #[test]
+    fn validate_field_selector_list_single_known_field_ok() {
+        let schema = make_schema();
+        let fs = FieldSelector::List {
+            fields: vec!["title".to_string()],
+        };
+        assert!(fs.validate(&schema).is_ok());
+    }
+
+    #[test]
+    fn validate_field_selector_list_unknown_field_returns_validation_error() {
+        let schema = make_schema();
+        let fs = FieldSelector::List {
+            fields: vec!["title".to_string(), "nonexistent".to_string()],
+        };
+        let err = fs.validate(&schema).unwrap_err();
+        match err {
+            MiniAppError::Validation { field, reason } => {
+                assert_eq!(field, "nonexistent");
+                assert!(reason.contains("nonexistent"));
+                assert!(reason.contains("schema-registered"));
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_field_selector_list_empty_fields_ok() {
+        // Empty list is valid; projection will return empty data objects.
+        let schema = make_schema();
+        let fs = FieldSelector::List { fields: vec![] };
+        assert!(fs.validate(&schema).is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // apply_projection — unit tests (Crux #1: single shared boundary)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn apply_projection_none_returns_unchanged() {
+        let schema = make_schema();
+        let row = make_row(serde_json::json!({"title": "hello", "body": "world"}));
+        let records = vec![row];
+        let result = apply_projection(records.clone(), &None, &schema).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, records[0].id);
+        assert_eq!(
+            result[0].data,
+            serde_json::json!({"title": "hello", "body": "world"})
+        );
+    }
+
+    #[test]
+    fn apply_projection_all_returns_unchanged() {
+        let schema = make_schema();
+        let row = make_row(serde_json::json!({"title": "hello", "body": "world"}));
+        let records = vec![row];
+        let fields = Some(FieldSelector::All);
+        let result = apply_projection(records.clone(), &fields, &schema).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].data,
+            serde_json::json!({"title": "hello", "body": "world"})
+        );
+    }
+
+    #[test]
+    fn apply_projection_list_projects_data() {
+        let schema = make_schema();
+        let row = make_row(serde_json::json!({"title": "hello", "body": "world"}));
+        let original_id = row.id.clone();
+        let original_created_at = row.created_at;
+        let records = vec![row];
+        let fields = Some(FieldSelector::List {
+            fields: vec!["title".to_string()],
+        });
+        let result = apply_projection(records, &fields, &schema).unwrap();
+        assert_eq!(result.len(), 1);
+        // Only "title" should be present in projected data.
+        assert_eq!(result[0].data, serde_json::json!({"title": "hello"}));
+        // Metadata fields must be preserved.
+        assert_eq!(result[0].id, original_id);
+        assert_eq!(result[0].created_at, original_created_at);
+    }
+
+    #[test]
+    fn apply_projection_list_projects_multiple_rows() {
+        let schema = make_schema();
+        let row1 = make_row(serde_json::json!({"title": "first", "body": "one"}));
+        let row2 = make_row(serde_json::json!({"title": "second", "body": "two"}));
+        let fields = Some(FieldSelector::List {
+            fields: vec!["body".to_string()],
+        });
+        let result = apply_projection(vec![row1, row2], &fields, &schema).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].data, serde_json::json!({"body": "one"}));
+        assert_eq!(result[1].data, serde_json::json!({"body": "two"}));
+    }
+
+    #[test]
+    fn apply_projection_unknown_field_returns_error() {
+        let schema = make_schema();
+        let row = make_row(serde_json::json!({"title": "hello", "body": "world"}));
+        let fields = Some(FieldSelector::List {
+            fields: vec!["nonexistent".to_string()],
+        });
+        let err = apply_projection(vec![row], &fields, &schema).unwrap_err();
+        match err {
+            MiniAppError::Validation { field, .. } => {
+                assert_eq!(field, "nonexistent");
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_projection_missing_field_in_data_returns_null() {
+        // project_row returns Null for fields absent from data.
+        // This is acceptable: validation passes (field is in schema),
+        // but the stored data doesn't have it.
+        let schema = make_schema();
+        let row = make_row(serde_json::json!({"title": "hello"}));
+        let fields = Some(FieldSelector::List {
+            fields: vec!["title".to_string(), "body".to_string()],
+        });
+        let result = apply_projection(vec![row], &fields, &schema).unwrap();
+        assert_eq!(result[0].data["title"], "hello");
+        assert_eq!(result[0].data["body"], serde_json::Value::Null);
     }
 }
