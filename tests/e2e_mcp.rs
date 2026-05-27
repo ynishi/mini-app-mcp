@@ -574,3 +574,134 @@ fn alias_run_limit_override() {
         rows_offset.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Parameterized alias (MiniJinja filter_template)
+// ---------------------------------------------------------------------------
+
+/// Verifies that a parameterized alias (created with `filter_template` +
+/// `params_schema`) can be executed via `alias_run` with a `params` object
+/// that substitutes the MiniJinja placeholders.
+///
+/// Crux #1: render (MiniJinja) → parse (serde_json) → validate (ListFilter)
+/// → Store::list pipeline must execute in full.
+/// Crux #2: plain `filter` aliases remain unaffected (covered by existing tests).
+#[test]
+fn alias_parameterized_create_run() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    // Seed a row with a known text value.
+    client.call_tool(
+        "create",
+        json!({
+            "table": "emo",
+            "data": {"text": "parameterized_seed_row"},
+        }),
+    );
+
+    // alias_create with filter_template + params_schema.
+    // The template uses {{ project }} as a MiniJinja placeholder.
+    let created = client.call_tool(
+        "alias_create",
+        json!({
+            "table": "emo",
+            "name": "param_alias",
+            "filter_template": r#"{"type": "like", "field": "text", "pattern": "{{ pattern }}"}"#,
+            "params_schema": ["pattern"],
+        }),
+    );
+    assert_eq!(
+        created.get("created").and_then(Value::as_str),
+        Some("param_alias"),
+        "alias_create with filter_template should return created name, got: {created:?}"
+    );
+
+    // alias_list should include params_schema in the record.
+    let listed: Vec<Value> =
+        serde_json::from_value(client.call_tool("alias_list", json!({"table": "emo"})))
+            .expect("alias_list should return a JSON array");
+    let param_alias_entry = listed
+        .iter()
+        .find(|a| a.get("name").and_then(Value::as_str) == Some("param_alias"))
+        .expect("param_alias should appear in alias_list");
+    // params_schema should be stored (not null).
+    assert!(
+        !param_alias_entry
+            .get("params_schema")
+            .is_none_or(Value::is_null),
+        "alias_list should include non-null params_schema for a template alias, got: {param_alias_entry:?}"
+    );
+
+    // alias_run with params — MiniJinja renders template → JSON parse → validate → list.
+    let rows: Vec<Value> = serde_json::from_value(client.call_tool(
+        "alias_run",
+        json!({
+            "table": "emo",
+            "name": "param_alias",
+            "params": {"pattern": "%parameterized_seed%"},
+        }),
+    ))
+    .expect("alias_run with params should return a JSON array");
+    assert!(
+        !rows.is_empty(),
+        "alias_run with rendered template should return at least one matching row"
+    );
+}
+
+/// Verifies that running a parameterized alias without supplying `params`
+/// returns ALIAS_PARAMS_REQUIRED.
+///
+/// Crux #1: the full render-parse-validate pipeline must be invoked; the
+/// pipeline cannot be bypassed when params_schema is Some.
+/// Crux #2: the error must be distinguishable (ALIAS_PARAMS_REQUIRED code).
+#[test]
+fn alias_parameterized_run_missing_params() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    // Create a parameterized alias.
+    client.call_tool(
+        "alias_create",
+        json!({
+            "table": "emo",
+            "name": "param_alias_err",
+            "filter_template": r#"{"type": "eq", "field": "text", "value": "{{ target }}"}"#,
+            "params_schema": ["target"],
+        }),
+    );
+
+    // alias_run without params must return a tool error (ALIAS_PARAMS_REQUIRED).
+    let id = client.next_id();
+    client.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "alias_run",
+            "arguments": {
+                "table": "emo",
+                "name": "param_alias_err"
+                // params intentionally omitted
+            }
+        }
+    }));
+    let resp = client.recv_for(id);
+    let is_tool_error = resp
+        .pointer("/result/isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        is_tool_error,
+        "alias_run without params on a template alias should return tool error, got: {resp}"
+    );
+    // Verify the error message contains "alias params required".
+    let text = resp
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        text.contains("requires params"),
+        "expected 'requires params' in error text, got: {text:?}"
+    );
+}

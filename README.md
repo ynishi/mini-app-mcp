@@ -79,9 +79,9 @@ All tools accept an optional `table` argument that selects the target table. In 
 | `schema_batch` | Execute an array of `ops[]` atomically under a single SQLite SAVEPOINT. Any op failure rolls back all preceding ops, leaving YAML and DB untouched. All ops must target the same table. Returns per-op results or a `BATCH_ABORTED` error with the index of the failing op. |
 | `data_snapshot` | Create a point-in-time SQLite snapshot of one or all mounted tables using the SQLite hot backup API. Snapshots are written to `<scope_root>/_snapshots/<table>.<unix_secs>.db`. Pass `table` and/or `scope` to limit the target set; omit both to snapshot all mounted tables. Pass `dry_run: true` to preview the operation (target tables, row counts, would-purge count) without creating any files. Retention is controlled by `MINI_APP_SNAPSHOT_RETENTION` (default 10), independent of `MINI_APP_BACKUP_RETENTION`. |
 | `row_materialize` | Write one or more rows to arbitrary absolute paths on the local filesystem. Select rows by `id` or by a `ListFilter` expression. Choose output format (`raw`, `markdown`, `json`, `yaml`), field projection (`All` or a named subset), and whether to write one file per row (`concat=false`, default) or concatenate all rows into a single file (`concat=true`). Returns `{ count, files: [{path, bytes, sha256, row_id}] }` — every file entry includes a SHA-256 hex digest of the written bytes. Pass `dry_run: true` to compute results without writing. |
-| `alias_create` | Register a named query alias for a table. Accepts `name`, `filter` (a `ListFilter` expression), optional `default_limit`, and optional `description`. Alias names are unique per table; duplicate names return `ALIAS_ALREADY_EXISTS`. Aliases are scoped per table and stored in the table's own SQLite database. |
-| `alias_list` | Return all aliases registered for a table as a JSON array of `{ name, filter, default_limit, description }` objects. |
-| `alias_run` | Execute a stored alias by name. Accepts optional runtime `limit` and `offset` that override the stored `default_limit` at call time. Returns the same shape as the `list` tool. Returns `ALIAS_NOT_FOUND` for an unknown name. |
+| `alias_create` | Register a named query alias for a table. Accepts `name`, either `filter` (a `ListFilter` expression) or `filter_template` (a MiniJinja template string — mutually exclusive with `filter`), optional `params_schema` (array of parameter name strings for a templated alias), optional `default_limit`, and optional `description`. Alias names are unique per table; duplicate names return `ALIAS_ALREADY_EXISTS`. Aliases are scoped per table and stored in the table's own SQLite database. |
+| `alias_list` | Return all aliases registered for a table as a JSON array of `{ name, filter, default_limit, description, params_schema }` objects. |
+| `alias_run` | Execute a stored alias by name. Accepts optional runtime `limit` and `offset` that override the stored `default_limit` at call time. For parameterized aliases (those created with `filter_template`), also accepts a `params` object whose key-value pairs are injected into the template. If `params_schema` is set and `params` is omitted, returns `ALIAS_PARAMS_REQUIRED`. Template render failures return `ALIAS_TEMPLATE_ERROR`. Returns the same shape as the `list` tool. Returns `ALIAS_NOT_FOUND` for an unknown name. |
 | `alias_delete` | Delete a named alias for a table. Returns `ALIAS_NOT_FOUND` if the alias does not exist. |
 
 ## MCP resources
@@ -485,9 +485,9 @@ Replace mode performs a full replacement: `data` is validated against the schema
 
 ## Query aliases
 
-Query aliases let you save a `ListFilter` expression under a short name and replay it — with optional per-call `limit` / `offset` overrides — without repeating the filter JSON every time.
+Query aliases let you save a `ListFilter` expression (or a MiniJinja filter template) under a short name and replay it — with optional per-call `limit` / `offset` overrides — without repeating the filter JSON every time.
 
-### Creating an alias
+### Creating a static alias
 
 ```
 alias_create(
@@ -501,7 +501,26 @@ alias_create(
 
 The alias is stored in the table's own SQLite database under `_aliases`. Alias names are unique per table; calling `alias_create` again with the same name returns `ALIAS_ALREADY_EXISTS`.
 
+### Creating a parameterized alias (filter template)
+
+Parameterized aliases use a [MiniJinja](https://docs.rs/minijinja/) template string instead of a fixed filter. At run time the caller supplies parameter values that are rendered into the template before execution.
+
+```
+alias_create(
+  table="issues",
+  name="by_state",
+  filter_template='{"type": "eq", "field": "state", "value": "{{ state }}"}',
+  params_schema=["state"],
+  default_limit=50,
+  description="Filter issues by state (parameterized)"
+)
+```
+
+`filter_template` and `filter` are mutually exclusive — exactly one must be supplied. `params_schema` is an optional array of parameter names; supply it to document which keys `alias_run` expects in its `params` object.
+
 ### Running an alias
+
+**Static alias** (no parameters):
 
 ```
 alias_run(table="notes", name="recent_open")
@@ -514,13 +533,35 @@ alias_run(table="notes", name="recent_open", limit=10, offset=20)
 # → pagination with runtime overrides
 ```
 
-`alias_run` resolves the stored filter and passes `limit` / `offset` to `Store::list`. If `limit` is supplied at call time it overrides `default_limit`; if omitted, `default_limit` from the alias is used. `offset` is always a runtime-only argument (not stored).
+**Parameterized alias** (with `params`):
+
+```
+alias_run(table="issues", name="by_state", params={"state": "open"})
+# → renders template → {"type": "eq", "field": "state", "value": "open"}
+# → validates as ListFilter → executes Store::list
+
+alias_run(table="issues", name="by_state", params={"state": "open"}, limit=10)
+# → runtime limit override with params injection
+```
+
+`alias_run` resolves the stored filter or renders the template and passes the result to `Store::list`. If `limit` is supplied at call time it overrides `default_limit`; if omitted, `default_limit` from the alias is used. `offset` is always a runtime-only argument (not stored).
+
+**Error cases for parameterized aliases**:
+
+| Situation | Error code |
+|---|---|
+| `params_schema` is set but `params` is omitted | `ALIAS_PARAMS_REQUIRED` |
+| MiniJinja render fails (bad syntax or missing variable) | `ALIAS_TEMPLATE_ERROR` |
+| Rendered output is not valid JSON or not a valid `ListFilter` | `VALIDATION_ERROR` |
 
 ### Listing and deleting aliases
 
 ```
 alias_list(table="notes")
-# → [{"name": "recent_open", "filter": {...}, "default_limit": 20, "description": "..."}]
+# → [{"name": "recent_open", "filter": {...}, "default_limit": 20, "description": "...", "params_schema": null}]
+
+alias_list(table="issues")
+# → [{"name": "by_state", "filter": null, "default_limit": 50, "description": "...", "params_schema": ["state"]}]
 
 alias_delete(table="notes", name="recent_open")
 ```
