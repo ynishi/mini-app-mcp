@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`fields` parameter on `list`, `get`, and `alias_run` tools** (`src/materialize.rs`, `src/mcp/server.rs`) — field projection for all three read tools. Each tool now accepts an optional `fields` argument following the existing `FieldSelector` shape: `{"mode": "all"}` returns all schema fields (default, backward-compatible) and `{"mode": "list", "fields": ["field1", "field2"]}` restricts the returned `data` object to the named subset. `id`, `created_at`, and `updated_at` are always returned unchanged; only the `data` portion is projected. Unknown field names return `VALIDATION_ERROR` before any query executes. Omitting `fields` is fully backward-compatible — all existing callers continue to receive complete rows without change.
+- **`materialize::apply_projection` helper** (`src/materialize.rs`) — single post-materialization, pre-serialization boundary shared by `list`, `get`, and `alias_run`. Validates field names against the schema's canonical field definitions (never against actual data keys), then projects each `RowRecord` by replacing its `data` field with a filtered `serde_json::Map`. The existing private `project_row` helper continues to perform the per-row field extraction; `apply_projection` owns schema validation and drives the `Vec<RowRecord>` transformation.
+- **`FieldSelector::validate` method** (`src/materialize.rs`) — new `pub fn validate(&self, schema: &SchemaConfig) -> Result<(), MiniAppError>` method. For `FieldSelector::List`, checks every field name against `schema.fields` and returns `MiniAppError::Validation { field, reason }` (`VALIDATION_ERROR` code) for any unknown name. Follows the same pattern as `ListFilter::validate` in `filter.rs`.
+- **Schema-based field validation for projection** (`src/materialize.rs`) — field name validation consults `SchemaConfig.fields` (the canonical definition list), never `row.data` keys, ensuring unknown fields are detected reliably even when the projected data would simply omit the key.
+- **Unit and integration tests** (`src/materialize.rs`, `src/mcp/server.rs`) — tests cover: `FieldSelector::validate` (valid subset, unknown field returns `VALIDATION_ERROR`); `apply_projection` (all-mode no-op, list-mode projection, unknown field propagation); `list` with `fields` (projected response); `get` with `fields` (projected single row); `alias_run` with `fields` (projected alias result).
+
 ## [0.10.0] - 2026-05-27
 
 ### Added

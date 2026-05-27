@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::error::MiniAppError;
 use crate::filter::ListFilter;
-use crate::materialize::{self, MaterializeParams};
+use crate::materialize::{self, FieldSelector, MaterializeParams};
 use crate::mcp::registry::TableRegistry;
 use crate::mcp::resources as res;
 use crate::mcp::schema_tools::{
@@ -589,6 +589,15 @@ struct GetParams {
     /// `MINI_APP_DB`) this may be omitted and the single configured table is
     /// used automatically.
     table: Option<String>,
+    /// Optional field projection applied to the `data` object of the returned row.
+    ///
+    /// Use `{"mode":"list","fields":["field1","field2"]}` to select a named
+    /// subset of fields, or `{"mode":"all"}` to request all fields (same as
+    /// omitting this argument).  When omitted the full `data` object is returned
+    /// (backward-compatible).  Unknown field names return
+    /// `VALIDATION_ERROR` (data.code="VALIDATION_ERROR").
+    #[serde(default)]
+    fields: Option<FieldSelector>,
 }
 
 /// Parameters for the `list` tool.
@@ -611,6 +620,15 @@ struct ListParams {
     /// (or passing `null`) returns all rows unfiltered (backward-compatible).
     #[serde(default)]
     filter: Option<ListFilter>,
+    /// Optional field projection applied to the `data` object of each returned row.
+    ///
+    /// Use `{"mode":"list","fields":["field1","field2"]}` to select a named
+    /// subset of fields, or `{"mode":"all"}` to request all fields (same as
+    /// omitting this argument).  When omitted the full `data` object is returned
+    /// (backward-compatible).  Unknown field names return
+    /// `VALIDATION_ERROR` (data.code="VALIDATION_ERROR").
+    #[serde(default)]
+    fields: Option<FieldSelector>,
 }
 
 /// Parameters for the `update` tool.
@@ -722,6 +740,15 @@ struct AliasRunParams {
     /// declared in the alias's `params_schema`.  Required when the alias was
     /// created with `filter_template`; ignored for plain `filter` aliases.
     params: Option<serde_json::Value>,
+    /// Optional field projection applied to the `data` object of each returned row.
+    ///
+    /// Use `{"mode":"list","fields":["field1","field2"]}` to select a named
+    /// subset of fields, or `{"mode":"all"}` to request all fields (same as
+    /// omitting this argument).  When omitted the full `data` object is returned
+    /// (backward-compatible).  Unknown field names return
+    /// `VALIDATION_ERROR` (data.code="VALIDATION_ERROR").
+    #[serde(default)]
+    fields: Option<FieldSelector>,
 }
 
 /// Parameters for the `alias_delete` tool.
@@ -822,7 +849,11 @@ impl MiniAppMcpServer {
                        In multi-table mode, `table` is required; omitting it returns a \
                        TABLE_REQUIRED error (data.code=\"TABLE_REQUIRED\"). \
                        In legacy single-table mode (`MINI_APP_SCHEMA`+`MINI_APP_DB`), `table` may be omitted. \
-                       If an unknown table name is specified, returns TABLE_NOT_FOUND (data.code=\"TABLE_NOT_FOUND\").",
+                       If an unknown table name is specified, returns TABLE_NOT_FOUND (data.code=\"TABLE_NOT_FOUND\"). \
+                       Optional `fields` argument supports field projection on the `data` object. \
+                       Use {\"mode\":\"list\",\"fields\":[\"field1\",\"field2\"]} to select specific fields, \
+                       or {\"mode\":\"all\"} (same as omitting). Unknown field names return \
+                       VALIDATION_ERROR (data.code=\"VALIDATION_ERROR\").",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -831,10 +862,15 @@ impl MiniAppMcpServer {
         )
     )]
     async fn tool_get(&self, Parameters(params): Parameters<GetParams>) -> Result<String, String> {
-        let (store, _schema) = self
+        let (store, schema) = self
             .resolve_table(params.table.as_deref())
             .map_err(|e| e.to_string())?;
         let record = store.get(&params.id).await.map_err(|e| e.to_string())?;
+        let records = materialize::apply_projection(vec![record], &params.fields, &schema)
+            .map_err(|e| e.to_string())?;
+        let record = records.into_iter().next().ok_or_else(|| {
+            "apply_projection returned empty vec (invariant violation)".to_string()
+        })?;
         serde_json::to_string(&record).map_err(|e| e.to_string())
     }
 
@@ -846,7 +882,11 @@ impl MiniAppMcpServer {
                        In multi-table mode, `table` is required; omitting it returns a \
                        TABLE_REQUIRED error (data.code=\"TABLE_REQUIRED\"). \
                        In legacy single-table mode (`MINI_APP_SCHEMA`+`MINI_APP_DB`), `table` may be omitted. \
-                       If an unknown table name is specified, returns TABLE_NOT_FOUND (data.code=\"TABLE_NOT_FOUND\").",
+                       If an unknown table name is specified, returns TABLE_NOT_FOUND (data.code=\"TABLE_NOT_FOUND\"). \
+                       Optional `fields` argument supports field projection on the `data` object of each row. \
+                       Use {\"mode\":\"list\",\"fields\":[\"field1\",\"field2\"]} to select specific fields, \
+                       or {\"mode\":\"all\"} (same as omitting). Unknown field names return \
+                       VALIDATION_ERROR (data.code=\"VALIDATION_ERROR\").",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -867,6 +907,8 @@ impl MiniAppMcpServer {
         let records = store
             .list(params.limit, params.offset, params.filter)
             .await
+            .map_err(|e| e.to_string())?;
+        let records = materialize::apply_projection(records, &params.fields, &schema)
             .map_err(|e| e.to_string())?;
         serde_json::to_string(&records).map_err(|e| e.to_string())
     }
@@ -1483,7 +1525,11 @@ impl MiniAppMcpServer {
                        is scoped exclusively to the named `table`. \
                        Returns ALIAS_NOT_FOUND if the alias does not exist. \
                        In multi-table mode `table` is required; omitting it returns \
-                       TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\").",
+                       TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\"). \
+                       Optional `fields` argument supports field projection on the `data` object of each row. \
+                       Use {\"mode\":\"list\",\"fields\":[\"field1\",\"field2\"]} to select specific fields, \
+                       or {\"mode\":\"all\"} (same as omitting). Unknown field names return \
+                       VALIDATION_ERROR (data.code=\"VALIDATION_ERROR\").",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1532,6 +1578,8 @@ impl MiniAppMcpServer {
         let records = store
             .list(limit, offset, Some(filter))
             .await
+            .map_err(|e| e.to_string())?;
+        let records = materialize::apply_projection(records, &params.fields, &schema)
             .map_err(|e| e.to_string())?;
         serde_json::to_string(&records).map_err(|e| e.to_string())
     }
@@ -1657,6 +1705,7 @@ fields:\n\
             .tool_get(Parameters(GetParams {
                 id: id.to_string(),
                 table: None,
+                fields: None,
             }))
             .await?;
         Ok(serde_json::from_str(&json).unwrap())
@@ -1673,6 +1722,7 @@ fields:\n\
                 offset,
                 table: None,
                 filter: None,
+                fields: None,
             }))
             .await?;
         Ok(serde_json::from_str(&json).unwrap())
@@ -2280,6 +2330,7 @@ fields:\n\
             .tool_get(Parameters(GetParams {
                 id: "some-id".to_string(),
                 table: Some("nonexistent".to_string()),
+                fields: None,
             }))
             .await;
         assert!(result.is_err(), "get with unknown table must fail");
@@ -2859,6 +2910,269 @@ fields:\n\
             updated["data"]["meta"],
             serde_json::json!({ "a": 9 }),
             "Nested object must be replaced wholesale, not deep-merged"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Field projection integration tests (list / get / alias_run)
+    // ---------------------------------------------------------------------------
+
+    async fn do_list_with_fields(
+        server: &MiniAppMcpServer,
+        fields: Option<FieldSelector>,
+    ) -> Result<serde_json::Value, String> {
+        let json = server
+            .tool_list(Parameters(ListParams {
+                limit: None,
+                offset: None,
+                table: None,
+                filter: None,
+                fields,
+            }))
+            .await?;
+        Ok(serde_json::from_str(&json).unwrap())
+    }
+
+    async fn do_get_with_fields(
+        server: &MiniAppMcpServer,
+        id: &str,
+        fields: Option<FieldSelector>,
+    ) -> Result<serde_json::Value, String> {
+        let json = server
+            .tool_get(Parameters(GetParams {
+                id: id.to_string(),
+                table: None,
+                fields,
+            }))
+            .await?;
+        Ok(serde_json::from_str(&json).unwrap())
+    }
+
+    #[tokio::test]
+    async fn list_without_fields_returns_all() {
+        let (server, _tmp) = make_server().await;
+        do_create(
+            &server,
+            serde_json::json!({"title": "hello", "state": "active"}),
+        )
+        .await
+        .unwrap();
+        let rows = do_list_with_fields(&server, None).await.unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        // Both fields must be present.
+        assert!(rows[0]["data"]["title"].is_string());
+        assert!(rows[0]["data"]["state"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_with_fields_projection() {
+        let (server, _tmp) = make_server().await;
+        do_create(
+            &server,
+            serde_json::json!({"title": "hello", "state": "active"}),
+        )
+        .await
+        .unwrap();
+        let fields = Some(FieldSelector::List {
+            fields: vec!["title".to_string()],
+        });
+        let rows = do_list_with_fields(&server, fields).await.unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        // Only "title" should be present in data.
+        assert!(rows[0]["data"]["title"].is_string());
+        assert!(rows[0]["data"].get("state").is_none() || rows[0]["data"]["state"].is_null());
+        // id / created_at / updated_at must be preserved.
+        assert!(rows[0]["id"].is_string());
+        assert!(rows[0]["created_at"].is_number());
+    }
+
+    #[tokio::test]
+    async fn list_with_fields_all_returns_all() {
+        let (server, _tmp) = make_server().await;
+        do_create(
+            &server,
+            serde_json::json!({"title": "hello", "state": "active"}),
+        )
+        .await
+        .unwrap();
+        let fields = Some(FieldSelector::All);
+        let rows = do_list_with_fields(&server, fields).await.unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]["data"]["title"].is_string());
+        assert!(rows[0]["data"]["state"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_with_unknown_field_returns_validation_error() {
+        let (server, _tmp) = make_server().await;
+        do_create(
+            &server,
+            serde_json::json!({"title": "hello", "state": "active"}),
+        )
+        .await
+        .unwrap();
+        let fields = Some(FieldSelector::List {
+            fields: vec!["nonexistent".to_string()],
+        });
+        let result = do_list_with_fields(&server, fields).await;
+        assert!(result.is_err(), "unknown field must return error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("VALIDATION_ERROR") || err.contains("nonexistent"),
+            "error must mention VALIDATION_ERROR or field name, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_without_fields_returns_all() {
+        let (server, _tmp) = make_server().await;
+        let created = do_create(
+            &server,
+            serde_json::json!({"title": "hello", "state": "active"}),
+        )
+        .await
+        .unwrap();
+        let id = created["id"].as_str().unwrap();
+        let row = do_get_with_fields(&server, id, None).await.unwrap();
+        assert!(row["data"]["title"].is_string());
+        assert!(row["data"]["state"].is_string());
+    }
+
+    #[tokio::test]
+    async fn get_with_fields_projection() {
+        let (server, _tmp) = make_server().await;
+        let created = do_create(
+            &server,
+            serde_json::json!({"title": "hello", "state": "active"}),
+        )
+        .await
+        .unwrap();
+        let id = created["id"].as_str().unwrap();
+        let fields = Some(FieldSelector::List {
+            fields: vec!["state".to_string()],
+        });
+        let row = do_get_with_fields(&server, id, fields).await.unwrap();
+        // Only "state" should be present.
+        assert!(row["data"]["state"].is_string());
+        assert!(row["data"].get("title").is_none() || row["data"]["title"].is_null());
+        // Metadata must be preserved.
+        assert_eq!(row["id"].as_str().unwrap(), id);
+        assert!(row["created_at"].is_number());
+    }
+
+    #[tokio::test]
+    async fn get_with_unknown_field_returns_validation_error() {
+        let (server, _tmp) = make_server().await;
+        let created = do_create(
+            &server,
+            serde_json::json!({"title": "hello", "state": "active"}),
+        )
+        .await
+        .unwrap();
+        let id = created["id"].as_str().unwrap();
+        let fields = Some(FieldSelector::List {
+            fields: vec!["nonexistent".to_string()],
+        });
+        let result = do_get_with_fields(&server, id, fields).await;
+        assert!(result.is_err(), "unknown field must return error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("VALIDATION_ERROR") || err.contains("nonexistent"),
+            "error must mention VALIDATION_ERROR or field name, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_run_with_fields_projection() {
+        let (server, _tmp) = make_server().await;
+        do_create(
+            &server,
+            serde_json::json!({"title": "hello", "state": "active"}),
+        )
+        .await
+        .unwrap();
+        // Create a plain alias.
+        server
+            .tool_alias_create(Parameters(AliasCreateParams {
+                table: None,
+                name: "all_rows".to_string(),
+                filter: Some(crate::filter::ListFilter::Eq {
+                    field: "state".to_string(),
+                    value: serde_json::json!("active"),
+                }),
+                filter_template: None,
+                params_schema: None,
+                limit: None,
+                description: None,
+            }))
+            .await
+            .unwrap();
+        // Run alias with field projection.
+        let json = server
+            .tool_alias_run(Parameters(AliasRunParams {
+                table: None,
+                name: "all_rows".to_string(),
+                limit: None,
+                offset: None,
+                params: None,
+                fields: Some(FieldSelector::List {
+                    fields: vec!["title".to_string()],
+                }),
+            }))
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["data"]["title"], "hello");
+        // "state" must not be in projected data.
+        assert!(rows[0]["data"].get("state").is_none() || rows[0]["data"]["state"].is_null());
+    }
+
+    #[tokio::test]
+    async fn alias_run_with_unknown_field_returns_validation_error() {
+        let (server, _tmp) = make_server().await;
+        do_create(
+            &server,
+            serde_json::json!({"title": "hello", "state": "active"}),
+        )
+        .await
+        .unwrap();
+        server
+            .tool_alias_create(Parameters(AliasCreateParams {
+                table: None,
+                name: "all_rows2".to_string(),
+                filter: Some(crate::filter::ListFilter::Eq {
+                    field: "state".to_string(),
+                    value: serde_json::json!("active"),
+                }),
+                filter_template: None,
+                params_schema: None,
+                limit: None,
+                description: None,
+            }))
+            .await
+            .unwrap();
+        let result = server
+            .tool_alias_run(Parameters(AliasRunParams {
+                table: None,
+                name: "all_rows2".to_string(),
+                limit: None,
+                offset: None,
+                params: None,
+                fields: Some(FieldSelector::List {
+                    fields: vec!["nonexistent".to_string()],
+                }),
+            }))
+            .await;
+        assert!(result.is_err(), "unknown field must return error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("VALIDATION_ERROR") || err.contains("nonexistent"),
+            "error must mention VALIDATION_ERROR or field name, got: {err}"
         );
     }
 }
