@@ -68,10 +68,10 @@ All tools accept an optional `table` argument that selects the target table. In 
 |---|---|
 | `info` | Returns the parsed schema (table name, field definitions) as JSON |
 | `create` | Inserts a new row; validates the `data` object against the schema |
-| `get` | Retrieves a single row by `id`. Accepts an optional `fields` selector to project the returned `data` object to a named subset of schema fields. |
+| `get` | Retrieves a single row by `id`. If `id` is shorter than 36 characters it is treated as a UUID prefix: zero matches return `NOT_FOUND`; two or more matches return `AMBIGUOUS_ID` with a candidate list. A full 36-character UUID always uses the exact-match path. Accepts an optional `fields` selector to project the returned `data` object to a named subset of schema fields. |
 | `list` | Returns rows with optional `limit` / `offset` pagination. Accepts an optional `fields` selector to project the returned `data` objects to a named subset of schema fields. |
-| `update` | Updates an existing row by `id`. Default mode is **merge** (RFC 7396): absent fields are preserved from the stored row, `null` values delete optional fields or raise a Validation error for required ones. Pass `"mode": "replace"` for full replacement (pre-0.9 behaviour). |
-| `delete` | Removes a row by `id` |
+| `update` | Updates an existing row by `id`. If `id` is shorter than 36 characters it is treated as a UUID prefix (see `get` for resolution rules). Default mode is **merge** (RFC 7396): absent fields are preserved from the stored row, `null` values delete optional fields or raise a Validation error for required ones. Pass `"mode": "replace"` for full replacement (pre-0.9 behaviour). |
+| `delete` | Removes a row by `id`. If `id` is shorter than 36 characters it is treated as a UUID prefix (see `get` for resolution rules). |
 | `reload` | Re-scan `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and atomically replace the table registry. Legacy `MINI_APP_SCHEMA` + `MINI_APP_DB` are re-applied if set. Returns `{ mounted, added, removed }`. Limitations: no file watcher (explicit invocation only); whole-registry replace (no per-table partial reload); no schema migration for existing rows; concurrent `reload` calls are last-write-wins. |
 | `schema_create` | Create a new `schema.yaml` under the specified `scope` (`project` or `user`) and register the table live. Pass `dry_run: true` to preview without writing. Fails with `SCHEMA_EXISTS` if the table already exists. |
 | `schema_update` | Replace an existing table's `schema.yaml` with a new definition (full overwrite). Backs up the previous YAML and a SQLite snapshot to `_backup/` before writing. Pass `dry_run: true` to preview field changes without touching disk. |
