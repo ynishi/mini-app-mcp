@@ -853,7 +853,12 @@ impl MiniAppMcpServer {
                        Optional `fields` argument supports field projection on the `data` object. \
                        Use {\"mode\":\"list\",\"fields\":[\"field1\",\"field2\"]} to select specific fields, \
                        or {\"mode\":\"all\"} (same as omitting). Unknown field names return \
-                       VALIDATION_ERROR (data.code=\"VALIDATION_ERROR\").",
+                       VALIDATION_ERROR (data.code=\"VALIDATION_ERROR\"). \
+                       UUID prefix match: if `id` is shorter than 36 characters, a prefix match is attempted \
+                       (SELECT id WHERE id LIKE '<prefix>%'). 0 matches returns NOT_FOUND error \
+                       (data.code=\"NOT_FOUND\"). 2 or more matches returns AMBIGUOUS_ID error \
+                       (data.code=\"AMBIGUOUS_ID\", data.candidates=[candidate id list]). \
+                       A full 36-character UUID bypasses prefix match and uses exact lookup.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -927,7 +932,12 @@ impl MiniAppMcpServer {
                        In multi-table mode, `table` is required; omitting it returns a \
                        TABLE_REQUIRED error (data.code=\"TABLE_REQUIRED\"). \
                        In legacy single-table mode (`MINI_APP_SCHEMA`+`MINI_APP_DB`), `table` may be omitted. \
-                       If an unknown table name is specified, returns TABLE_NOT_FOUND (data.code=\"TABLE_NOT_FOUND\").",
+                       If an unknown table name is specified, returns TABLE_NOT_FOUND (data.code=\"TABLE_NOT_FOUND\"). \
+                       UUID prefix match: if `id` is shorter than 36 characters, a prefix match is attempted \
+                       (SELECT id WHERE id LIKE '<prefix>%'). 0 matches returns NOT_FOUND error \
+                       (data.code=\"NOT_FOUND\"). 2 or more matches returns AMBIGUOUS_ID error \
+                       (data.code=\"AMBIGUOUS_ID\", data.candidates=[candidate id list]). \
+                       A full 36-character UUID bypasses prefix match and uses exact lookup.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -957,7 +967,12 @@ impl MiniAppMcpServer {
                        In multi-table mode, `table` is required; omitting it returns a \
                        TABLE_REQUIRED error (data.code=\"TABLE_REQUIRED\"). \
                        In legacy single-table mode (`MINI_APP_SCHEMA`+`MINI_APP_DB`), `table` may be omitted. \
-                       If an unknown table name is specified, returns TABLE_NOT_FOUND (data.code=\"TABLE_NOT_FOUND\").",
+                       If an unknown table name is specified, returns TABLE_NOT_FOUND (data.code=\"TABLE_NOT_FOUND\"). \
+                       UUID prefix match: if `id` is shorter than 36 characters, a prefix match is attempted \
+                       (SELECT id WHERE id LIKE '<prefix>%'). 0 matches returns NOT_FOUND error \
+                       (data.code=\"NOT_FOUND\"). 2 or more matches returns AMBIGUOUS_ID error \
+                       (data.code=\"AMBIGUOUS_ID\", data.candidates=[candidate id list]). \
+                       A full 36-character UUID bypasses prefix match and uses exact lookup.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
