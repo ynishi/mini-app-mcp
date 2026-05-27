@@ -98,31 +98,40 @@ const CREATE_TABLE_SQL: &str = "
 /// `_aliases` table in its own database connection.
 ///
 /// `name` is the PRIMARY KEY — UNIQUE constraint is implicit.
-/// `filter` stores the serialized [`crate::filter::ListFilter`] JSON.
+/// `filter` stores the serialized [`crate::filter::ListFilter`] JSON, or a
+/// MiniJinja template string when `params_schema` is set.
 /// `default_limit` is optional and may be overridden at `alias_run` call time.
+/// `params_schema` stores an optional JSON array of parameter name strings
+/// (e.g. `["project","owner"]`); `NULL` means the alias takes no parameters.
 const CREATE_ALIASES_TABLE_SQL: &str = "
     CREATE TABLE IF NOT EXISTS _aliases (
         name           TEXT    PRIMARY KEY,
         filter         TEXT    NOT NULL,
         default_limit  INTEGER,
-        description    TEXT
+        description    TEXT,
+        params_schema  TEXT
     )
 ";
 
 /// A row returned from the `_aliases` table.
 ///
-/// `filter` is stored as raw JSON text; callers (`alias_run` in server.rs) are
-/// responsible for deserialising it back to a [`crate::filter::ListFilter`].
+/// `filter` is stored as raw JSON text or a MiniJinja template string;
+/// callers (`alias_run` in server.rs) are responsible for rendering and
+/// deserialising it back to a [`crate::filter::ListFilter`].
 #[derive(Debug, Clone)]
 pub struct AliasRecord {
     /// Alias name (PRIMARY KEY in `_aliases`).
     pub name: String,
-    /// Serialised [`crate::filter::ListFilter`] JSON string.
+    /// Serialised [`crate::filter::ListFilter`] JSON string, or a MiniJinja
+    /// template string when `params_schema` is `Some`.
     pub filter: String,
     /// Optional default limit to apply when `alias_run` does not supply one.
     pub default_limit: Option<u32>,
     /// Optional human-readable description.
     pub description: Option<String>,
+    /// Optional JSON array of parameter name strings (e.g. `["project","owner"]`).
+    /// `None` means the alias takes no parameters and the filter text is plain JSON.
+    pub params_schema: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +277,18 @@ impl Store {
                 }
                 c.execute_batch(CREATE_TABLE_SQL)?;
                 c.execute_batch(CREATE_ALIASES_TABLE_SQL)?;
+                // Idempotent migration: add params_schema column if absent (K-1 st1-entries).
+                // SQLite does not support `ALTER TABLE ADD COLUMN IF NOT EXISTS`, so we
+                // use PRAGMA table_info to check for the column first.
+                let has_params_schema = c
+                    .prepare("PRAGMA table_info(_aliases)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .any(|name| name == "params_schema");
+                if !has_params_schema {
+                    c.execute_batch("ALTER TABLE _aliases ADD COLUMN params_schema TEXT")?;
+                }
                 Ok(c)
             })
             .await
@@ -747,38 +768,40 @@ impl Store {
 
     /// Register a named query alias in `_aliases`.
     ///
-    /// The `filter` value is serialised to JSON text and stored verbatim.
-    /// `default_limit` and `description` are optional.
+    /// The `filter_json` value is stored verbatim (serialize before calling).
+    /// `default_limit`, `description`, and `params_schema` are optional.
+    /// `params_schema` is a JSON array of parameter name strings
+    /// (e.g. `["project","owner"]`); pass `None` for parameter-free aliases.
     ///
     /// # Errors
     /// - [`MiniAppError::AliasAlreadyExists`] — an alias with `name` already
     ///   exists.  Delete it first or choose a different name.
     /// - [`MiniAppError::Storage`] — rusqlite error.
-    /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError), or
-    ///   `filter` serialisation failed.
+    /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
     ///
     /// # Panic
     /// Does not panic.
     pub async fn alias_create(
         &self,
         name: &str,
-        filter: &crate::filter::ListFilter,
+        filter_json: &str,
         default_limit: Option<u32>,
         description: Option<String>,
+        params_schema: Option<String>,
     ) -> Result<(), MiniAppError> {
         let conn = self.conn.clone();
         let name = name.to_string();
-        let filter_json = serde_json::to_string(filter)
-            .map_err(|e| MiniAppError::Schema(format!("filter serialisation: {e}")))?;
+        let filter_json = filter_json.to_string();
 
         tokio::task::spawn_blocking(move || -> Result<(), MiniAppError> {
             let conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             conn.execute(
-                "INSERT OR IGNORE INTO _aliases (name, filter, default_limit, description) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![name, filter_json, default_limit, description],
+                "INSERT OR IGNORE INTO _aliases \
+                 (name, filter, default_limit, description, params_schema) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![name, filter_json, default_limit, description, params_schema],
             )?;
             if conn.changes() == 0 {
                 return Err(MiniAppError::AliasAlreadyExists { name });
@@ -807,7 +830,7 @@ impl Store {
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             let mut stmt = conn.prepare(
-                "SELECT name, filter, default_limit, description \
+                "SELECT name, filter, default_limit, description, params_schema \
                  FROM _aliases WHERE name = ?1",
             )?;
             let record = stmt
@@ -817,6 +840,7 @@ impl Store {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<u32>>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })
                 .optional()?
@@ -827,6 +851,7 @@ impl Store {
                 filter: record.1,
                 default_limit: record.2,
                 description: record.3,
+                params_schema: record.4,
             })
         })
         .await
@@ -851,7 +876,7 @@ impl Store {
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             let mut stmt = conn.prepare(
-                "SELECT name, filter, default_limit, description \
+                "SELECT name, filter, default_limit, description, params_schema \
                  FROM _aliases ORDER BY name ASC",
             )?;
             let records = stmt
@@ -861,18 +886,22 @@ impl Store {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<u32>>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
 
             Ok(records
                 .into_iter()
-                .map(|(name, filter, default_limit, description)| AliasRecord {
-                    name,
-                    filter,
-                    default_limit,
-                    description,
-                })
+                .map(
+                    |(name, filter, default_limit, description, params_schema)| AliasRecord {
+                        name,
+                        filter,
+                        default_limit,
+                        description,
+                        params_schema,
+                    },
+                )
                 .collect())
         })
         .await
@@ -1699,9 +1728,16 @@ mod tests {
     async fn alias_create_and_get_round_trip() {
         let store = make_test_store().await;
         let filter = make_filter();
+        let filter_json = serde_json::to_string(&filter).unwrap();
 
         store
-            .alias_create("recent_open", &filter, Some(20), Some("desc".to_string()))
+            .alias_create(
+                "recent_open",
+                &filter_json,
+                Some(20),
+                Some("desc".to_string()),
+                None,
+            )
             .await
             .expect("alias_create must succeed");
 
@@ -1730,9 +1766,10 @@ mod tests {
     async fn alias_create_with_optional_nulls() {
         let store = make_test_store().await;
         let filter = make_filter();
+        let filter_json = serde_json::to_string(&filter).unwrap();
 
         store
-            .alias_create("no_opts", &filter, None, None)
+            .alias_create("no_opts", &filter_json, None, None, None)
             .await
             .expect("alias_create must succeed with None optionals");
 
@@ -1758,12 +1795,13 @@ mod tests {
             .expect("alias_list must succeed on empty store");
         assert!(list.is_empty(), "empty store should return empty list");
 
+        let filter_json = serde_json::to_string(&filter).unwrap();
         store
-            .alias_create("b_alias", &filter, None, None)
+            .alias_create("b_alias", &filter_json, None, None, None)
             .await
             .unwrap();
         store
-            .alias_create("a_alias", &filter, None, None)
+            .alias_create("a_alias", &filter_json, None, None, None)
             .await
             .unwrap();
 
@@ -1779,9 +1817,10 @@ mod tests {
     async fn alias_delete_removes_alias() {
         let store = make_test_store().await;
         let filter = make_filter();
+        let filter_json = serde_json::to_string(&filter).unwrap();
 
         store
-            .alias_create("to_delete", &filter, None, None)
+            .alias_create("to_delete", &filter_json, None, None, None)
             .await
             .unwrap();
 
@@ -1806,14 +1845,15 @@ mod tests {
     async fn alias_create_duplicate_returns_already_exists() {
         let store = make_test_store().await;
         let filter = make_filter();
+        let filter_json = serde_json::to_string(&filter).unwrap();
 
         store
-            .alias_create("dup", &filter, None, None)
+            .alias_create("dup", &filter_json, None, None, None)
             .await
             .expect("first alias_create must succeed");
 
         let err = store
-            .alias_create("dup", &filter, None, None)
+            .alias_create("dup", &filter_json, None, None, None)
             .await
             .expect_err("second alias_create must fail");
 
@@ -1863,8 +1903,9 @@ mod tests {
         let store_b = make_test_store().await;
         let filter = make_filter();
 
+        let filter_json = serde_json::to_string(&filter).unwrap();
         store_a
-            .alias_create("shared_name", &filter, None, None)
+            .alias_create("shared_name", &filter_json, None, None, None)
             .await
             .expect("store_a alias_create must succeed");
 

@@ -67,6 +67,12 @@ pub mod codes {
     /// Returned when `alias_create` is called but an alias with the same name
     /// already exists in the table's `_aliases` storage.
     pub const ALIAS_ALREADY_EXISTS: &str = "ALIAS_ALREADY_EXISTS";
+    /// Returned when `alias_run` is called without `params` but the alias has
+    /// a non-null `params_schema` (i.e. the alias requires parameter injection).
+    pub const ALIAS_PARAMS_REQUIRED: &str = "ALIAS_PARAMS_REQUIRED";
+    /// Returned when MiniJinja template rendering fails (syntax error or
+    /// missing variable) during `alias_run`.
+    pub const ALIAS_TEMPLATE_ERROR: &str = "ALIAS_TEMPLATE_ERROR";
 }
 
 /// All errors that can arise inside mini-app-mcp.
@@ -295,6 +301,22 @@ pub enum MiniAppError {
     /// - `name`: the duplicate alias name.
     #[error("alias already exists: {name}")]
     AliasAlreadyExists { name: String },
+
+    /// `alias_run` was called without `params` but the alias requires parameter
+    /// injection (its `params_schema` is non-null).
+    ///
+    /// # Fields
+    /// - `name`: the alias name that requires parameters.
+    #[error("alias '{name}' requires params but none were provided")]
+    AliasParamsRequired { name: String },
+
+    /// MiniJinja template rendering failed during `alias_run`.
+    ///
+    /// The inner `String` carries the MiniJinja error message (template syntax
+    /// error, missing variable, type error, etc.).  A string-tuple variant
+    /// avoids `#[from]` conflicts with other error origins (K-79).
+    #[error("alias template render error: {0}")]
+    AliasTemplateError(String),
 }
 
 impl MiniAppError {
@@ -331,6 +353,8 @@ impl MiniAppError {
             MiniAppError::MaterializeInvalidParam { .. } => codes::MATERIALIZE_INVALID_PARAM,
             MiniAppError::AliasNotFound { .. } => codes::ALIAS_NOT_FOUND,
             MiniAppError::AliasAlreadyExists { .. } => codes::ALIAS_ALREADY_EXISTS,
+            MiniAppError::AliasParamsRequired { .. } => codes::ALIAS_PARAMS_REQUIRED,
+            MiniAppError::AliasTemplateError(_) => codes::ALIAS_TEMPLATE_ERROR,
         }
     }
 }
@@ -434,6 +458,13 @@ impl From<MiniAppError> for McpError {
                 })
             }
             MiniAppError::AliasAlreadyExists { name } => {
+                serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "name": name,
+                })
+            }
+            MiniAppError::AliasParamsRequired { name } => {
                 serde_json::json!({
                     "code": code,
                     "message": message,
@@ -650,6 +681,16 @@ mod tests {
                     name: "my_alias".into(),
                 },
             ),
+            (
+                codes::ALIAS_PARAMS_REQUIRED,
+                MiniAppError::AliasParamsRequired {
+                    name: "my_alias".into(),
+                },
+            ),
+            (
+                codes::ALIAS_TEMPLATE_ERROR,
+                MiniAppError::AliasTemplateError("template syntax error".into()),
+            ),
         ];
         for (expected_code, err) in cases {
             assert_eq!(
@@ -709,6 +750,10 @@ mod tests {
             MiniAppError::AliasAlreadyExists {
                 name: "my_alias".into(),
             },
+            MiniAppError::AliasParamsRequired {
+                name: "my_alias".into(),
+            },
+            MiniAppError::AliasTemplateError("template syntax error".into()),
         ];
         for err in errs {
             let mcp: McpError = err.into();
