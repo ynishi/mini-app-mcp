@@ -769,26 +769,7 @@ mod tests {
         }
     }
 
-    // T3: MiniAppError::TableNotFound converts to McpError with table field
-    #[test]
-    fn table_not_found_converts_to_mcp_error_with_table_field() {
-        use rmcp::ErrorData as McpError;
-        let err = MiniAppError::TableNotFound {
-            table: "my_table".to_string(),
-        };
-        let mcp: McpError = err.into();
-        let data = mcp.data.expect("data must be Some");
-        assert_eq!(data["code"], "TABLE_NOT_FOUND");
-        assert_eq!(data["table"], "my_table");
-    }
-
-    // T3: MiniAppError::TableRequired converts to McpError with TABLE_REQUIRED code
-    #[test]
-    fn table_required_converts_to_mcp_error_with_code() {
-        use rmcp::ErrorData as McpError;
-        let err = MiniAppError::TableRequired;
-        let mcp: McpError = err.into();
-        let data = mcp.data.expect("data must be Some");
-        assert_eq!(data["code"], "TABLE_REQUIRED");
-    }
+    // (rmcp-dependent variant→McpError conversion tests live in
+    // `crates/mcp/src/error_conv.rs` to honor the one-way `mcp → core` dep
+    // boundary, Outline rust book §5-1-10 K-orphan-rule.)
 }

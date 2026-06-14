@@ -403,20 +403,20 @@ impl MiniAppMcpServer {
 
         let contents = match base_uri {
             URI_SCHEMA_YAML => {
-                let entry = registry.resolve(table_query).map_err(McpError::from)?;
+                let entry = registry.resolve(table_query).map_err(crate::miniapp_error_to_mcp_error)?;
                 let text = std::fs::read_to_string(entry.schema_path.as_ref()).map_err(|e| {
                     McpError::internal_error(format!("failed to read schema.yaml: {e}"), None)
                 })?;
                 ResourceContents::text(text, uri).with_mime_type("application/yaml")
             }
             URI_SCHEMA_JSON => {
-                let entry = registry.resolve(table_query).map_err(McpError::from)?;
+                let entry = registry.resolve(table_query).map_err(crate::miniapp_error_to_mcp_error)?;
                 let text = serde_json::to_string_pretty(entry.schema.as_ref())
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 ResourceContents::text(text, uri).with_mime_type("application/json")
             }
             URI_SCHEMA_JSON_SCHEMA => {
-                let entry = registry.resolve(table_query).map_err(McpError::from)?;
+                let entry = registry.resolve(table_query).map_err(crate::miniapp_error_to_mcp_error)?;
                 let js = res::derive_json_schema(entry.schema.as_ref());
                 let text = serde_json::to_string_pretty(&js)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1029,7 +1029,7 @@ impl MiniAppMcpServer {
             && config.schema_path.is_none()
             && config.db_path.is_none()
         {
-            return Err(McpError::from(MiniAppError::Config(
+            return Err(crate::miniapp_error_to_mcp_error(MiniAppError::Config(
                 "reload not configured: server was constructed via new_single without a mount \
                  config"
                     .into(),
@@ -1046,7 +1046,7 @@ impl MiniAppMcpServer {
             .map_err(|e| {
                 let msg = format!("reload: {e}");
                 tracing::error!(%msg);
-                McpError::from(e)
+                crate::miniapp_error_to_mcp_error(e)
             })?;
 
         // Compute diff against the new registry snapshot.
@@ -1071,7 +1071,7 @@ impl MiniAppMcpServer {
             removed,
         };
         serde_json::to_string(&result)
-            .map_err(|e| McpError::from(MiniAppError::Schema(e.to_string())))
+            .map_err(|e| crate::miniapp_error_to_mcp_error(MiniAppError::Schema(e.to_string())))
     }
 
     /// Create a new schema (schema.yaml + DB directory) in the given scope.

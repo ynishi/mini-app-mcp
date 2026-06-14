@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::config::Config;
 use crate::error::MiniAppError;
 use crate::filter::ListFilter;
-use crate::mcp::registry::TableRegistry;
+use crate::registry::TableRegistry;
 use crate::schema::SchemaConfig;
 use crate::store::RowRecord;
 
@@ -621,7 +621,7 @@ pub async fn do_materialize(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::mcp::registry::TableRegistry;
+    use crate::registry::TableRegistry;
     use crate::schema::{FieldDef, FieldType, SchemaConfig};
     use crate::store::Store;
     use std::path::PathBuf;

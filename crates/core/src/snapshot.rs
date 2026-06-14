@@ -39,7 +39,7 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::error::MiniAppError;
-use crate::mcp::registry::TableRegistry;
+use crate::registry::TableRegistry;
 
 /// Creates a SQLite snapshot for a table using the hot backup API.
 ///
@@ -919,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn test_do_data_snapshot_dry_run_zero_write() {
         use crate::config::Config;
-        use crate::mcp::registry::{TableEntry, TableRegistry};
+        use crate::registry::{TableEntry, TableRegistry};
         use crate::schema::{FieldDef, FieldType, SchemaConfig};
         use crate::store::Store;
         use arc_swap::ArcSwap;
