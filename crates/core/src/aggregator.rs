@@ -60,8 +60,9 @@ pub enum AliasAggregator {
     },
 }
 
-/// Source-table specifier — either a single table or a list combined via
-/// `ATTACH DATABASE` + `UNION ALL` (Crux #3).
+/// Source-table specifier — either a single table, a list combined via
+/// `ATTACH DATABASE` + `UNION ALL` (Crux #3), or a glob pattern that must
+/// be resolved against the live [`TableRegistry`] before execution.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum SourceSpec {
@@ -71,17 +72,143 @@ pub enum SourceSpec {
     Single(String),
     /// Two or more tables, joined via `UNION ALL` (never `JOIN`).
     Multi(Vec<String>),
+    /// Glob pattern (e.g. `"shi_*"`) resolved against the registry at
+    /// `alias_run` time. Callers MUST resolve to [`SourceSpec::Multi`] via
+    /// [`SourceSpec::resolve_pattern`] before invoking [`execute_aggregate`];
+    /// [`SourceSpec::tables`] returns an empty slice for this variant so
+    /// the existing "empty sources" guard in `execute_aggregate` fires as a
+    /// fail-fast bug detector if resolution is skipped.
+    Pattern(String),
 }
 
 impl SourceSpec {
-    /// Returns the source tables as a slice. Length is `1` for `Single` and
-    /// the supplied vector's length for `Multi`; [`execute_aggregate`]
-    /// rejects an empty `Multi` with [`MiniAppError::Aggregator`].
+    /// Returns the source tables as a slice. Length is `1` for `Single`,
+    /// the supplied vector's length for `Multi`, and `0` for `Pattern`
+    /// (unresolved — must be resolved via [`SourceSpec::resolve_pattern`]
+    /// before [`execute_aggregate`]). [`execute_aggregate`] rejects an
+    /// empty `Multi` (and consequently an unresolved `Pattern`) with
+    /// [`MiniAppError::Aggregator`].
     pub fn tables(&self) -> &[String] {
         match self {
             SourceSpec::Single(t) => std::slice::from_ref(t),
             SourceSpec::Multi(v) => v.as_slice(),
+            // Unresolved Pattern: empty slice triggers the existing
+            // "sources must contain at least one table" guard in
+            // execute_aggregate for fail-fast bug detection.
+            SourceSpec::Pattern(_) => &[],
         }
+    }
+
+    /// Returns `true` when this variant requires registry-side glob
+    /// resolution (i.e. [`SourceSpec::Pattern`]). Phase 2 `alias_run`
+    /// callers branch on this to invoke [`SourceSpec::resolve_pattern`]
+    /// before passing the spec to [`execute_aggregate`].
+    pub fn requires_resolve(&self) -> bool {
+        matches!(self, SourceSpec::Pattern(_))
+    }
+
+    /// Resolves [`SourceSpec::Pattern`] against the supplied table-name
+    /// list using a simple `*` glob (one segment, no `?` / `[]` support
+    /// in Phase 2 — extension point reserved for a future revision).
+    /// Returns `Single(name)` when exactly one table matches, `Multi(v)`
+    /// when two or more match (sorted ascending for determinism), and
+    /// `Err(MiniAppError::Aggregator)` when zero tables match (so callers
+    /// surface the empty-sources error early rather than after ATTACH).
+    ///
+    /// Non-`Pattern` variants are returned unchanged so callers can
+    /// invoke this unconditionally without branching on
+    /// [`SourceSpec::requires_resolve`].
+    pub fn resolve_pattern(self, all_tables: &[String]) -> Result<Self, MiniAppError> {
+        let Self::Pattern(pat) = self else {
+            return Ok(self);
+        };
+        let matcher = GlobMatcher::compile(&pat)?;
+        let mut hits: Vec<String> = all_tables
+            .iter()
+            .filter(|t| matcher.matches(t))
+            .cloned()
+            .collect();
+        hits.sort();
+        match hits.len() {
+            0 => Err(MiniAppError::Aggregator(format!(
+                "SourceSpec::Pattern('{pat}') matched zero tables"
+            ))),
+            1 => Ok(SourceSpec::Single(hits.into_iter().next().unwrap())),
+            _ => Ok(SourceSpec::Multi(hits)),
+        }
+    }
+}
+
+/// A `*`-only glob matcher used by [`SourceSpec::resolve_pattern`].
+/// One `*` matches any sequence (including empty) of characters; other
+/// characters match literally. `?` / `[]` are reserved for a future
+/// revision.
+struct GlobMatcher {
+    segments: Vec<String>,
+    leading_wildcard: bool,
+    trailing_wildcard: bool,
+}
+
+impl GlobMatcher {
+    fn compile(pattern: &str) -> Result<Self, MiniAppError> {
+        if pattern.is_empty() {
+            return Err(MiniAppError::Aggregator(
+                "SourceSpec::Pattern must not be empty".into(),
+            ));
+        }
+        for ch in pattern.chars() {
+            if ch == '?' || ch == '[' || ch == ']' {
+                return Err(MiniAppError::Aggregator(format!(
+                    "SourceSpec::Pattern('{pattern}') uses unsupported metachar '{ch}' (only '*' is supported in Phase 2)"
+                )));
+            }
+        }
+        let leading_wildcard = pattern.starts_with('*');
+        let trailing_wildcard = pattern.ends_with('*');
+        let segments: Vec<String> = pattern.split('*').map(str::to_owned).collect();
+        Ok(Self {
+            segments,
+            leading_wildcard,
+            trailing_wildcard,
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        // segments contains the literal pieces between `*` separators.
+        // E.g. "shi_*" → ["shi_", ""] (leading=false, trailing=true).
+        // E.g. "*_log" → ["", "_log"] (leading=true, trailing=false).
+        // E.g. "shi_*_log" → ["shi_", "_log"].
+        // E.g. "shi" → ["shi"] (no wildcards, exact match).
+        // E.g. "*" → ["", ""] (matches everything).
+        let mut remaining = name;
+        let last = self.segments.len().saturating_sub(1);
+        for (idx, seg) in self.segments.iter().enumerate() {
+            if seg.is_empty() {
+                continue;
+            }
+            if idx == 0 && !self.leading_wildcard {
+                if !remaining.starts_with(seg.as_str()) {
+                    return false;
+                }
+                remaining = &remaining[seg.len()..];
+            } else if idx == last && !self.trailing_wildcard {
+                if !remaining.ends_with(seg.as_str()) {
+                    return false;
+                }
+                let cut = remaining.len() - seg.len();
+                remaining = &remaining[..cut];
+            } else {
+                match remaining.find(seg.as_str()) {
+                    Some(pos) => {
+                        remaining = &remaining[pos + seg.len()..];
+                    }
+                    None => return false,
+                }
+            }
+        }
+        // After consuming all literal segments, any leftover characters
+        // are absorbed by the wildcards at either end.
+        true
     }
 }
 
@@ -143,9 +270,7 @@ fn validate_identifier(label: &str, name: &str) -> Result<(), MiniAppError> {
         if !(c.is_ascii_alphanumeric() || c == '_') {
             return Err(MiniAppError::Validation {
                 field: label.to_string(),
-                reason: format!(
-                    "{label} '{name}' must contain only [A-Za-z0-9_]"
-                ),
+                reason: format!("{label} '{name}' must contain only [A-Za-z0-9_]"),
             });
         }
     }
@@ -198,21 +323,12 @@ impl AliasAggregator {
     fn scalar_agg_sql(&self) -> Result<String, MiniAppError> {
         match self {
             AliasAggregator::Count => Ok("COUNT(*)".to_string()),
-            AliasAggregator::Sum { field } => {
-                Ok(format!("SUM(json_extract(data, '$.{field}'))"))
-            }
-            AliasAggregator::Avg { field } => {
-                Ok(format!("AVG(json_extract(data, '$.{field}'))"))
-            }
-            AliasAggregator::Min { field } => {
-                Ok(format!("MIN(json_extract(data, '$.{field}'))"))
-            }
-            AliasAggregator::Max { field } => {
-                Ok(format!("MAX(json_extract(data, '$.{field}'))"))
-            }
+            AliasAggregator::Sum { field } => Ok(format!("SUM(json_extract(data, '$.{field}'))")),
+            AliasAggregator::Avg { field } => Ok(format!("AVG(json_extract(data, '$.{field}'))")),
+            AliasAggregator::Min { field } => Ok(format!("MIN(json_extract(data, '$.{field}'))")),
+            AliasAggregator::Max { field } => Ok(format!("MAX(json_extract(data, '$.{field}'))")),
             AliasAggregator::GroupBy { .. } => Err(MiniAppError::Aggregator(
-                "GroupBy is not a scalar aggregator (handled by execute_aggregate)"
-                    .into(),
+                "GroupBy is not a scalar aggregator (handled by execute_aggregate)".into(),
             )),
         }
     }
@@ -324,10 +440,7 @@ fn run_aggregate_blocking(
     for (i, path) in db_paths.iter().enumerate() {
         let alias = format!("db_{i}");
         let path_str = path.to_str().ok_or_else(|| {
-            MiniAppError::Aggregator(format!(
-                "db_path is not valid UTF-8: {}",
-                path.display()
-            ))
+            MiniAppError::Aggregator(format!("db_path is not valid UTF-8: {}", path.display()))
         })?;
         conn.execute(
             &format!("ATTACH DATABASE ?1 AS {alias}"),
@@ -389,9 +502,7 @@ fn build_inner_sql(
     Ok((inner, all_params))
 }
 
-fn filter_params_to_rusqlite(
-    params: &[FilterParam],
-) -> Vec<Box<dyn rusqlite::ToSql>> {
+fn filter_params_to_rusqlite(params: &[FilterParam]) -> Vec<Box<dyn rusqlite::ToSql>> {
     params
         .iter()
         .map(|p| -> Box<dyn rusqlite::ToSql> {
@@ -482,19 +593,14 @@ fn run_group_by(
     Ok(AliasRunResult::Groups(rows))
 }
 
-fn row_value_to_json(
-    row: &rusqlite::Row,
-    idx: usize,
-) -> rusqlite::Result<serde_json::Value> {
+fn row_value_to_json(row: &rusqlite::Row, idx: usize) -> rusqlite::Result<serde_json::Value> {
     use rusqlite::types::ValueRef;
     let v = row.get_ref(idx)?;
     Ok(match v {
         ValueRef::Null => serde_json::Value::Null,
         ValueRef::Integer(i) => serde_json::Value::from(i),
         ValueRef::Real(f) => serde_json::Value::from(f),
-        ValueRef::Text(t) => {
-            serde_json::Value::String(String::from_utf8_lossy(t).into_owned())
-        }
+        ValueRef::Text(t) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
         ValueRef::Blob(_) => serde_json::Value::Null,
     })
 }
@@ -569,17 +675,11 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn count_single_source_returns_row_count() {
-        let dir = build_in_memory_db_with_rows(&[
-            ("r1", "a", 1.0),
-            ("r2", "b", 2.0),
-            ("r3", "a", 3.0),
-        ]);
-        let result = run_aggregate_blocking(
-            &[dir.path().join("rows.db")],
-            None,
-            &AliasAggregator::Count,
-        )
-        .unwrap();
+        let dir =
+            build_in_memory_db_with_rows(&[("r1", "a", 1.0), ("r2", "b", 2.0), ("r3", "a", 3.0)]);
+        let result =
+            run_aggregate_blocking(&[dir.path().join("rows.db")], None, &AliasAggregator::Count)
+                .unwrap();
         assert!(matches!(result, AliasRunResult::Count(3)));
     }
 
@@ -622,7 +722,7 @@ mod tests {
         ]);
         let path = dir.path().join("rows.db");
         let min = run_aggregate_blocking(
-            &[path.clone()],
+            std::slice::from_ref(&path),
             None,
             &AliasAggregator::Min {
                 field: "amount".into(),
@@ -630,7 +730,7 @@ mod tests {
         )
         .unwrap();
         let max = run_aggregate_blocking(
-            &[path.clone()],
+            std::slice::from_ref(&path),
             None,
             &AliasAggregator::Max {
                 field: "amount".into(),
@@ -710,11 +810,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn multi_source_emits_union_all_not_join() {
-        let (sql, _) = build_inner_sql(
-            &["db_0".to_string(), "db_1".to_string()],
-            None,
-        )
-        .unwrap();
+        let (sql, _) = build_inner_sql(&["db_0".to_string(), "db_1".to_string()], None).unwrap();
         assert!(sql.contains("UNION ALL"), "expected UNION ALL in: {sql}");
         let upper = sql.to_uppercase();
         assert!(!upper.contains(" JOIN "), "JOIN must not appear: {sql}");
@@ -755,20 +851,14 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn multi_db_attach_union_all_count_returns_combined_total() {
-        let dir_a = build_in_memory_db_with_rows(&[
-            ("a1", "x", 1.0),
-            ("a2", "x", 2.0),
-        ]);
+        let dir_a = build_in_memory_db_with_rows(&[("a1", "x", 1.0), ("a2", "x", 2.0)]);
         let dir_b = build_in_memory_db_with_rows(&[
             ("b1", "y", 10.0),
             ("b2", "y", 20.0),
             ("b3", "y", 30.0),
         ]);
         let result = run_aggregate_blocking(
-            &[
-                dir_a.path().join("rows.db"),
-                dir_b.path().join("rows.db"),
-            ],
+            &[dir_a.path().join("rows.db"), dir_b.path().join("rows.db")],
             None,
             &AliasAggregator::Count,
         )
@@ -785,10 +875,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn too_many_sources_returns_aggregator_error() {
-        let registry = TableRegistry::from_entries(
-            std::collections::HashMap::new(),
-            None,
-        );
+        let registry = TableRegistry::from_entries(std::collections::HashMap::new(), None);
         let names: Vec<String> = (0..(SQLITE_MAX_ATTACHED + 1))
             .map(|i| format!("t{i}"))
             .collect();
@@ -828,6 +915,163 @@ mod tests {
         assert_eq!(single.tables(), &["t".to_string()]);
         let multi = SourceSpec::Multi(vec!["a".into(), "b".into()]);
         assert_eq!(multi.tables(), &["a".to_string(), "b".to_string()]);
+    }
+
+    // -----------------------------------------------------------------
+    // (j2) SourceSpec::Pattern — tables() returns empty (unresolved
+    //      bug detector via execute_aggregate empty-source guard),
+    //      requires_resolve() flags Pattern only
+    // -----------------------------------------------------------------
+    #[test]
+    fn source_spec_pattern_unresolved_yields_empty_tables() {
+        let pat = SourceSpec::Pattern("shi_*".into());
+        assert_eq!(pat.tables(), &[] as &[String]);
+        assert!(pat.requires_resolve());
+        assert!(!SourceSpec::Single("t".into()).requires_resolve());
+        assert!(!SourceSpec::Multi(vec!["a".into()]).requires_resolve());
+    }
+
+    // -----------------------------------------------------------------
+    // (j3) SourceSpec::resolve_pattern — glob matching matrix
+    //      (prefix / suffix / middle / exact / matches-all),
+    //      0-hit error path, 1-hit Single normalisation, n-hit Multi
+    //      sorted ascending for determinism
+    // -----------------------------------------------------------------
+    #[test]
+    fn source_spec_resolve_pattern_prefix_glob() {
+        let tables = vec![
+            "shi_active_context".into(),
+            "shi_ng_context".into(),
+            "shi_trigger".into(),
+            "mia_brief".into(),
+        ];
+        let resolved = SourceSpec::Pattern("shi_*".into())
+            .resolve_pattern(&tables)
+            .expect("resolve ok");
+        match resolved {
+            SourceSpec::Multi(v) => assert_eq!(
+                v,
+                vec![
+                    "shi_active_context".to_string(),
+                    "shi_ng_context".to_string(),
+                    "shi_trigger".to_string(),
+                ]
+            ),
+            other => panic!("expected Multi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_spec_resolve_pattern_suffix_glob() {
+        let tables = vec!["agent_log".into(), "session_log".into(), "memo".into()];
+        let resolved = SourceSpec::Pattern("*_log".into())
+            .resolve_pattern(&tables)
+            .expect("resolve ok");
+        match resolved {
+            SourceSpec::Multi(v) => {
+                assert_eq!(v, vec!["agent_log".to_string(), "session_log".to_string()])
+            }
+            other => panic!("expected Multi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_spec_resolve_pattern_middle_glob() {
+        let tables = vec![
+            "shi_v1_brief".into(),
+            "shi_v2_brief".into(),
+            "shi_v1_log".into(),
+        ];
+        let resolved = SourceSpec::Pattern("shi_*_brief".into())
+            .resolve_pattern(&tables)
+            .expect("resolve ok");
+        match resolved {
+            SourceSpec::Multi(v) => assert_eq!(
+                v,
+                vec!["shi_v1_brief".to_string(), "shi_v2_brief".to_string()]
+            ),
+            other => panic!("expected Multi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_spec_resolve_pattern_single_hit_normalises_to_single() {
+        let tables = vec!["shi_brief".into(), "mia_brief".into()];
+        let resolved = SourceSpec::Pattern("shi_*".into())
+            .resolve_pattern(&tables)
+            .expect("resolve ok");
+        match resolved {
+            SourceSpec::Single(t) => assert_eq!(t, "shi_brief"),
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_spec_resolve_pattern_match_all_glob() {
+        let tables = vec!["a".into(), "b".into()];
+        let resolved = SourceSpec::Pattern("*".into())
+            .resolve_pattern(&tables)
+            .expect("resolve ok");
+        match resolved {
+            SourceSpec::Multi(v) => assert_eq!(v, vec!["a".to_string(), "b".to_string()]),
+            other => panic!("expected Multi for *-match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_spec_resolve_pattern_zero_hit_returns_error() {
+        let tables = vec!["mia_brief".into()];
+        let err = SourceSpec::Pattern("shi_*".into())
+            .resolve_pattern(&tables)
+            .expect_err("expected zero-hit error");
+        assert_eq!(err.code(), crate::error::codes::AGGREGATOR_ERROR);
+    }
+
+    #[test]
+    fn source_spec_resolve_pattern_non_pattern_passes_through() {
+        let tables = vec!["x".into()];
+        let single = SourceSpec::Single("t".into())
+            .resolve_pattern(&tables)
+            .expect("non-pattern passthrough");
+        assert!(matches!(single, SourceSpec::Single(ref s) if s == "t"));
+        let multi = SourceSpec::Multi(vec!["a".into(), "b".into()])
+            .resolve_pattern(&tables)
+            .expect("non-pattern passthrough");
+        assert!(
+            matches!(multi, SourceSpec::Multi(ref v) if v == &vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn source_spec_resolve_pattern_rejects_empty_pattern() {
+        let tables = vec!["x".into()];
+        let err = SourceSpec::Pattern("".into())
+            .resolve_pattern(&tables)
+            .expect_err("empty pattern rejected");
+        assert_eq!(err.code(), crate::error::codes::AGGREGATOR_ERROR);
+    }
+
+    #[test]
+    fn source_spec_resolve_pattern_rejects_unsupported_metachar() {
+        let tables = vec!["x".into()];
+        for bad in &["shi_?", "shi_[ab]"] {
+            let err = SourceSpec::Pattern((*bad).into())
+                .resolve_pattern(&tables)
+                .expect_err("unsupported metachar rejected");
+            assert_eq!(err.code(), crate::error::codes::AGGREGATOR_ERROR);
+        }
+    }
+
+    #[test]
+    fn source_spec_resolve_pattern_exact_match_no_wildcard() {
+        let tables = vec!["shi_brief".into(), "shi_log".into()];
+        let resolved = SourceSpec::Pattern("shi_brief".into())
+            .resolve_pattern(&tables)
+            .expect("exact pattern resolves to Single");
+        match resolved {
+            SourceSpec::Single(t) => assert_eq!(t, "shi_brief"),
+            other => panic!("expected Single, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------

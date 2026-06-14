@@ -39,6 +39,14 @@ pub mod aggregator;
 /// Multi-table registry + atomic reload (Arc-Swap based, K-110-compliant).
 pub mod registry;
 
+/// Global alias storage (Phase 2). Persists named queries that span
+/// Single / Multi / Pattern table sources in a dedicated
+/// `<project_dir or user_dir>/_global.db` SQLite file, separate from
+/// per-table `<table>.db`. Provides lookup with Project → User
+/// precedence and a lossless migration helper from legacy per-table
+/// `_aliases` storage.
+pub mod alias_storage;
+
 /// `row_materialize` operation — row selection, field projection, and
 /// multi-format filesystem output with SHA-256 integrity digest.
 pub mod materialize;
