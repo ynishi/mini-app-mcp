@@ -101,27 +101,54 @@ impl TableRegistry {
         user_dir: Option<&Path>,
         project_dir: Option<&Path>,
     ) -> Result<Self, MiniAppError> {
+        // Honour the "missing dir = skip with warn" policy uniformly
+        // (scan_and_mount applies the same filter internally; the
+        // global storage open path also needs the existence guard so
+        // create_dir_all does not fail on a read-only / inaccessible
+        // parent).
+        let user_dir = user_dir.filter(|p| p.exists());
+        let project_dir = project_dir.filter(|p| p.exists());
+
         let mut entries: HashMap<String, TableEntry> = HashMap::new();
 
-        // Phase 1: User scope (base layer)
+        // Open the global alias storage upfront so we can route the
+        // per-scope migrations through their respective destinations
+        // (User scope for user_dir-origin tables, Project scope for
+        // project_dir-origin tables — preserves the "user-scope alias
+        // follows the user across projects" intent).
+        let global_aliases = if user_dir.is_some() || project_dir.is_some() {
+            Some(Arc::new(GlobalAliasStorage::open(project_dir, user_dir)?))
+        } else {
+            None
+        };
+
+        // Phase 1: User scope scan + per-scope migration. The user
+        // scan runs BEFORE the project scan so user-origin entries
+        // are still present in `entries` at this point — that lets us
+        // pull each user-origin store's connection even for tables
+        // that the project scan will later override (override would
+        // otherwise replace the entry and we would lose the
+        // user-origin Store handle).
         if let Some(dir) = user_dir {
             scan_and_mount(dir, &mut entries).await?;
+            if let Some(g) = global_aliases.as_ref() {
+                migrate_per_dir_subset(g, crate::alias_storage::AliasScope::User, dir, &entries)
+                    .await?;
+            }
         }
 
-        // Phase 2: Project scope (override layer — same-named tables replace User)
+        // Phase 2: Project scope scan (override layer) + Project-scope
+        // migration. After this point any user-scope alias whose table
+        // was overridden by a project entry is already safely written
+        // to the User scope above; the project-side `_aliases` rows
+        // land in the Project scope here.
         if let Some(dir) = project_dir {
             scan_and_mount(dir, &mut entries).await?;
+            if let Some(g) = global_aliases.as_ref() {
+                migrate_per_dir_subset(g, crate::alias_storage::AliasScope::Project, dir, &entries)
+                    .await?;
+            }
         }
-
-        // Phase 2 (alias_storage): open global `_global.db` in both
-        // Project and User scopes, then run a lossless + idempotent
-        // migration of any legacy per-table `_aliases` rows into
-        // project-scope `_global_aliases`. The per-table `_aliases`
-        // SQLite tables are left untouched so existing
-        // `Store::alias_*` callers keep working (full removal lands
-        // with the MCP-tool switchover in a later ST).
-        let global_aliases =
-            open_and_migrate_global_aliases(project_dir, user_dir, &entries).await?;
 
         Ok(TableRegistry {
             entries,
@@ -372,64 +399,73 @@ impl TableRegistry {
 // Private helpers
 // =============================================================================
 
-/// Open the Phase 2 global alias storage (`_global.db` in project + user
-/// scopes) and migrate any legacy per-table `_aliases` rows into the
-/// project-scope `_global_aliases` (lossless + idempotent).
+/// Migrate the legacy per-table `_aliases` rows belonging to the
+/// tables that live directly under `dir` into the chosen `scope` of
+/// the already-open global alias storage.
 ///
-/// Returns `Ok(None)` when both `project_dir` and `user_dir` are `None`
-/// (e.g. legacy single-table mode) or when neither directory exists yet
-/// (`GlobalAliasStorage::open` would otherwise be invoked with no scopes
-/// to mount).
+/// Lossless + idempotent: only the rows present in each per-table
+/// `_aliases` are read, and `INSERT OR IGNORE` skips any name already
+/// in the destination scope so multiple registry rebuilds are safe.
 ///
-/// The per-table `_aliases` SQLite tables are not modified by this
-/// helper; rows are read and copied. Full removal of the per-table
-/// tables happens in a later ST once the MCP `alias_*` tools are
-/// switched over.
-async fn open_and_migrate_global_aliases(
-    project_dir: Option<&Path>,
-    user_dir: Option<&Path>,
+/// "Tables directly under `dir`" is computed by scanning `dir` for
+/// immediate subdirectories whose name is also present in `entries`
+/// (i.e. they were successfully mounted by the preceding
+/// `scan_and_mount` pass and their `Store` handle is still in the
+/// merged entries map). This is what gives Phase 2 ST3-review
+/// finding #2 its fix: user-origin tables route their aliases to
+/// User scope, and project-origin tables route to Project scope.
+async fn migrate_per_dir_subset(
+    storage: &Arc<GlobalAliasStorage>,
+    scope: crate::alias_storage::AliasScope,
+    dir: &Path,
     entries: &HashMap<String, TableEntry>,
-) -> Result<Option<Arc<GlobalAliasStorage>>, MiniAppError> {
-    // Honour the same "missing dir = skip with warn" policy as
-    // scan_and_mount (registry test invariant): only pass through dirs
-    // that actually exist on disk so GlobalAliasStorage::open does not
-    // try to create_dir_all on a read-only / inaccessible parent.
-    let project_dir = project_dir.filter(|p| p.exists());
-    let user_dir = user_dir.filter(|p| p.exists());
-    if project_dir.is_none() && user_dir.is_none() {
-        return Ok(None);
-    }
-    let storage = GlobalAliasStorage::open(project_dir, user_dir)?;
-    // Pick migration destination: prefer Project scope when mounted,
-    // else fall back to User scope (the only scope present).
-    let target_scope = if project_dir.is_some() {
-        crate::alias_storage::AliasScope::Project
-    } else {
-        crate::alias_storage::AliasScope::User
-    };
-    // Collect (table_name, per-table conn) pairs. We migrate from every
-    // mounted store unconditionally; rows already present in the target
-    // scope are silently skipped by INSERT OR IGNORE so the call is
-    // idempotent across registry rebuilds.
-    let per_table: Vec<(String, Arc<std::sync::Mutex<rusqlite::Connection>>)> = entries
-        .iter()
-        .map(|(name, entry)| (name.clone(), entry.store.conn()))
-        .collect();
-    if !per_table.is_empty() {
-        // Best-effort: log the migrated row count for observability but
-        // do not surface it through the registry API.
-        let migrated = storage
-            .migrate_from_per_table(target_scope, per_table)
-            .await?;
-        if migrated > 0 {
-            tracing::info!(
-                migrated_rows = migrated,
-                scope = ?target_scope,
-                "migrated legacy per-table _aliases rows into _global_aliases"
+) -> Result<(), MiniAppError> {
+    let mut subset_names: Vec<String> = Vec::new();
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            // The exists() filter in mount_from_dirs should have
+            // caught this, but the dir could disappear in the window
+            // between the check and the read. Treat as "no tables to
+            // migrate" rather than failing the entire mount.
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "migrate_per_dir_subset could not read dir; skipping"
             );
+            return Ok(());
+        }
+    };
+    for dir_entry in read_dir.flatten() {
+        let Ok(meta) = dir_entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = dir_entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if entries.contains_key(&name) {
+            subset_names.push(name);
         }
     }
-    Ok(Some(Arc::new(storage)))
+    let per_table: Vec<(String, Arc<std::sync::Mutex<rusqlite::Connection>>)> = subset_names
+        .iter()
+        .filter_map(|name| entries.get(name).map(|e| (name.clone(), e.store.conn())))
+        .collect();
+    if per_table.is_empty() {
+        return Ok(());
+    }
+    let migrated = storage.migrate_from_per_table(scope, per_table).await?;
+    if migrated > 0 {
+        tracing::info!(
+            migrated_rows = migrated,
+            scope = ?scope,
+            "migrated legacy per-table _aliases rows into _global_aliases"
+        );
+    }
+    Ok(())
 }
 
 /// Scan `dir` for table subdirectories and mount each into `entries`.
@@ -916,6 +952,196 @@ mod tests {
             registry.global_aliases().is_none(),
             "mount_legacy must not attach GlobalAliasStorage"
         );
+    }
+
+    // Per-scope migration routing (Phase 2 review fix #2): user-origin
+    // tables migrate to User scope, project-origin tables migrate to
+    // Project scope — preserving the "user-scope alias follows user
+    // across projects" intent.
+    #[tokio::test]
+    async fn mount_from_dirs_routes_per_table_aliases_to_origin_scope() {
+        use crate::alias_storage::{AliasScope, LEGACY_PER_TABLE_ALIASES_SQL};
+
+        let user_dir = TempDir::new().expect("tempdir");
+        let project_dir = TempDir::new().expect("tempdir");
+
+        // User-origin table `user_only` carrying a legacy alias.
+        let user_table = create_table_dir(
+            &user_dir,
+            "user_only",
+            "  - name: f\n    type: string\n    required: false\n",
+        );
+        let user_db = user_table.join("user_only.db");
+        let conn = rusqlite::Connection::open(&user_db).expect("open user db");
+        conn.execute_batch(LEGACY_PER_TABLE_ALIASES_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO _aliases (name, filter, default_limit, description, params_schema) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "from_user",
+                "{}",
+                Some(7i64),
+                Some("user-scope alias".to_string()),
+                Option::<String>::None
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Project-origin table `proj_only` carrying a legacy alias.
+        let proj_table = create_table_dir(
+            &project_dir,
+            "proj_only",
+            "  - name: f\n    type: string\n    required: false\n",
+        );
+        let proj_db = proj_table.join("proj_only.db");
+        let conn = rusqlite::Connection::open(&proj_db).expect("open proj db");
+        conn.execute_batch(LEGACY_PER_TABLE_ALIASES_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO _aliases (name, filter, default_limit, description, params_schema) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "from_project",
+                "{}",
+                Some(11i64),
+                Some("project-scope alias".to_string()),
+                Option::<String>::None
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let registry =
+            TableRegistry::mount_from_dirs(Some(user_dir.path()), Some(project_dir.path()))
+                .await
+                .expect("mount must succeed");
+        let global = registry
+            .global_aliases()
+            .expect("global storage must be attached");
+
+        // user-origin alias must land in User scope.
+        let user_alias = global
+            .alias_get_scope(AliasScope::User, "from_user")
+            .await
+            .expect("user alias_get_scope ok")
+            .expect("user alias must be present in User scope");
+        assert_eq!(user_alias.description.as_deref(), Some("user-scope alias"));
+        // and NOT in Project scope.
+        let user_in_project = global
+            .alias_get_scope(AliasScope::Project, "from_user")
+            .await
+            .expect("project alias_get_scope ok");
+        assert!(
+            user_in_project.is_none(),
+            "user-origin alias must NOT leak into Project scope (silent inversion fix)"
+        );
+
+        // project-origin alias must land in Project scope.
+        let proj_alias = global
+            .alias_get_scope(AliasScope::Project, "from_project")
+            .await
+            .expect("project alias_get_scope ok")
+            .expect("project alias must be present in Project scope");
+        assert_eq!(
+            proj_alias.description.as_deref(),
+            Some("project-scope alias")
+        );
+        // and NOT in User scope.
+        let proj_in_user = global
+            .alias_get_scope(AliasScope::User, "from_project")
+            .await
+            .expect("user alias_get_scope ok");
+        assert!(
+            proj_in_user.is_none(),
+            "project-origin alias must NOT leak into User scope"
+        );
+    }
+
+    // Same name in both scopes: user-origin → User, project-origin →
+    // Project. alias_get returns Project (precedence rule), but each
+    // scope independently keeps its own row so a later project-less
+    // mount can still see the User entry.
+    #[tokio::test]
+    async fn mount_from_dirs_preserves_user_alias_when_project_overrides_table() {
+        use crate::alias_storage::{AliasScope, LEGACY_PER_TABLE_ALIASES_SQL};
+
+        let user_dir = TempDir::new().expect("tempdir");
+        let project_dir = TempDir::new().expect("tempdir");
+
+        // user_dir/foo with alias "shared" (description: "user").
+        let user_table = create_table_dir(
+            &user_dir,
+            "foo",
+            "  - name: f\n    type: string\n    required: false\n",
+        );
+        let user_db = user_table.join("foo.db");
+        let conn = rusqlite::Connection::open(&user_db).expect("open user foo db");
+        conn.execute_batch(LEGACY_PER_TABLE_ALIASES_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO _aliases (name, filter, default_limit, description, params_schema) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "shared",
+                "{}",
+                Option::<i64>::None,
+                Some("user".to_string()),
+                Option::<String>::None
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // project_dir/foo (overrides user_dir/foo) with alias "shared" (description: "project").
+        let proj_table = create_table_dir(
+            &project_dir,
+            "foo",
+            "  - name: f\n    type: string\n    required: false\n",
+        );
+        let proj_db = proj_table.join("foo.db");
+        let conn = rusqlite::Connection::open(&proj_db).expect("open project foo db");
+        conn.execute_batch(LEGACY_PER_TABLE_ALIASES_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO _aliases (name, filter, default_limit, description, params_schema) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "shared",
+                "{}",
+                Option::<i64>::None,
+                Some("project".to_string()),
+                Option::<String>::None
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let registry =
+            TableRegistry::mount_from_dirs(Some(user_dir.path()), Some(project_dir.path()))
+                .await
+                .expect("mount must succeed");
+        let global = registry
+            .global_aliases()
+            .expect("global storage must be attached");
+
+        // User scope row preserved with user-origin description.
+        let user_row = global
+            .alias_get_scope(AliasScope::User, "shared")
+            .await
+            .unwrap()
+            .expect("user shared alias preserved");
+        assert_eq!(user_row.description.as_deref(), Some("user"));
+
+        // Project scope row has project-origin description.
+        let project_row = global
+            .alias_get_scope(AliasScope::Project, "shared")
+            .await
+            .unwrap()
+            .expect("project shared alias present");
+        assert_eq!(project_row.description.as_deref(), Some("project"));
+
+        // alias_get applies the Project → User precedence rule.
+        let merged = global.alias_get("shared").await.unwrap();
+        assert_eq!(merged.description.as_deref(), Some("project"));
+        assert_eq!(merged.scope, Some(AliasScope::Project));
     }
 
     // mount_from_dirs auto-migrates any pre-existing per-table _aliases
