@@ -1,9 +1,9 @@
 /// MCP server implementation for mini-app-mcp.
 ///
-/// Exposes 17 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
+/// Exposes 18 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
 /// `reload`, `schema_create`, `schema_update`, `schema_delete`, `schema_batch`,
 /// `data_snapshot`, `row_materialize`, `alias_create`, `alias_list`, `alias_run`,
-/// `alias_delete`) and resources
+/// `alias_delete`, `query_aggregate`) and resources
 /// (`schema://yaml`, `schema://json`, `schema://json-schema`, `docs://readme`,
 /// `docs://tools`, `docs://errors`, `docs://filters`) as MCP capabilities over stdio transport.
 /// No HTTP / REST / CLI-CRUD entry points are provided (Crux "MCP-only entry
@@ -366,7 +366,7 @@ impl MiniAppMcpServer {
         resources.push(
             RawResource::new(URI_DOCS_TOOLS, "Tools Reference")
                 .with_description(
-                    "Cheat sheet listing all 17 tools with descriptions and input shapes.",
+                    "Cheat sheet listing all 18 tools with descriptions and input shapes.",
                 )
                 .with_mime_type("text/markdown")
                 .no_annotation(),
@@ -469,7 +469,7 @@ impl ServerHandler for MiniAppMcpServer {
         info.server_info.description = Some(
             "Agent-First CRUD store backed by SQLite. \
              Supports multiple tables via User→Project schema chain. \
-             17 tools: info, create, get, list, update, delete, reload, \
+             18 tools: info, create, get, list, update, delete, reload, \
              schema_create, schema_update, schema_delete, schema_batch, data_snapshot, \
              row_materialize, alias_create, alias_list, alias_run, alias_delete."
                 .to_string(),
@@ -755,6 +755,23 @@ struct AliasRunParams {
     /// `VALIDATION_ERROR` (data.code="VALIDATION_ERROR").
     #[serde(default)]
     fields: Option<FieldSelector>,
+}
+
+/// Parameters for the `query_aggregate` tool.
+#[derive(Deserialize, JsonSchema)]
+struct QueryAggregateParams {
+    /// Source-table specifier — `{ "kind": "single", "value": "..." }` or
+    /// `{ "kind": "multi", "value": ["...", "..."] }`. `Multi` UNION ALLs
+    /// the listed tables before aggregation via SQLite ATTACH DATABASE.
+    sources: crate::aggregator::SourceSpec,
+    /// Optional pre-aggregation filter applied via WHERE within every
+    /// source sub-query (re-uses the same `ListFilter` shape that the
+    /// `list` tool accepts).
+    #[serde(default)]
+    filter: Option<ListFilter>,
+    /// Aggregator primitive — `Count` / `Sum` / `Avg` / `Min` / `Max` /
+    /// `GroupBy { by_field, having?, inner? }`.
+    aggregator: crate::aggregator::AliasAggregator,
 }
 
 /// Parameters for the `alias_delete` tool.
@@ -1642,6 +1659,67 @@ impl MiniAppMcpServer {
         serde_json::to_string(&serde_json::json!({ "deleted": params.name }))
             .map_err(|e| e.to_string())
     }
+
+    /// Run a multi-table aggregation across one or more sources.
+    ///
+    /// Resolves each source via the registry, mounts each backing `.db`
+    /// file via `ATTACH DATABASE`, composes a `UNION ALL` inner sub-query
+    /// (or a single `SELECT` for `SourceSpec::Single`), and wraps it in an
+    /// outer aggregate (with optional `GROUP BY` + `HAVING`). Read-only —
+    /// no DB mutation is performed.
+    ///
+    /// Returns `AGGREGATOR_ERROR` (`data.code`) for structural
+    /// inconsistencies (empty sources, ATTACH-limit exceeded, nested
+    /// `GroupBy`, non-UTF-8 db path). Returns `VALIDATION_ERROR` for
+    /// field / identifier rejections. Returns `TABLE_NOT_FOUND` when any
+    /// source name is not mounted.
+    #[tool(
+        name = "query_aggregate",
+        description = "Aggregate rows from one or more tables using \
+                       COUNT / SUM / AVG / MIN / MAX / GROUP BY (with \
+                       optional HAVING). Single source uses one table; \
+                       Multi source UNION ALLs across tables before \
+                       aggregation via SQLite ATTACH DATABASE. Read-only \
+                       — does not modify any data.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_query_aggregate(
+        &self,
+        Parameters(params): Parameters<QueryAggregateParams>,
+    ) -> Result<String, String> {
+        let registry = self.tables.load_full();
+        let tables = params.sources.tables();
+        if tables.is_empty() {
+            return Err(MiniAppError::Aggregator(
+                "sources must contain at least one table".into(),
+            )
+            .to_string());
+        }
+        // Phase 1: use the FIRST source table's schema as the validation
+        // basis (caller is responsible for cross-source schema
+        // compatibility; per-table validation is Phase 2 carry).
+        let first_schema: Arc<SchemaConfig> = {
+            let entry = registry
+                .resolve(Some(&tables[0]))
+                .map_err(|e| e.to_string())?;
+            Arc::clone(&entry.schema)
+        };
+        let result = crate::aggregator::execute_aggregate(
+            registry.as_ref(),
+            params.sources,
+            params.filter,
+            params.aggregator,
+            &first_schema,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
 }
 
 // =============================================================================
@@ -1804,13 +1882,14 @@ fields:\n\
             "alias_list",
             "alias_run",
             "alias_delete",
+            "query_aggregate",
         ] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(tools.len(), 17, "expected exactly 17 tools");
+        assert_eq!(tools.len(), 18, "expected exactly 18 tools");
     }
 
     /// RED: ensure create/update tools advertise `data` as an object in their

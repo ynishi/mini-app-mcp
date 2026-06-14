@@ -11,7 +11,7 @@ use crate::schema::{FieldType, SchemaConfig};
 /// README.md embedded at compile time so it ships in the binary.
 pub const README: &str = include_str!("../../../../README.md");
 
-/// Hand-written cheat sheet listing all 17 tools with descriptions / shapes.
+/// Hand-written cheat sheet listing all 18 tools with descriptions / shapes.
 pub const TOOLS_DOC: &str = r#"# mini-app-mcp — Tools Reference
 
 ## `table` argument (all tools)
@@ -162,6 +162,22 @@ Delete a named query alias from a table. The alias is scoped exclusively to the 
 - Returns `ALIAS_NOT_FOUND` (`data.code`) if the alias does not exist.
 - In multi-table mode `table` is required; omitting it returns `TABLE_REQUIRED`.
 - Annotations: `readOnlyHint=false`, `destructiveHint=true`, `idempotentHint=true`
+
+## `query_aggregate`
+Aggregate rows from one or more tables using `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` / `GROUP BY` (with optional `HAVING`). Single source uses one table; Multi source UNION ALLs across tables before aggregation via SQLite `ATTACH DATABASE`.
+- **Input**: `{ "sources": { "kind": "single"|"multi", "value": "<name>"|["<n1>","<n2>",...] }, "filter": <ListFilter optional>, "aggregator": { "kind": "count"|"sum"|"avg"|"min"|"max"|"group_by", ... } }`
+  - `sources.kind="single"` → `value` is a table name string
+  - `sources.kind="multi"` → `value` is an array of table names (ATTACH limit 10)
+  - `aggregator.kind="sum"|"avg"|"min"|"max"` requires `"field": "<name>"`
+  - `aggregator.kind="group_by"` requires `"by_field": "<name>"` plus optional `"having": <ListFilter>` and `"inner": <AliasAggregator>`
+- **Output**: externally-tagged result `{ "kind": "count"|"value"|"groups"|"rows", "value": ... }`
+  - `count` → `i64`
+  - `value` → JSON number / null (scalar aggregate)
+  - `groups` → `[{ "key": ..., "count": N, "value": <inner result>? }, ...]`
+- Returns `AGGREGATOR_ERROR` (`data.code`) for empty sources, ATTACH-limit exceeded, nested `GroupBy`, or non-UTF-8 db path.
+- Returns `VALIDATION_ERROR` for field / identifier rejections, and `TABLE_NOT_FOUND` when any source name is not mounted.
+- Read-only — does not modify any data.
+- Annotations: `readOnlyHint=true`, `idempotentHint=true`
 "#;
 
 /// Hand-written reference table of all error codes from `src/error.rs`.

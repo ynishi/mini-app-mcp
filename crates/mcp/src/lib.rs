@@ -10,6 +10,7 @@
 //! split these symbols live in `mini-app-core`; we re-export them here so
 //! existing integration tests continue to compile without path rewrites.
 
+pub use mini_app_core::aggregator;
 pub use mini_app_core::backup;
 pub use mini_app_core::config;
 pub use mini_app_core::dump;

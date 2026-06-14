@@ -327,6 +327,7 @@ mod tests {
                 id_prefix: "abc".into(),
                 candidates: vec!["abc-1".into(), "abc-2".into()],
             },
+            MiniAppError::Aggregator("empty sources".into()),
         ];
         for err in errs {
             let mcp = conv(err);
