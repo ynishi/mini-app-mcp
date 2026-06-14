@@ -7,7 +7,7 @@ authors.workspace = true
 license.workspace = true
 description = "Agent-First CRUD store MCP server — 1 daemon per table, schema.yaml driven, SQLite backend"
 repository.workspace = true
-readme = "README.md"
+readme = "../../README.md"
 keywords = ["mcp", "sqlite", "agent", "crud", "schema"]
 categories = ["database", "command-line-utilities"]
 

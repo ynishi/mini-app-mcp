@@ -7,7 +7,7 @@ authors.workspace = true
 license.workspace = true
 description = "Agent-First CRUD store core library — schema.yaml driven, SQLite backend (transport-agnostic)"
 repository.workspace = true
-readme = "CHANGELOG.md"
+readme = "../../README.md"
 keywords = ["sqlite", "agent", "crud", "schema", "yaml"]
 categories = ["database", "data-structures"]
 
