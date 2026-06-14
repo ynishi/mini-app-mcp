@@ -4,7 +4,7 @@
 /// `reload`, `schema_create`, `schema_update`, `schema_delete`, `schema_batch`,
 /// `data_snapshot`, `row_materialize`, `alias_create`, `alias_list`, `alias_run`,
 /// `alias_delete`, `query_aggregate`) and resources
-/// (`schema://yaml`, `schema://json`, `schema://json-schema`, `docs://readme`,
+/// (`schema://yaml`, `schema://json`, `schema://json-schema`, `docs://quickstart`,
 /// `docs://tools`, `docs://errors`, `docs://filters`) as MCP capabilities over stdio transport.
 /// No HTTP / REST / CLI-CRUD entry points are provided (Crux "MCP-only entry
 /// point" constraint).
@@ -281,7 +281,7 @@ const URI_SCHEMA_YAML: &str = "schema://yaml";
 const URI_SCHEMA_JSON: &str = "schema://json";
 const URI_SCHEMA_JSON_SCHEMA: &str = "schema://json-schema";
 /// Full URIs for documentation resources (no query params).
-const URI_DOCS_README: &str = "docs://readme";
+const URI_DOCS_QUICKSTART: &str = "docs://quickstart";
 const URI_DOCS_TOOLS: &str = "docs://tools";
 const URI_DOCS_ERRORS: &str = "docs://errors";
 const URI_DOCS_FILTERS: &str = "docs://filters";
@@ -389,8 +389,13 @@ impl MiniAppMcpServer {
 
         // Documentation resources — always present, table-independent.
         resources.push(
-            RawResource::new(URI_DOCS_README, "README")
-                .with_description("README.md — embedded in the binary at compile time.")
+            RawResource::new(URI_DOCS_QUICKSTART, "Quickstart")
+                .with_description(
+                    "Agent quickstart — server identity, multi-table vs legacy \
+                     mode detection, first-call recipe, and pointers to the other \
+                     `docs://` resources. Distinct from the human-facing project \
+                     README on GitHub (which is not served as an MCP resource).",
+                )
                 .with_mime_type("text/markdown")
                 .no_annotation(),
         );
@@ -459,8 +464,8 @@ impl MiniAppMcpServer {
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 ResourceContents::text(text, uri).with_mime_type("application/schema+json")
             }
-            URI_DOCS_README => {
-                ResourceContents::text(res::README, uri).with_mime_type("text/markdown")
+            URI_DOCS_QUICKSTART => {
+                ResourceContents::text(res::QUICKSTART, uri).with_mime_type("text/markdown")
             }
             URI_DOCS_TOOLS => {
                 ResourceContents::text(res::TOOLS_DOC, uri).with_mime_type("text/markdown")
@@ -2425,7 +2430,7 @@ fields:\n\
         // Docs URIs must be present without query string.
         let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
         for expected in &[
-            "docs://readme",
+            "docs://quickstart",
             "docs://tools",
             "docs://errors",
             "docs://filters",
@@ -2508,20 +2513,24 @@ fields:\n\
     }
 
     #[tokio::test]
-    async fn read_resource_readme_starts_with_heading() {
+    async fn read_resource_quickstart_documents_mode_detection() {
         let (server, _tmp) = make_server().await;
         let result = server
-            .read_resource_impl("docs://readme")
+            .read_resource_impl("docs://quickstart")
             .await
-            .expect("docs://readme must succeed");
+            .expect("docs://quickstart must succeed");
         let text = match &result.contents[0] {
             rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
             _ => panic!("expected text contents"),
         };
         assert!(
             text.starts_with("# mini-app-mcp"),
-            "README must start with '# mini-app-mcp', got: {:?}",
+            "Quickstart must start with '# mini-app-mcp', got: {:?}",
             &text[..text.len().min(40)]
+        );
+        assert!(
+            text.contains("Multi-table mode") && text.contains("Legacy single-table mode"),
+            "Quickstart served via docs://quickstart must document both mode flavours so agents can detect which mode the server is running in"
         );
     }
 

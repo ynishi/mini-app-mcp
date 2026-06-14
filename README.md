@@ -93,7 +93,7 @@ In addition to the 17 tools above, the server exposes 7 read-only **Resources** 
 | `schema://yaml` | `application/yaml` | Raw `schema.yaml` file content (read from disk on each request) |
 | `schema://json` | `application/json` | Parsed `SchemaConfig` as JSON (same shape the `info` tool returns) |
 | `schema://json-schema` | `application/schema+json` | JSON Schema (draft-07) derived from the schema's fields. Use this to validate `data` arguments before calling `create` / `update` |
-| `docs://readme` | `text/markdown` | This README, compiled into the binary |
+| `docs://quickstart` | `text/markdown` | Agent quickstart (mode detection + first-call recipe + pointers to the other `docs://` resources), compiled into the binary. Distinct from this human-facing README — read this resource from inside the MCP session |
 | `docs://tools` | `text/markdown` | Cheat sheet of all 17 MCP tools and their input shapes |
 | `docs://errors` | `text/markdown` | Reference table of error codes returned by the server |
 | `docs://filters` | `text/markdown` | Guide for constructing filter objects (Eq/In/Like/Or/And) used by `list`, `alias_create`, and `row_materialize` |

@@ -8,8 +8,19 @@ use crate::schema::{FieldType, SchemaConfig};
 // Embedded static content
 // ---------------------------------------------------------------------------
 
-/// README.md embedded at compile time so it ships in the binary.
-pub const README: &str = include_str!("../../../../README.md");
+/// Agent quickstart embedded at compile time so it ships in the binary.
+///
+/// Served via the `docs://quickstart` MCP resource. Lives at
+/// `crates/mcp/QUICKSTART.md` (inside this crate's package root) so
+/// `cargo publish` finds it identically in the git tree and in the
+/// extracted package tarball.
+///
+/// This is intentionally **not** the workspace-root `README.md`. The
+/// workspace README is human-facing (build / releases / contribution
+/// instructions, ~36KB); this file is agent-facing (mode detection,
+/// first-call recipe, pointers to the other `docs://` resources, ~70
+/// lines).
+pub const QUICKSTART: &str = include_str!("../../QUICKSTART.md");
 
 /// Hand-written cheat sheet listing all 18 tools with descriptions / shapes.
 pub const TOOLS_DOC: &str = r#"# mini-app-mcp — Tools Reference
@@ -493,11 +504,37 @@ mod tests {
     }
 
     #[test]
-    fn readme_starts_with_heading() {
+    fn quickstart_starts_with_heading() {
         assert!(
-            README.starts_with("# mini-app-mcp"),
-            "README must start with '# mini-app-mcp'"
+            QUICKSTART.starts_with("# mini-app-mcp"),
+            "QUICKSTART must start with '# mini-app-mcp'"
         );
+    }
+
+    #[test]
+    fn quickstart_documents_mode_detection() {
+        assert!(
+            QUICKSTART.contains("Multi-table mode"),
+            "QUICKSTART must document Multi-table mode so agents know when `table` is required"
+        );
+        assert!(
+            QUICKSTART.contains("Legacy single-table mode"),
+            "QUICKSTART must document Legacy single-table mode"
+        );
+        assert!(
+            QUICKSTART.contains("TABLE_REQUIRED"),
+            "QUICKSTART must document the TABLE_REQUIRED error agents use to detect multi-table mode"
+        );
+    }
+
+    #[test]
+    fn quickstart_points_to_other_docs() {
+        for uri in &["docs://tools", "docs://errors", "docs://filters"] {
+            assert!(
+                QUICKSTART.contains(uri),
+                "QUICKSTART must point to '{uri}' so agents can discover the other documentation resources"
+            );
+        }
     }
 
     #[test]
