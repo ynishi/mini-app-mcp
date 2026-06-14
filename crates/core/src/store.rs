@@ -10,7 +10,7 @@
 /// from `schema.yaml` at the SQL level.  The `data` column stores a JSON
 /// blob; all field validation happens in application code via
 /// [`SchemaConfig::validate`].
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,6 +75,13 @@ pub enum UpdateMode {
 pub struct Store {
     conn: Arc<Mutex<rusqlite::Connection>>,
     schema: SchemaConfig,
+    /// Filesystem path of the SQLite database file backing this store.
+    ///
+    /// Captured at [`Store::open`] time and exposed via
+    /// [`Store::db_path`] for the multi-table aggregator path, which
+    /// uses `ATTACH DATABASE` to mount per-table `.db` files into a
+    /// shared in-memory connection.
+    db_path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +303,7 @@ impl Store {
             );
         }
 
+        let stored_db_path = db_path.to_path_buf();
         let db_path = db_path.to_path_buf();
         let conn =
             tokio::task::spawn_blocking(move || -> Result<rusqlite::Connection, MiniAppError> {
@@ -336,7 +344,18 @@ impl Store {
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
             schema,
+            db_path: stored_db_path,
         })
+    }
+
+    /// Returns the filesystem path of the SQLite database file backing
+    /// this store, as captured at [`Store::open`] time.
+    ///
+    /// Used by `mini_app_core::aggregator::execute_aggregate` to mount
+    /// each per-table `.db` file via `ATTACH DATABASE` for the
+    /// multi-table `UNION ALL` aggregation path (Crux #3).
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     /// Validate `value` against the schema and insert a new row with a

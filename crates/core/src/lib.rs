@@ -28,6 +28,14 @@ pub use store::UpdateMode;
 /// Server-side row filter for the `list` tool.
 pub mod filter;
 
+/// Multi-table aggregation primitives (`query_aggregate` tool backend).
+///
+/// Provides `AliasAggregator` (Count / Sum / Avg / Min / Max / GroupBy),
+/// `SourceSpec` (Single / Multi), `AliasRunResult` (Rows / Count / Value /
+/// Groups), and `execute_aggregate` for SQLite ATTACH DATABASE + UNION ALL
+/// composition across per-table `.db` files.
+pub mod aggregator;
+
 /// Multi-table registry + atomic reload (Arc-Swap based, K-110-compliant).
 pub mod registry;
 

@@ -77,6 +77,12 @@ pub mod codes {
     /// Returned when an id prefix matches more than one row and the caller
     /// must disambiguate by using a longer prefix or the full UUID.
     pub const AMBIGUOUS_ID: &str = "AMBIGUOUS_ID";
+    /// Returned when the `query_aggregate` tool receives a structurally
+    /// inconsistent request (empty sources, ATTACH-limit exceeded,
+    /// inner-without-group-by, etc.) — distinct from per-field validation
+    /// errors (those use `VALIDATION_ERROR`) and from raw SQLite failures
+    /// (those use `STORAGE_ERROR`).
+    pub const AGGREGATOR_ERROR: &str = "AGGREGATOR_ERROR";
 }
 
 /// All errors that can arise inside mini-app-core.
@@ -189,6 +195,11 @@ pub enum MiniAppError {
         id_prefix: String,
         candidates: Vec<String>,
     },
+
+    /// A structural inconsistency was detected in a `query_aggregate` request
+    /// (empty sources, ATTACH-limit exceeded, inner-without-group-by, etc.).
+    #[error("aggregator error: {0}")]
+    Aggregator(String),
 }
 
 impl MiniAppError {
@@ -221,6 +232,7 @@ impl MiniAppError {
             MiniAppError::AliasParamsRequired { .. } => codes::ALIAS_PARAMS_REQUIRED,
             MiniAppError::AliasTemplateError(_) => codes::ALIAS_TEMPLATE_ERROR,
             MiniAppError::AmbiguousId { .. } => codes::AMBIGUOUS_ID,
+            MiniAppError::Aggregator(_) => codes::AGGREGATOR_ERROR,
         }
     }
 }
@@ -346,6 +358,10 @@ mod tests {
                     id_prefix: "abc".into(),
                     candidates: vec!["abc-1".into(), "abc-2".into()],
                 },
+            ),
+            (
+                codes::AGGREGATOR_ERROR,
+                MiniAppError::Aggregator("empty sources".into()),
             ),
         ];
         for (expected_code, err) in cases {

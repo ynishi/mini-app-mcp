@@ -252,6 +252,39 @@ impl ListFilter {
             }
         }
     }
+
+    /// Build a parameterised SELECT statement for a single table that wraps
+    /// the WHERE fragment from [`build_sql`](Self::build_sql).
+    ///
+    /// Returns `(sql, params)` where `sql` has the shape:
+    /// `SELECT id, data, created_at, updated_at FROM <table> WHERE <fragment>`.
+    ///
+    /// This is a sibling method of [`build_sql`](Self::build_sql) — the
+    /// existing `build_sql` signature and return value are **completely
+    /// preserved** (Crux #1: build_sql table-arg refactor — adding a wrapper
+    /// instead of mutating the existing method). `build_subquery` is intended
+    /// for the multi-table aggregator path where each source table is rendered
+    /// as a separate SELECT sub-query combined with `UNION ALL`.
+    ///
+    /// `table` is **caller-validated**: it must be a schema-registered
+    /// identifier matching `[a-zA-Z_][a-zA-Z0-9_]*`. No SQL escaping is
+    /// performed here; callers (e.g. `execute_aggregate`) sanity-check the
+    /// table name before invocation. The DDL guarantees the `rows` table shape
+    /// so the projection list is fixed.
+    ///
+    /// # Errors
+    /// Returns [`MiniAppError::Validation`] if [`build_sql`](Self::build_sql)
+    /// propagates one (e.g. an `Array`/`Object`/`Null` filter value).
+    pub fn build_subquery(
+        &self,
+        table: &str,
+    ) -> Result<(String, Vec<FilterParam>), MiniAppError> {
+        let (where_fragment, params) = self.build_sql()?;
+        let sql = format!(
+            "SELECT id, data, created_at, updated_at FROM {table} WHERE {where_fragment}"
+        );
+        Ok((sql, params))
+    }
 }
 
 // ---------------------------------------------------------------------------
