@@ -1629,7 +1629,10 @@ impl MiniAppMcpServer {
             // backward compatibility.
             let mut aliases = global.alias_list().await.map_err(|e| e.to_string())?;
             if let Some(t) = params.table.as_deref() {
-                aliases.retain(|r| matches!(&r.sources, SourceSpec::Single(s) if s == t));
+                // Phase 2 fix: include Multi / Pattern aliases that
+                // reference `t` as well — the prior Single-only retain
+                // silently dropped them.
+                aliases.retain(|r| r.sources.includes_table(t));
             }
             let values: Vec<serde_json::Value> = aliases.iter().map(alias_record_to_json).collect();
             return serde_json::to_string(&values).map_err(|e| e.to_string());

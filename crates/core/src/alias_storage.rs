@@ -481,6 +481,13 @@ fn open_scope_db(dir: &Path) -> Result<(Arc<Mutex<rusqlite::Connection>>, PathBu
     std::fs::create_dir_all(dir)?;
     let db_path = dir.join("_global.db");
     let conn = rusqlite::Connection::open(&db_path)?;
+    // Enable WAL journal mode so concurrent connections to the same
+    // `_global.db` file (e.g. across `rebuild_registry` ArcSwap windows
+    // when the previous storage handle is still held by in-flight
+    // tasks) do not serialise on SQLITE_BUSY. Mirrors `Store::open`'s
+    // WAL setup for dual-registry safety. The PRAGMA returns a single
+    // "wal" row; rusqlite errors are propagated as `MiniAppError::Storage`.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(CREATE_GLOBAL_ALIASES_SQL)?;
     Ok((Arc::new(Mutex::new(conn)), db_path))
 }

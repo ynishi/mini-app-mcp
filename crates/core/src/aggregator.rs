@@ -107,6 +107,22 @@ impl SourceSpec {
         matches!(self, SourceSpec::Pattern(_))
     }
 
+    /// Returns `true` when this source spec covers `table` — `Single`
+    /// when the names match, `Multi` when the list contains `table`,
+    /// `Pattern` when the glob compiles and matches `table`. Used by
+    /// `alias_list({"table":"X"})` to keep Multi / Pattern aliases that
+    /// reference `X` visible (the older `SourceSpec::Single`-only
+    /// retain predicate silently dropped them).
+    pub fn includes_table(&self, table: &str) -> bool {
+        match self {
+            SourceSpec::Single(t) => t == table,
+            SourceSpec::Multi(v) => v.iter().any(|t| t == table),
+            SourceSpec::Pattern(p) => GlobMatcher::compile(p)
+                .map(|m| m.matches(table))
+                .unwrap_or(false),
+        }
+    }
+
     /// Resolves [`SourceSpec::Pattern`] against the supplied table-name
     /// list using a simple `*` glob (one segment, no `?` / `[]` support
     /// in Phase 2 — extension point reserved for a future revision).
@@ -1060,6 +1076,23 @@ mod tests {
                 .expect_err("unsupported metachar rejected");
             assert_eq!(err.code(), crate::error::codes::AGGREGATOR_ERROR);
         }
+    }
+
+    #[test]
+    fn source_spec_includes_table_single_multi_pattern() {
+        assert!(SourceSpec::Single("rows".into()).includes_table("rows"));
+        assert!(!SourceSpec::Single("rows".into()).includes_table("other"));
+        let multi = SourceSpec::Multi(vec!["a".into(), "b".into()]);
+        assert!(multi.includes_table("a"));
+        assert!(multi.includes_table("b"));
+        assert!(!multi.includes_table("c"));
+        let pat = SourceSpec::Pattern("shi_*".into());
+        assert!(pat.includes_table("shi_active_context"));
+        assert!(pat.includes_table("shi_trigger"));
+        assert!(!pat.includes_table("mia_brief"));
+        // Invalid pattern compiles to false (no panic).
+        let bad = SourceSpec::Pattern("shi_?".into());
+        assert!(!bad.includes_table("shi_x"));
     }
 
     #[test]
