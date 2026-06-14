@@ -595,6 +595,69 @@ alias_delete(table="notes", name="recent_open")
 
 Each table's `_aliases` storage is physically separate: aliases for `notes` live in `notes.db`, aliases for `issues` live in `issues.db`. There is no global alias namespace and no way for an alias operation to read or write aliases belonging to a different table.
 
+## Aggregation
+
+`query_aggregate` runs `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` / `GROUP BY` over one or many tables in a single tool call. Multi-table sources are joined with literal `UNION ALL` via SQLite `ATTACH DATABASE`, eliminating the N+1 round trips that result when callers fetch per-table rows and reduce client-side. The tool is read-only and idempotent.
+
+### Shape
+
+```jsonc
+{
+  "sources":   { "kind": "single", "value": "<table>" },          // or "multi" + ["t1","t2",...]
+  "filter":    null,                                              // optional, same ListFilter shape as `list`
+  "aggregator": { "kind": "count" }                               // or sum / avg / min / max / group_by
+}
+```
+
+Result is externally-tagged so callers can dispatch on `kind`:
+
+```jsonc
+{ "kind": "count",  "value": 42 }
+{ "kind": "value",  "value": 3.14 }
+{ "kind": "groups", "value": [ { "key": "a", "count": 12, "value": 7.0 }, ... ] }
+```
+
+### Single-source aggregation
+
+```jsonc
+// COUNT all rows in `emo`.
+{ "name": "query_aggregate", "arguments": {
+    "sources":    { "kind": "single", "value": "emo" },
+    "aggregator": { "kind": "count" }
+}}
+
+// SUM the `amount` field.
+{ "name": "query_aggregate", "arguments": {
+    "sources":    { "kind": "single", "value": "ledger" },
+    "aggregator": { "kind": "sum", "field": "amount" }
+}}
+```
+
+### Multi-table aggregation
+
+`Multi` mounts every backing `.db` file via SQLite `ATTACH DATABASE` (limit 10) and composes a `UNION ALL` between per-table sub-queries before applying the outer aggregate.
+
+```jsonc
+// COUNT rows across two same-shape tables.
+{ "name": "query_aggregate", "arguments": {
+    "sources":    { "kind": "multi", "value": ["events_a", "events_b"] },
+    "aggregator": { "kind": "count" }
+}}
+
+// GROUP BY tag with HAVING and an inner SUM(amount).
+{ "name": "query_aggregate", "arguments": {
+    "sources":    { "kind": "multi", "value": ["events_a", "events_b"] },
+    "aggregator": {
+        "kind":     "group_by",
+        "by_field": "tag",
+        "having":   { "type": "eq", "field": "tag", "value": "a" },
+        "inner":    { "kind": "sum", "field": "amount" }
+    }
+}}
+```
+
+Caller is responsible for ensuring all `Multi` sources share a compatible schema; per-table field validation is a Phase 2 carry. Aggregator-specific errors (empty sources, ATTACH-limit exceeded, nested `GroupBy`, non-UTF-8 db path) return `AGGREGATOR_ERROR` (`data.code`); unknown table names return `TABLE_NOT_FOUND`; field / identifier rejections return `VALIDATION_ERROR`.
+
 ## Storage notes
 
 SQLite databases are opened in WAL journal mode for safe concurrent access during `reload`. Sidecar files `<db>.db-wal` and `<db>.db-shm` are created next to each `.db` file — these are managed by SQLite and should not be deleted manually.

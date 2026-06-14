@@ -705,3 +705,215 @@ fn alias_parameterized_run_missing_params() {
         "expected 'requires params' in error text, got: {text:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// query_aggregate scenarios (Phase 1 MultiTableQuery Aggregate)
+//
+// Scenarios (h)-(l) per workspace/tasks/aggregator-phase-1/subtask-3.md:
+//   (h) Single source COUNT
+//   (i) Multi UNION ALL COUNT (Crux #3: UNION ALL, never JOIN)
+//   (j) Multi GROUP BY + HAVING + inner Sum (Crux #2: HAVING positioning)
+//   (k) Unknown table → TABLE_NOT_FOUND
+//   (l) Empty Multi → AGGREGATOR_ERROR
+// ---------------------------------------------------------------------------
+
+const AGG_SCHEMA: &str = "table: agg
+fields:
+  - name: text
+    type: string
+    required: true
+  - name: tag
+    type: string
+    required: false
+  - name: amount
+    type: number
+    required: false
+";
+
+struct AggLayout {
+    _tmp: TempDir,
+    user_dir: PathBuf,
+    project_dir: PathBuf,
+}
+
+/// Build a user-scope layout with one or more same-shape `agg*` tables so
+/// `query_aggregate` Multi can `ATTACH DATABASE` each backing `.db` file.
+fn make_agg_layout(extra_tables: &[&str]) -> AggLayout {
+    let tmp = TempDir::new().expect("tempdir");
+    let user_dir = tmp.path().join("user");
+    let project_dir = tmp.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    for name in std::iter::once("agg").chain(extra_tables.iter().copied()) {
+        let dir = user_dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Reuse the AGG_SCHEMA shape but rewrite the table name so every
+        // mounted table shares the same field set.
+        let schema = AGG_SCHEMA.replace("table: agg", &format!("table: {name}"));
+        std::fs::write(dir.join("schema.yaml"), schema).unwrap();
+    }
+    AggLayout {
+        _tmp: tmp,
+        user_dir,
+        project_dir,
+    }
+}
+
+fn create_agg_row(client: &mut McpClient, table: &str, tag: &str, amount: f64) {
+    let _ = client.call_tool(
+        "create",
+        json!({
+            "table": table,
+            "data": { "text": format!("row-{tag}-{amount}"), "tag": tag, "amount": amount }
+        }),
+    );
+}
+
+#[test]
+fn query_aggregate_single_count_returns_row_count() {
+    // (h) Single source COUNT.
+    let layout = make_agg_layout(&[]);
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+    create_agg_row(&mut client, "agg", "a", 1.0);
+    create_agg_row(&mut client, "agg", "b", 2.0);
+    create_agg_row(&mut client, "agg", "a", 3.0);
+    let result = client.call_tool(
+        "query_aggregate",
+        json!({
+            "sources": { "kind": "single", "value": "agg" },
+            "aggregator": { "kind": "count" }
+        }),
+    );
+    assert_eq!(result.get("kind").and_then(Value::as_str), Some("count"));
+    assert_eq!(result.get("value").and_then(Value::as_i64), Some(3));
+}
+
+#[test]
+fn query_aggregate_multi_count_returns_combined_total() {
+    // (i) Multi UNION ALL COUNT — Crux #3 verification.
+    // UNION ALL means rows-from-A + rows-from-B; a JOIN would yield A*B.
+    let layout = make_agg_layout(&["agg2"]);
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+    create_agg_row(&mut client, "agg", "x", 1.0);
+    create_agg_row(&mut client, "agg", "x", 2.0);
+    create_agg_row(&mut client, "agg2", "y", 10.0);
+    create_agg_row(&mut client, "agg2", "y", 20.0);
+    create_agg_row(&mut client, "agg2", "y", 30.0);
+    let result = client.call_tool(
+        "query_aggregate",
+        json!({
+            "sources": { "kind": "multi", "value": ["agg", "agg2"] },
+            "aggregator": { "kind": "count" }
+        }),
+    );
+    assert_eq!(result.get("kind").and_then(Value::as_str), Some("count"));
+    assert_eq!(
+        result.get("value").and_then(Value::as_i64),
+        Some(5),
+        "expected UNION ALL semantics (2+3=5), JOIN would have yielded 6"
+    );
+}
+
+#[test]
+fn query_aggregate_groupby_with_having_filters_groups() {
+    // (j) Multi GROUP BY + HAVING + inner Sum — Crux #2 verification.
+    let layout = make_agg_layout(&["agg2"]);
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+    create_agg_row(&mut client, "agg", "a", 5.0);
+    create_agg_row(&mut client, "agg", "a", 5.0);
+    create_agg_row(&mut client, "agg", "b", 1.0);
+    create_agg_row(&mut client, "agg2", "c", 4.0);
+    create_agg_row(&mut client, "agg2", "c", 6.0);
+    let result = client.call_tool(
+        "query_aggregate",
+        json!({
+            "sources": { "kind": "multi", "value": ["agg", "agg2"] },
+            "aggregator": {
+                "kind": "group_by",
+                "by_field": "tag",
+                "having": { "type": "eq", "field": "tag", "value": "a" },
+                "inner": { "kind": "sum", "field": "amount" }
+            }
+        }),
+    );
+    assert_eq!(result.get("kind").and_then(Value::as_str), Some("groups"));
+    let groups = result
+        .get("value")
+        .and_then(Value::as_array)
+        .expect("groups array");
+    assert_eq!(
+        groups.len(),
+        1,
+        "HAVING tag='a' should leave 1 group, got {groups:?}"
+    );
+    let g = &groups[0];
+    assert_eq!(g.get("key").and_then(Value::as_str), Some("a"));
+    assert_eq!(g.get("count").and_then(Value::as_i64), Some(2));
+    let inner = g
+        .get("value")
+        .and_then(Value::as_f64)
+        .expect("inner sum should be a number");
+    assert!(
+        (inner - 10.0).abs() < 1e-9,
+        "inner sum 5+5=10, got {inner}"
+    );
+}
+
+#[test]
+fn query_aggregate_unknown_table_returns_table_not_found() {
+    // (k) Unknown source name → TABLE_NOT_FOUND code in the structured error.
+    let layout = make_agg_layout(&[]);
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+    let id = client.next_id();
+    client.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "query_aggregate",
+            "arguments": {
+                "sources": { "kind": "single", "value": "no_such_table" },
+                "aggregator": { "kind": "count" }
+            }
+        }
+    }));
+    let resp = client.recv_for(id);
+    let text = resp
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        text.contains("TABLE_NOT_FOUND") || text.contains("table not found"),
+        "expected TABLE_NOT_FOUND in error text, got: {text:?}"
+    );
+}
+
+#[test]
+fn query_aggregate_empty_multi_returns_aggregator_error() {
+    // (l) Empty Multi sources → AGGREGATOR_ERROR.
+    let layout = make_agg_layout(&[]);
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+    let id = client.next_id();
+    client.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "query_aggregate",
+            "arguments": {
+                "sources": { "kind": "multi", "value": [] },
+                "aggregator": { "kind": "count" }
+            }
+        }
+    }));
+    let resp = client.recv_for(id);
+    let text = resp
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        text.contains("AGGREGATOR_ERROR")
+            || text.contains("aggregator error")
+            || text.contains("at least one"),
+        "expected AGGREGATOR_ERROR in error text, got: {text:?}"
+    );
+}
