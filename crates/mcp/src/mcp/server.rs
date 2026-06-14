@@ -1487,14 +1487,11 @@ impl MiniAppMcpServer {
         &self,
         Parameters(params): Parameters<AliasCreateParams>,
     ) -> Result<String, String> {
-        // Backward-compat: when `sources` is omitted, normalise the
-        // legacy `table` argument into `SourceSpec::Single(<table>)`.
-        // When neither is supplied we fall back to `resolve_table` (which
-        // either returns the legacy default table or surfaces
-        // TABLE_REQUIRED in multi-table mode).
-        let (store, schema) = self
-            .resolve_table(params.table.as_deref())
-            .map_err(|e| e.to_string())?;
+        // Resolve `sources` independently of `resolve_table` so callers
+        // can register Multi / Pattern aliases without a `table` arg
+        // (which would otherwise surface TABLE_REQUIRED in multi-table
+        // mode). `sources` + `table` are mutually exclusive — supplying
+        // both is an error so the chosen source is unambiguous.
         let sources = match (params.sources.clone(), params.table.clone()) {
             (Some(_), Some(_)) => {
                 return Err(
@@ -1503,19 +1500,52 @@ impl MiniAppMcpServer {
             }
             (Some(s), None) => s,
             (None, Some(t)) => SourceSpec::Single(t),
-            (None, None) => SourceSpec::Single(schema.table.clone()),
+            (None, None) => {
+                // Last-resort: legacy default table (single-table mode)
+                // or TABLE_REQUIRED (multi-table mode). The legacy path
+                // is preserved so existing alias_create calls without
+                // any source designator keep working.
+                let (_, schema) = self.resolve_table(None).map_err(|e| e.to_string())?;
+                SourceSpec::Single(schema.table.clone())
+            }
+        };
+
+        // Schema for filter validation: pick the first source table's
+        // schema (Pattern's empty tables() slice → defer to runtime;
+        // Phase 2 limitation, same as execute_aggregate's per-table
+        // schema assumption).
+        let first_table = sources.tables().first().cloned();
+        let validation_schema = match &first_table {
+            Some(t) => Some(
+                self.resolve_table(Some(t.as_str()))
+                    .map_err(|e| e.to_string())?
+                    .1,
+            ),
+            None => None,
+        };
+        // Legacy single-table mode fallback writes through the per-table
+        // store. We only need this handle when the global storage is
+        // unavailable and a concrete source table can be resolved
+        // (Pattern in legacy mode is rejected at runtime).
+        let legacy_store = match &first_table {
+            Some(t) => Some(
+                self.resolve_table(Some(t.as_str()))
+                    .map_err(|e| e.to_string())?
+                    .0,
+            ),
+            None => None,
         };
 
         let (filter_json, params_schema_json): (String, Option<String>) =
             match (params.filter, params.filter_template) {
                 (Some(f), None) => {
-                    // Conventional path: validate filter against schema, then serialize.
-                    f.validate(&schema).map_err(|e| e.to_string())?;
+                    if let Some(schema) = &validation_schema {
+                        f.validate(schema).map_err(|e| e.to_string())?;
+                    }
                     let json = serde_json::to_string(&f).map_err(|e| e.to_string())?;
                     (json, None)
                 }
                 (None, Some(tmpl)) => {
-                    // Template path: store template string verbatim; serialize params_schema.
                     let schema_json = params
                         .params_schema
                         .map(|s| serde_json::to_string(&s))
@@ -1532,7 +1562,6 @@ impl MiniAppMcpServer {
             };
 
         if let Some(global) = self.global_aliases_handle() {
-            // Phase 2 path: persist to project-scope `_global_aliases`.
             let record = AliasRecord::new(
                 &params.name,
                 sources,
@@ -1547,7 +1576,12 @@ impl MiniAppMcpServer {
                 .await
                 .map_err(|e| e.to_string())?;
         } else {
-            // Legacy single-table mode: keep using per-table `_aliases`.
+            // Legacy single-table mode: per-table `_aliases`. Pattern
+            // sources are rejected here because no concrete store is
+            // available to back them.
+            let store = legacy_store.ok_or_else(|| {
+                "Pattern sources are not supported in legacy single-table mode".to_string()
+            })?;
             store
                 .alias_create(
                     &params.name,
@@ -1662,12 +1696,11 @@ impl MiniAppMcpServer {
         &self,
         Parameters(params): Parameters<AliasRunParams>,
     ) -> Result<String, String> {
-        let (store, schema) = self
-            .resolve_table(params.table.as_deref())
-            .map_err(|e| e.to_string())?;
-
         // Phase 2: prefer global storage when available. Falls back to
-        // per-table store path for legacy single-table mode.
+        // per-table store path for legacy single-table mode. The
+        // per-table `store` / `schema` handles are resolved lazily
+        // *after* the alias record is loaded so Multi / Pattern aliases
+        // can be queried without a `table` arg.
         let global = self.global_aliases_handle();
         let (filter_text, default_limit, params_schema, sources, aggregator): (
             String,
@@ -1685,6 +1718,10 @@ impl MiniAppMcpServer {
                 rec.aggregator,
             )
         } else {
+            // Legacy single-table mode: per-table _aliases.
+            let (store, _) = self
+                .resolve_table(params.table.as_deref())
+                .map_err(|e| e.to_string())?;
             let rec = store
                 .alias_get(&params.name)
                 .await
@@ -1711,15 +1748,15 @@ impl MiniAppMcpServer {
             serde_json::from_str(&filter_text).map_err(|e| e.to_string())?
         };
 
-        filter.validate(&schema).map_err(|e| e.to_string())?;
         let limit = params.limit.or(default_limit);
         let offset = params.offset;
 
         // Aggregator path: dispatch to execute_aggregate when present.
         // Pattern sources are resolved against the live registry's table
         // list before execution (resolve_pattern is a no-op for
-        // Single/Multi). This is the alias_run-side companion to ST1a's
-        // SourceSpec::Pattern primitive.
+        // Single/Multi). The schema used for filter / aggregator
+        // validation is the first source table's schema (Phase 2
+        // per-table-schema-assumption, same as execute_aggregate).
         if let Some(agg) = aggregator {
             let registry = self.tables.load_full();
             let src = sources.expect("global path always produces sources");
@@ -1731,6 +1768,16 @@ impl MiniAppMcpServer {
             } else {
                 src
             };
+            let schema_table = resolved
+                .tables()
+                .first()
+                .cloned()
+                .ok_or_else(|| "alias sources resolved to zero tables".to_string())?;
+            let schema = self
+                .resolve_table(Some(schema_table.as_str()))
+                .map_err(|e| e.to_string())?
+                .1;
+            filter.validate(&schema).map_err(|e| e.to_string())?;
             let result = crate::aggregator::execute_aggregate(
                 &registry,
                 resolved,
@@ -1743,27 +1790,23 @@ impl MiniAppMcpServer {
             return serde_json::to_string(&result).map_err(|e| e.to_string());
         }
 
-        // Plain (Rows) path: per-table list. Multi/Pattern sources
-        // without an aggregator are not supported in Phase 2 — surface a
-        // structured error so callers know to add an aggregator.
-        if let Some(s) = &sources {
-            match s {
-                SourceSpec::Single(t) if t == &schema.table => {}
-                SourceSpec::Single(t) => {
-                    return Err(format!(
-                        "alias was created with sources=Single({t}) but resolved table is {} — \
-                         pass `table` argument matching the alias source",
-                        schema.table
-                    ));
-                }
-                SourceSpec::Multi(_) | SourceSpec::Pattern(_) => {
-                    return Err(
-                        "Multi/Pattern source aliases require an aggregator (Phase 2 limitation)"
-                            .to_string(),
-                    );
-                }
+        // Plain (Rows) path: resolve the per-table store from the alias
+        // sources (Single) or from the legacy `table` arg.
+        let (store, schema) = match &sources {
+            Some(SourceSpec::Single(t)) => self
+                .resolve_table(Some(t.as_str()))
+                .map_err(|e| e.to_string())?,
+            Some(SourceSpec::Multi(_)) | Some(SourceSpec::Pattern(_)) => {
+                return Err(
+                    "Multi/Pattern source aliases require an aggregator (Phase 2 limitation)"
+                        .to_string(),
+                );
             }
-        }
+            None => self
+                .resolve_table(params.table.as_deref())
+                .map_err(|e| e.to_string())?,
+        };
+        filter.validate(&schema).map_err(|e| e.to_string())?;
         let records = store
             .list(limit, offset, Some(filter))
             .await

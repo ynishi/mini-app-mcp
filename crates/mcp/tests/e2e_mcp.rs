@@ -884,6 +884,154 @@ fn query_aggregate_unknown_table_returns_table_not_found() {
     );
 }
 
+// =============================================================================
+// Phase 2 — Global Alias e2e (Multi / Pattern sources via alias_run)
+// =============================================================================
+
+/// alias_create with Multi sources + Count aggregator, then alias_run
+/// dispatches to execute_aggregate and returns the combined count.
+#[test]
+fn alias_create_multi_sources_with_count_aggregator_round_trip() {
+    let layout = make_agg_layout(&["agg2"]);
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+    create_agg_row(&mut client, "agg", "x", 1.0);
+    create_agg_row(&mut client, "agg", "x", 2.0);
+    create_agg_row(&mut client, "agg2", "y", 10.0);
+    create_agg_row(&mut client, "agg2", "y", 20.0);
+    create_agg_row(&mut client, "agg2", "y", 30.0);
+
+    // Register a global alias spanning two tables with a Count aggregator.
+    // No `table` argument — `sources` is the Phase 2 surface.
+    let created = client.call_tool(
+        "alias_create",
+        json!({
+            "name": "agg_combined_count",
+            "sources": { "kind": "multi", "value": ["agg", "agg2"] },
+            "aggregator": { "kind": "count" },
+            "filter": { "type": "like", "field": "tag", "pattern": "%" },
+            "description": "combined count across agg + agg2"
+        }),
+    );
+    assert_eq!(
+        created.get("created").and_then(Value::as_str),
+        Some("agg_combined_count")
+    );
+
+    // alias_run must dispatch to execute_aggregate and return Count(5).
+    let result = client.call_tool("alias_run", json!({ "name": "agg_combined_count" }));
+    assert_eq!(result.get("kind").and_then(Value::as_str), Some("count"));
+    assert_eq!(
+        result.get("value").and_then(Value::as_i64),
+        Some(5),
+        "Multi UNION ALL (2+3=5) via alias_run + execute_aggregate, got {result:?}"
+    );
+}
+
+/// alias_create with Pattern sources + Count aggregator, then alias_run
+/// resolves the glob against the live registry's mounted table list
+/// (`agg` + `agg2` → Multi(\[agg, agg2\])) before dispatching to
+/// execute_aggregate.
+#[test]
+fn alias_create_pattern_sources_resolves_at_alias_run() {
+    let layout = make_agg_layout(&["agg2"]);
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+    create_agg_row(&mut client, "agg", "p", 1.0);
+    create_agg_row(&mut client, "agg2", "p", 2.0);
+    create_agg_row(&mut client, "agg2", "p", 3.0);
+
+    let created = client.call_tool(
+        "alias_create",
+        json!({
+            "name": "agg_glob_count",
+            "sources": { "kind": "pattern", "value": "agg*" },
+            "aggregator": { "kind": "count" },
+            "filter": { "type": "like", "field": "tag", "pattern": "%" }
+        }),
+    );
+    assert_eq!(
+        created.get("created").and_then(Value::as_str),
+        Some("agg_glob_count")
+    );
+
+    let result = client.call_tool("alias_run", json!({ "name": "agg_glob_count" }));
+    assert_eq!(result.get("kind").and_then(Value::as_str), Some("count"));
+    assert_eq!(
+        result.get("value").and_then(Value::as_i64),
+        Some(3),
+        "Pattern 'agg*' must resolve to [agg, agg2] and count 1+2=3, got {result:?}"
+    );
+}
+
+/// alias_create with Pattern sources that match zero mounted tables
+/// must surface AGGREGATOR_ERROR at alias_run time (the registry-side
+/// resolution failure is not deferred to ATTACH DATABASE).
+#[test]
+fn alias_run_pattern_zero_match_returns_aggregator_error() {
+    let layout = make_agg_layout(&[]);
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+    client.call_tool(
+        "alias_create",
+        json!({
+            "name": "no_match",
+            "sources": { "kind": "pattern", "value": "zzz_*" },
+            "aggregator": { "kind": "count" },
+            "filter": { "type": "like", "field": "tag", "pattern": "%" }
+        }),
+    );
+
+    let id = client.next_id();
+    client.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "alias_run",
+            "arguments": { "name": "no_match" }
+        }
+    }));
+    let resp = client.recv_for(id);
+    let text = resp
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        text.contains("AGGREGATOR_ERROR") || text.contains("matched zero tables"),
+        "expected AGGREGATOR_ERROR for zero-match Pattern, got: {text:?}"
+    );
+}
+
+/// `sources` and the legacy `table` argument are mutually exclusive on
+/// `alias_create`; supplying both must return a structured error.
+#[test]
+fn alias_create_with_both_sources_and_table_is_rejected() {
+    let layout = make_agg_layout(&[]);
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+    let id = client.next_id();
+    client.send_line(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "alias_create",
+            "arguments": {
+                "name": "conflict",
+                "table": "agg",
+                "sources": { "kind": "single", "value": "agg" },
+                "filter": { "type": "like", "field": "tag", "pattern": "%" }
+            }
+        }
+    }));
+    let resp = client.recv_for(id);
+    let text = resp
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        text.contains("mutually exclusive") || text.contains("sources"),
+        "expected mutually-exclusive error, got: {text:?}"
+    );
+}
+
 #[test]
 fn query_aggregate_empty_multi_returns_aggregator_error() {
     // (l) Empty Multi sources → AGGREGATOR_ERROR.

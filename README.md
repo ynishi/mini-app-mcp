@@ -658,6 +658,66 @@ Result is externally-tagged so callers can dispatch on `kind`:
 
 Caller is responsible for ensuring all `Multi` sources share a compatible schema; per-table field validation is a Phase 2 carry. Aggregator-specific errors (empty sources, ATTACH-limit exceeded, nested `GroupBy`, non-UTF-8 db path) return `AGGREGATOR_ERROR` (`data.code`); unknown table names return `TABLE_NOT_FOUND`; field / identifier rejections return `VALIDATION_ERROR`.
 
+## Global Alias (Phase 2)
+
+Phase 2 unifies aliases across tables in a single global storage
+(`<project_dir>/_global.db` + `<user_dir>/_global.db`, with lookup
+precedence Project → User). The `alias_create` MCP tool accepts new
+optional `sources` and `aggregator` arguments so one alias can span
+multiple tables and stored aggregate logic:
+
+```jsonc
+// Multi-table alias with COUNT aggregator (replays via execute_aggregate).
+{ "name": "alias_create", "arguments": {
+    "name":       "combined_events_count",
+    "sources":    { "kind": "multi", "value": ["events_a", "events_b"] },
+    "aggregator": { "kind": "count" },
+    "filter":     { "type": "like", "field": "tag", "pattern": "%" }
+}}
+
+// Pattern source — resolved against the live registry's table list at
+// alias_run time. Matches all currently-mounted `events_*` tables.
+{ "name": "alias_create", "arguments": {
+    "name":       "all_events_count",
+    "sources":    { "kind": "pattern", "value": "events_*" },
+    "aggregator": { "kind": "count" },
+    "filter":     { "type": "like", "field": "tag", "pattern": "%" }
+}}
+
+// alias_run dispatches to execute_aggregate transparently.
+{ "name": "alias_run", "arguments": { "name": "all_events_count" } }
+// → { "kind": "count", "value": <sum across all events_* tables> }
+```
+
+The legacy `table` argument is still accepted and is silently
+normalised to `sources = { "kind": "single", "value": "<table>" }`;
+specifying both `table` and `sources` is an error.
+
+**Migration**: existing per-table `_aliases` rows are copied into the
+project-scope `_global_aliases` automatically on every
+`TableRegistry::mount_from_dirs` call. The migration is lossless
+(all five legacy fields preserved + `sources = Single(<table>)` filled
+in) and idempotent (`INSERT OR IGNORE` skips collisions), so it is safe
+to run on every server restart. Per-table `_aliases` tables are not
+deleted, preserving a rollback path until a future minor release.
+
+**Phase 2 limitations**
+
+- `Multi` / `Pattern` source aliases require an `aggregator`; running
+  them without one returns a structured error (the per-table `list`
+  path cannot serve cross-table rows).
+- Pattern glob supports `*` only (one or more); `?` / `[]` are reserved
+  for a future revision.
+- Pattern matching that resolves to zero tables returns
+  `AGGREGATOR_ERROR` at `alias_run` time (early surface — does not
+  defer to `ATTACH DATABASE`).
+- Filter validation uses the schema of the first source table only;
+  cross-table schema divergence is the caller's responsibility (same
+  constraint as `query_aggregate`).
+- Legacy single-table mode (no `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR`)
+  falls back to the per-table `Store::alias_*` path; `Pattern` sources
+  are rejected in this mode.
+
 ## Storage notes
 
 SQLite databases are opened in WAL journal mode for safe concurrent access during `reload`. Sidecar files `<db>.db-wal` and `<db>.db-shm` are created next to each `.db` file — these are managed by SQLite and should not be deleted manually.
