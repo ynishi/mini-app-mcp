@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.11.0] - 2026-06-14
+
 ### Added (Phase 2 — Global Alias)
 
 - **`GlobalAliasStorage`** (`crates/core/src/alias_storage.rs`) — Phase 2 single-source-of-truth for named queries that span Single / Multi / Pattern table sources. Persists records in a dedicated `_global.db` SQLite file in each of the Project (`<project_dir>/_global.db`) and User (`<user_dir>/_global.db`) scope directories, with lookup precedence **Project → User** on name collisions. Holds at most two `Arc<Mutex<rusqlite::Connection>>` handles (one per scope, both `Send + Sync`-safe inside `spawn_blocking`). `alias_create(scope, record)` writes to the chosen scope; `alias_get(name)` resolves Project first then falls back to User; `alias_list()` returns the union sorted ascending with Project entries overwriting User collisions; `alias_delete(scope, name)` removes from the named scope.

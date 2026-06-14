@@ -1,12 +1,12 @@
 [package]
 name = "mini-app-core"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-authors = ["Yutaka Nishimura"]
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
 description = "Agent-First CRUD store core library — schema.yaml driven, SQLite backend (transport-agnostic)"
-repository = "https://github.com/ynishi/mini-app-mcp"
+repository.workspace = true
 readme = "CHANGELOG.md"
 keywords = ["sqlite", "agent", "crud", "schema", "yaml"]
 categories = ["database", "data-structures"]
