@@ -391,30 +391,31 @@ impl GlobalAliasStorage {
     }
 
     /// Lossless, idempotent migration of legacy per-table `_aliases` rows
-    /// into the project-scope `_global_aliases`.
+    /// into a chosen scope's `_global_aliases`.
     ///
     /// For each `(table_name, per_table_conn)` pair, every row from
     /// the per-table `_aliases` table is loaded and inserted into
-    /// project storage with `sources = Single(<table_name>)` and
-    /// `aggregator = None`. Rows whose `name` already exists in project
-    /// storage are skipped (`INSERT OR IGNORE`), so the migration may
+    /// `target_scope` storage with `sources = Single(<table_name>)` and
+    /// `aggregator = None`. Rows whose `name` already exists in that
+    /// scope are skipped (`INSERT OR IGNORE`), so the migration may
     /// safely run on every registry open.
     ///
-    /// Returns the number of rows newly written to project storage
-    /// (skipped collisions are not counted).
+    /// Returns the number of rows newly written (skipped collisions are
+    /// not counted).
     ///
     /// # Errors
-    /// - [`MiniAppError::Config`] when project storage is unmounted.
+    /// - [`MiniAppError::Config`] when `target_scope` is unmounted.
     /// - [`MiniAppError::Storage`] on rusqlite failure (per-table read
-    ///   or project insert).
+    ///   or destination insert).
     pub async fn migrate_from_per_table(
         &self,
+        target_scope: AliasScope,
         per_table: Vec<(String, Arc<Mutex<rusqlite::Connection>>)>,
     ) -> Result<usize, MiniAppError> {
-        let project = self.project_conn.as_ref().map(Arc::clone).ok_or_else(|| {
-            MiniAppError::Config(
-                "GlobalAliasStorage::migrate_from_per_table requires project scope".into(),
-            )
+        let dest = self.conn_for_scope(target_scope).map_err(|_| {
+            MiniAppError::Config(format!(
+                "GlobalAliasStorage::migrate_from_per_table requires {target_scope:?} scope to be mounted"
+            ))
         })?;
         tokio::task::spawn_blocking(move || -> Result<usize, MiniAppError> {
             let mut migrated = 0usize;
@@ -447,7 +448,7 @@ impl GlobalAliasStorage {
                         "serialise Single source for table '{table_name}' during migration: {e}"
                     ))
                 })?;
-                let dst = project
+                let dst = dest
                     .lock()
                     .map_err(|_| MiniAppError::Schema("dest mutex poisoned".into()))?;
                 for (name, filter, default_limit, description, params_schema) in rows {
@@ -821,10 +822,13 @@ mod tests {
 
         let storage = GlobalAliasStorage::open_in_memory().unwrap();
         let migrated = storage
-            .migrate_from_per_table(vec![
-                ("table_a".to_string(), Arc::new(Mutex::new(conn_a))),
-                ("table_b".to_string(), Arc::new(Mutex::new(conn_b))),
-            ])
+            .migrate_from_per_table(
+                AliasScope::Project,
+                vec![
+                    ("table_a".to_string(), Arc::new(Mutex::new(conn_a))),
+                    ("table_b".to_string(), Arc::new(Mutex::new(conn_b))),
+                ],
+            )
             .await
             .unwrap();
         assert_eq!(migrated, 3);
@@ -869,11 +873,17 @@ mod tests {
 
         let storage = GlobalAliasStorage::open_in_memory().unwrap();
         let first = storage
-            .migrate_from_per_table(vec![("t".to_string(), Arc::clone(&conn_arc))])
+            .migrate_from_per_table(
+                AliasScope::Project,
+                vec![("t".to_string(), Arc::clone(&conn_arc))],
+            )
             .await
             .unwrap();
         let second = storage
-            .migrate_from_per_table(vec![("t".to_string(), Arc::clone(&conn_arc))])
+            .migrate_from_per_table(
+                AliasScope::Project,
+                vec![("t".to_string(), Arc::clone(&conn_arc))],
+            )
             .await
             .unwrap();
         assert_eq!(first, 1);
@@ -910,10 +920,10 @@ mod tests {
         )
         .unwrap();
         let migrated = storage
-            .migrate_from_per_table(vec![(
-                "ignored_table".to_string(),
-                Arc::new(Mutex::new(conn)),
-            )])
+            .migrate_from_per_table(
+                AliasScope::Project,
+                vec![("ignored_table".to_string(), Arc::new(Mutex::new(conn)))],
+            )
             .await
             .unwrap();
         assert_eq!(migrated, 0);

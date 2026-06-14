@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::alias_storage::GlobalAliasStorage;
 use crate::error::MiniAppError;
 use crate::schema::{self, SchemaConfig};
 use crate::store::Store;
@@ -58,6 +59,11 @@ pub struct TableRegistry {
     entries: HashMap<String, TableEntry>,
     /// The default table name, set only in legacy single-table mode.
     default_table: Option<String>,
+    /// Global alias storage (Phase 2). `None` in legacy single-table mode
+    /// where no `user_dir` / `project_dir` is available. Holds the
+    /// Project + User scope `_global.db` handles, lookup precedence
+    /// Project → User.
+    global_aliases: Option<Arc<GlobalAliasStorage>>,
 }
 
 impl TableRegistry {
@@ -107,9 +113,20 @@ impl TableRegistry {
             scan_and_mount(dir, &mut entries).await?;
         }
 
+        // Phase 2 (alias_storage): open global `_global.db` in both
+        // Project and User scopes, then run a lossless + idempotent
+        // migration of any legacy per-table `_aliases` rows into
+        // project-scope `_global_aliases`. The per-table `_aliases`
+        // SQLite tables are left untouched so existing
+        // `Store::alias_*` callers keep working (full removal lands
+        // with the MCP-tool switchover in a later ST).
+        let global_aliases =
+            open_and_migrate_global_aliases(project_dir, user_dir, &entries).await?;
+
         Ok(TableRegistry {
             entries,
             default_table: None,
+            global_aliases,
         })
     }
 
@@ -151,6 +168,7 @@ impl TableRegistry {
         Ok(TableRegistry {
             entries,
             default_table: Some(table_name),
+            global_aliases: None,
         })
     }
 
@@ -226,6 +244,18 @@ impl TableRegistry {
         self.entries.keys().map(|k| k.as_str())
     }
 
+    /// Returns the global alias storage handle if available.
+    ///
+    /// `Some` when this registry was built via
+    /// [`TableRegistry::mount_from_dirs`] with at least one of
+    /// `user_dir` / `project_dir` populated (Phase 2 multi-table mode).
+    /// `None` in legacy single-table mode and in test-only
+    /// [`TableRegistry::from_entries`] / [`TableRegistry::from_single`]
+    /// constructors.
+    pub fn global_aliases(&self) -> Option<&Arc<GlobalAliasStorage>> {
+        self.global_aliases.as_ref()
+    }
+
     /// Returns an immutable reference to the entries map.
     ///
     /// Provides read-only access to all mounted [`TableEntry`] values, keyed by
@@ -256,6 +286,7 @@ impl TableRegistry {
         TableRegistry {
             entries,
             default_table,
+            global_aliases: None,
         }
     }
 
@@ -286,6 +317,7 @@ impl TableRegistry {
         TableRegistry {
             entries,
             default_table: Some(table_name),
+            global_aliases: None,
         }
     }
 
@@ -339,6 +371,66 @@ impl TableRegistry {
 // =============================================================================
 // Private helpers
 // =============================================================================
+
+/// Open the Phase 2 global alias storage (`_global.db` in project + user
+/// scopes) and migrate any legacy per-table `_aliases` rows into the
+/// project-scope `_global_aliases` (lossless + idempotent).
+///
+/// Returns `Ok(None)` when both `project_dir` and `user_dir` are `None`
+/// (e.g. legacy single-table mode) or when neither directory exists yet
+/// (`GlobalAliasStorage::open` would otherwise be invoked with no scopes
+/// to mount).
+///
+/// The per-table `_aliases` SQLite tables are not modified by this
+/// helper; rows are read and copied. Full removal of the per-table
+/// tables happens in a later ST once the MCP `alias_*` tools are
+/// switched over.
+async fn open_and_migrate_global_aliases(
+    project_dir: Option<&Path>,
+    user_dir: Option<&Path>,
+    entries: &HashMap<String, TableEntry>,
+) -> Result<Option<Arc<GlobalAliasStorage>>, MiniAppError> {
+    // Honour the same "missing dir = skip with warn" policy as
+    // scan_and_mount (registry test invariant): only pass through dirs
+    // that actually exist on disk so GlobalAliasStorage::open does not
+    // try to create_dir_all on a read-only / inaccessible parent.
+    let project_dir = project_dir.filter(|p| p.exists());
+    let user_dir = user_dir.filter(|p| p.exists());
+    if project_dir.is_none() && user_dir.is_none() {
+        return Ok(None);
+    }
+    let storage = GlobalAliasStorage::open(project_dir, user_dir)?;
+    // Pick migration destination: prefer Project scope when mounted,
+    // else fall back to User scope (the only scope present).
+    let target_scope = if project_dir.is_some() {
+        crate::alias_storage::AliasScope::Project
+    } else {
+        crate::alias_storage::AliasScope::User
+    };
+    // Collect (table_name, per-table conn) pairs. We migrate from every
+    // mounted store unconditionally; rows already present in the target
+    // scope are silently skipped by INSERT OR IGNORE so the call is
+    // idempotent across registry rebuilds.
+    let per_table: Vec<(String, Arc<std::sync::Mutex<rusqlite::Connection>>)> = entries
+        .iter()
+        .map(|(name, entry)| (name.clone(), entry.store.conn()))
+        .collect();
+    if !per_table.is_empty() {
+        // Best-effort: log the migrated row count for observability but
+        // do not surface it through the registry API.
+        let migrated = storage
+            .migrate_from_per_table(target_scope, per_table)
+            .await?;
+        if migrated > 0 {
+            tracing::info!(
+                migrated_rows = migrated,
+                scope = ?target_scope,
+                "migrated legacy per-table _aliases rows into _global_aliases"
+            );
+        }
+    }
+    Ok(Some(Arc::new(storage)))
+}
 
 /// Scan `dir` for table subdirectories and mount each into `entries`.
 ///
@@ -772,4 +864,111 @@ mod tests {
     // (rmcp-dependent variant→McpError conversion tests live in
     // `crates/mcp/src/error_conv.rs` to honor the one-way `mcp → core` dep
     // boundary, Outline rust book §5-1-10 K-orphan-rule.)
+
+    // ── Phase 2 (ST1b): global alias storage integration ─────────────────
+
+    // mount_from_dirs opens GlobalAliasStorage and exposes it via the
+    // global_aliases() accessor.
+    #[tokio::test]
+    async fn mount_from_dirs_attaches_global_alias_storage() {
+        let user_dir = TempDir::new().expect("tempdir");
+        create_table_dir(
+            &user_dir,
+            "rows",
+            "  - name: f\n    type: string\n    required: false\n",
+        );
+        let registry = TableRegistry::mount_from_dirs(Some(user_dir.path()), None)
+            .await
+            .expect("mount must succeed");
+        assert!(
+            registry.global_aliases().is_some(),
+            "mount_from_dirs with user_dir must attach GlobalAliasStorage"
+        );
+    }
+
+    // mount_from_dirs(None, None) → no global alias storage.
+    #[tokio::test]
+    async fn mount_from_dirs_without_any_dir_has_no_global_alias_storage() {
+        let registry = TableRegistry::mount_from_dirs(None, None)
+            .await
+            .expect("mount must succeed even with no dirs");
+        assert!(
+            registry.global_aliases().is_none(),
+            "mount_from_dirs(None, None) must not attach GlobalAliasStorage"
+        );
+    }
+
+    // Legacy single-table mode does not own a global alias storage.
+    #[tokio::test]
+    async fn mount_legacy_has_no_global_alias_storage() {
+        let dir = TempDir::new().expect("tempdir");
+        let schema_path = dir.path().join("schema.yaml");
+        std::fs::write(
+            &schema_path,
+            "table: notes\nfields:\n  - name: title\n    type: string\n    required: true\n",
+        )
+        .expect("write schema");
+        let db_path = dir.path().join("notes.db");
+        let registry = TableRegistry::mount_legacy(&schema_path, &db_path)
+            .await
+            .expect("mount_legacy must succeed");
+        assert!(
+            registry.global_aliases().is_none(),
+            "mount_legacy must not attach GlobalAliasStorage"
+        );
+    }
+
+    // mount_from_dirs auto-migrates any pre-existing per-table _aliases
+    // rows into the project-scope _global_aliases (lossless, the rows
+    // become visible through alias_list with sources=Single(<table>)).
+    #[tokio::test]
+    async fn mount_from_dirs_auto_migrates_per_table_aliases() {
+        use crate::alias_storage::LEGACY_PER_TABLE_ALIASES_SQL;
+
+        let project_dir = TempDir::new().expect("tempdir");
+        let table_dir = create_table_dir(
+            &project_dir,
+            "rows",
+            "  - name: f\n    type: string\n    required: false\n",
+        );
+
+        // Pre-create the rows.db with a legacy _aliases row before mount
+        // so the auto-migration sees something to copy.
+        let db_path = table_dir.join("rows.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open per-table db");
+        conn.execute_batch(LEGACY_PER_TABLE_ALIASES_SQL)
+            .expect("create _aliases");
+        conn.execute(
+            "INSERT INTO _aliases (name, filter, default_limit, description, params_schema) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "legacy_alias",
+                "{}",
+                Some(10i64),
+                Some("preserved".to_string()),
+                Option::<String>::None
+            ],
+        )
+        .expect("seed legacy alias");
+        drop(conn);
+
+        let registry = TableRegistry::mount_from_dirs(None, Some(project_dir.path()))
+            .await
+            .expect("mount must succeed");
+        let global = registry
+            .global_aliases()
+            .expect("global storage must be attached");
+        let all = global.alias_list().await.expect("alias_list");
+        assert_eq!(all.len(), 1, "exactly one alias should be migrated");
+        let rec = &all[0];
+        assert_eq!(rec.name, "legacy_alias");
+        assert!(
+            matches!(&rec.sources, crate::aggregator::SourceSpec::Single(t) if t == "rows"),
+            "migrated row must have sources=Single(rows), got {:?}",
+            rec.sources
+        );
+        assert!(rec.aggregator.is_none());
+        assert_eq!(rec.default_limit, Some(10));
+        assert_eq!(rec.description.as_deref(), Some("preserved"));
+    }
 }

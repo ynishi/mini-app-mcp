@@ -358,6 +358,18 @@ impl Store {
         &self.db_path
     }
 
+    /// Returns a clone of the [`Arc<Mutex<rusqlite::Connection>>`]
+    /// handle backing this store. Used by
+    /// [`crate::alias_storage::GlobalAliasStorage::migrate_from_per_table`]
+    /// to read the legacy per-table `_aliases` rows on registry mount.
+    ///
+    /// The connection is shared (no copy); callers MUST acquire the
+    /// `Mutex` lock inside a `spawn_blocking` body to avoid blocking the
+    /// async runtime.
+    pub fn conn(&self) -> Arc<Mutex<rusqlite::Connection>> {
+        Arc::clone(&self.conn)
+    }
+
     /// Validate `value` against the schema and insert a new row with a
     /// generated UUID primary key.
     ///
