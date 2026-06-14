@@ -7,6 +7,9 @@ authors = ["Yutaka Nishimura"]
 license = "MIT OR Apache-2.0"
 description = "Agent-First CRUD store core library — schema.yaml driven, SQLite backend (transport-agnostic)"
 repository = "https://github.com/ynishi/mini-app-mcp"
+readme = "CHANGELOG.md"
+keywords = ["sqlite", "agent", "crud", "schema", "yaml"]
+categories = ["database", "data-structures"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }

@@ -403,20 +403,26 @@ impl MiniAppMcpServer {
 
         let contents = match base_uri {
             URI_SCHEMA_YAML => {
-                let entry = registry.resolve(table_query).map_err(crate::miniapp_error_to_mcp_error)?;
+                let entry = registry
+                    .resolve(table_query)
+                    .map_err(crate::miniapp_error_to_mcp_error)?;
                 let text = std::fs::read_to_string(entry.schema_path.as_ref()).map_err(|e| {
                     McpError::internal_error(format!("failed to read schema.yaml: {e}"), None)
                 })?;
                 ResourceContents::text(text, uri).with_mime_type("application/yaml")
             }
             URI_SCHEMA_JSON => {
-                let entry = registry.resolve(table_query).map_err(crate::miniapp_error_to_mcp_error)?;
+                let entry = registry
+                    .resolve(table_query)
+                    .map_err(crate::miniapp_error_to_mcp_error)?;
                 let text = serde_json::to_string_pretty(entry.schema.as_ref())
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 ResourceContents::text(text, uri).with_mime_type("application/json")
             }
             URI_SCHEMA_JSON_SCHEMA => {
-                let entry = registry.resolve(table_query).map_err(crate::miniapp_error_to_mcp_error)?;
+                let entry = registry
+                    .resolve(table_query)
+                    .map_err(crate::miniapp_error_to_mcp_error)?;
                 let js = res::derive_json_schema(entry.schema.as_ref());
                 let text = serde_json::to_string_pretty(&js)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;

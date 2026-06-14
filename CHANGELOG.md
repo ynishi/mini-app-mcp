@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Workspace split** (commit `bb2a208`) — the single `mini-app-mcp` crate has been split into a 2-crate workspace: `mini-app-core` (lib, v0.1.0) carries the transport-agnostic DB layer (`schema` / `error` / `config` / `store` / `filter` / `materialize` / `dump` / `backup` / `snapshot` / `registry`), and `mini-app-mcp` (bin) re-exports the same module paths and provides the MCP stdio transport. Existing callers using `mini_app_mcp::{schema, error, store, ...}` continue to compile without path changes via re-exports in `crates/mcp/src/lib.rs`. `mini-app-core` carries zero `rmcp` dependency (one-way `mcp → core` boundary); `rmcp::ErrorData` conversion lives in `crates/mcp/src/error_conv.rs` as a `pub(crate) fn miniapp_error_to_mcp_error` ACL adapter (Outline rust book §5-1-10 K-orphan-rule pattern). The `mini-app-mcp` binary version remains `0.10.0` on this branch; the workspace-split-aware binary will ship as the next patch / minor release.
+
 ## [0.10.0] - 2026-05-27
 
 ### Added
