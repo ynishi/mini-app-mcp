@@ -11,6 +11,7 @@
 //! existing integration tests continue to compile without path rewrites.
 
 pub use mini_app_core::aggregator;
+pub use mini_app_core::alias_storage;
 pub use mini_app_core::backup;
 pub use mini_app_core::config;
 pub use mini_app_core::dump;

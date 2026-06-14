@@ -275,14 +275,10 @@ impl ListFilter {
     /// # Errors
     /// Returns [`MiniAppError::Validation`] if [`build_sql`](Self::build_sql)
     /// propagates one (e.g. an `Array`/`Object`/`Null` filter value).
-    pub fn build_subquery(
-        &self,
-        table: &str,
-    ) -> Result<(String, Vec<FilterParam>), MiniAppError> {
+    pub fn build_subquery(&self, table: &str) -> Result<(String, Vec<FilterParam>), MiniAppError> {
         let (where_fragment, params) = self.build_sql()?;
-        let sql = format!(
-            "SELECT id, data, created_at, updated_at FROM {table} WHERE {where_fragment}"
-        );
+        let sql =
+            format!("SELECT id, data, created_at, updated_at FROM {table} WHERE {where_fragment}");
         Ok((sql, params))
     }
 }

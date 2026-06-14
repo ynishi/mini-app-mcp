@@ -852,10 +852,7 @@ fn query_aggregate_groupby_with_having_filters_groups() {
         .get("value")
         .and_then(Value::as_f64)
         .expect("inner sum should be a number");
-    assert!(
-        (inner - 10.0).abs() < 1e-9,
-        "inner sum 5+5=10, got {inner}"
-    );
+    assert!((inner - 10.0).abs() < 1e-9, "inner sum 5+5=10, got {inner}");
 }
 
 #[test]

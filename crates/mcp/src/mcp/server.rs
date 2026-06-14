@@ -41,6 +41,8 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::aggregator::{AliasAggregator, SourceSpec};
+use crate::alias_storage::{AliasRecord, AliasScope, GlobalAliasStorage};
 use crate::config::Config;
 use crate::error::MiniAppError;
 use crate::filter::ListFilter;
@@ -215,6 +217,35 @@ impl MiniAppMcpServer {
         };
         Ok(entry_arc)
     }
+
+    /// Returns an owned clone of the current registry's global alias
+    /// storage handle when available (multi-table mode). `None` in
+    /// legacy single-table mode so the alias_* tools can fall back to
+    /// per-table `_aliases`.
+    fn global_aliases_handle(&self) -> Option<Arc<GlobalAliasStorage>> {
+        self.tables.load().global_aliases().map(Arc::clone)
+    }
+}
+
+/// Serialise a Phase 2 [`AliasRecord`] (alias_storage variant) into the
+/// JSON shape returned by `alias_list`. Manual mapping because
+/// `AliasRecord` does not derive `Serialize` (it owns the un-serialised
+/// `SourceSpec` / `AliasAggregator` enums + a `scope: Option<AliasScope>`
+/// field).
+fn alias_record_to_json(r: &AliasRecord) -> serde_json::Value {
+    serde_json::json!({
+        "name": r.name,
+        "sources": r.sources,
+        "aggregator": r.aggregator,
+        "filter": r.filter,
+        "default_limit": r.default_limit,
+        "description": r.description,
+        "params_schema": r.params_schema,
+        "scope": r.scope.map(|s| match s {
+            AliasScope::Project => "project",
+            AliasScope::User => "user",
+        }),
+    })
 }
 
 // =============================================================================
@@ -680,14 +711,22 @@ struct DeleteParams {
 /// Parameters for the `alias_create` tool.
 #[derive(Deserialize, JsonSchema)]
 struct AliasCreateParams {
-    /// Name of the table whose alias namespace to use.
-    ///
-    /// In multi-table mode this argument is required; omitting it returns a
-    /// TABLE_REQUIRED error. In legacy single-table mode (`MINI_APP_SCHEMA` +
-    /// `MINI_APP_DB`) this may be omitted and the single configured table is
-    /// used automatically.
+    /// Legacy single-table source. Backward-compat alias for
+    /// `sources = { "kind": "single", "value": <table> }`. When `sources`
+    /// is `None` and `table` is `Some`, the alias is silently normalised
+    /// to `SourceSpec::Single(<table>)` before being stored. Mutually
+    /// exclusive with `sources` (supplying both is an error).
     table: Option<String>,
-    /// Unique name for this alias within the table's alias namespace.
+    /// Phase 2 source-table specifier. `Single(<table>)` / `Multi([..])` /
+    /// `Pattern(<glob>)`. Takes precedence over `table` when supplied.
+    /// Required when `aggregator` is used with multi-table sources.
+    sources: Option<SourceSpec>,
+    /// Optional aggregator primitive (Phase 2). `Count` / `Sum` / `Avg` /
+    /// `Min` / `Max` / `GroupBy`. When supplied, `alias_run` dispatches
+    /// to `execute_aggregate` instead of the plain `Store::list` path.
+    aggregator: Option<AliasAggregator>,
+    /// Unique name for this alias (global namespace within the chosen
+    /// scope).
     name: String,
     /// The filter to store for this alias.  Mutually exclusive with
     /// `filter_template`; exactly one of the two must be supplied.
@@ -1448,9 +1487,24 @@ impl MiniAppMcpServer {
         &self,
         Parameters(params): Parameters<AliasCreateParams>,
     ) -> Result<String, String> {
+        // Backward-compat: when `sources` is omitted, normalise the
+        // legacy `table` argument into `SourceSpec::Single(<table>)`.
+        // When neither is supplied we fall back to `resolve_table` (which
+        // either returns the legacy default table or surfaces
+        // TABLE_REQUIRED in multi-table mode).
         let (store, schema) = self
             .resolve_table(params.table.as_deref())
             .map_err(|e| e.to_string())?;
+        let sources = match (params.sources.clone(), params.table.clone()) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "`sources` and `table` are mutually exclusive (provide one only)".to_string(),
+                );
+            }
+            (Some(s), None) => s,
+            (None, Some(t)) => SourceSpec::Single(t),
+            (None, None) => SourceSpec::Single(schema.table.clone()),
+        };
 
         let (filter_json, params_schema_json): (String, Option<String>) =
             match (params.filter, params.filter_template) {
@@ -1477,16 +1531,34 @@ impl MiniAppMcpServer {
                 }
             };
 
-        store
-            .alias_create(
+        if let Some(global) = self.global_aliases_handle() {
+            // Phase 2 path: persist to project-scope `_global_aliases`.
+            let record = AliasRecord::new(
                 &params.name,
-                &filter_json,
+                sources,
+                params.aggregator,
+                filter_json,
                 params.limit,
                 params.description,
                 params_schema_json,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            );
+            global
+                .alias_create(AliasScope::Project, record)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            // Legacy single-table mode: keep using per-table `_aliases`.
+            store
+                .alias_create(
+                    &params.name,
+                    &filter_json,
+                    params.limit,
+                    params.description,
+                    params_schema_json,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         serde_json::to_string(&serde_json::json!({ "created": params.name }))
             .map_err(|e| e.to_string())
     }
@@ -1517,11 +1589,22 @@ impl MiniAppMcpServer {
         &self,
         Parameters(params): Parameters<AliasListParams>,
     ) -> Result<String, String> {
+        if let Some(global) = self.global_aliases_handle() {
+            // Phase 2 path: list across both scopes (Project precedence)
+            // and optionally narrow to a single legacy `table` source for
+            // backward compatibility.
+            let mut aliases = global.alias_list().await.map_err(|e| e.to_string())?;
+            if let Some(t) = params.table.as_deref() {
+                aliases.retain(|r| matches!(&r.sources, SourceSpec::Single(s) if s == t));
+            }
+            let values: Vec<serde_json::Value> = aliases.iter().map(alias_record_to_json).collect();
+            return serde_json::to_string(&values).map_err(|e| e.to_string());
+        }
+        // Legacy single-table mode: per-table `_aliases`.
         let (store, _schema) = self
             .resolve_table(params.table.as_deref())
             .map_err(|e| e.to_string())?;
         let aliases = store.alias_list().await.map_err(|e| e.to_string())?;
-        // AliasRecord does not derive Serialize; map to serde_json::Value manually.
         let values: Vec<serde_json::Value> = aliases
             .into_iter()
             .map(|a| {
@@ -1582,15 +1665,36 @@ impl MiniAppMcpServer {
         let (store, schema) = self
             .resolve_table(params.table.as_deref())
             .map_err(|e| e.to_string())?;
-        let alias = store
-            .alias_get(&params.name)
-            .await
-            .map_err(|e| e.to_string())?;
+
+        // Phase 2: prefer global storage when available. Falls back to
+        // per-table store path for legacy single-table mode.
+        let global = self.global_aliases_handle();
+        let (filter_text, default_limit, params_schema, sources, aggregator): (
+            String,
+            Option<u32>,
+            Option<String>,
+            Option<SourceSpec>,
+            Option<AliasAggregator>,
+        ) = if let Some(g) = global {
+            let rec = g.alias_get(&params.name).await.map_err(|e| e.to_string())?;
+            (
+                rec.filter,
+                rec.default_limit,
+                rec.params_schema,
+                Some(rec.sources),
+                rec.aggregator,
+            )
+        } else {
+            let rec = store
+                .alias_get(&params.name)
+                .await
+                .map_err(|e| e.to_string())?;
+            (rec.filter, rec.default_limit, rec.params_schema, None, None)
+        };
 
         // Crux #1: render → parse → validate pipeline (params_schema=Some path).
         // Crux #2: params_schema=None path skips render entirely (backward compat).
-        let filter: crate::filter::ListFilter = if alias.params_schema.is_some() {
-            // Parameterized alias: require params, render template, then parse.
+        let filter: crate::filter::ListFilter = if params_schema.is_some() {
             let params_value = params
                 .params
                 .ok_or_else(|| crate::error::MiniAppError::AliasParamsRequired {
@@ -1599,20 +1703,67 @@ impl MiniAppMcpServer {
                 .map_err(|e| e.to_string())?;
             let env = minijinja::Environment::new();
             let rendered = env
-                .render_str(&alias.filter, &params_value)
+                .render_str(&filter_text, &params_value)
                 .map_err(|e| crate::error::MiniAppError::AliasTemplateError(e.to_string()))
                 .map_err(|e| e.to_string())?;
             serde_json::from_str(&rendered).map_err(|e| e.to_string())?
         } else {
-            // Plain filter alias: skip render step (Crux #2 no-op path).
-            serde_json::from_str(&alias.filter).map_err(|e| e.to_string())?
+            serde_json::from_str(&filter_text).map_err(|e| e.to_string())?
         };
 
         filter.validate(&schema).map_err(|e| e.to_string())?;
-        // Crux: runtime limit/offset override stored defaults; never replay
-        // stored parameters verbatim.
-        let limit = params.limit.or(alias.default_limit);
+        let limit = params.limit.or(default_limit);
         let offset = params.offset;
+
+        // Aggregator path: dispatch to execute_aggregate when present.
+        // Pattern sources are resolved against the live registry's table
+        // list before execution (resolve_pattern is a no-op for
+        // Single/Multi). This is the alias_run-side companion to ST1a's
+        // SourceSpec::Pattern primitive.
+        if let Some(agg) = aggregator {
+            let registry = self.tables.load_full();
+            let src = sources.expect("global path always produces sources");
+            let resolved = if src.requires_resolve() {
+                let table_names: Vec<String> =
+                    registry.table_names().map(|n| n.to_owned()).collect();
+                src.resolve_pattern(&table_names)
+                    .map_err(|e| e.to_string())?
+            } else {
+                src
+            };
+            let result = crate::aggregator::execute_aggregate(
+                &registry,
+                resolved,
+                Some(filter),
+                agg,
+                &schema,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            return serde_json::to_string(&result).map_err(|e| e.to_string());
+        }
+
+        // Plain (Rows) path: per-table list. Multi/Pattern sources
+        // without an aggregator are not supported in Phase 2 — surface a
+        // structured error so callers know to add an aggregator.
+        if let Some(s) = &sources {
+            match s {
+                SourceSpec::Single(t) if t == &schema.table => {}
+                SourceSpec::Single(t) => {
+                    return Err(format!(
+                        "alias was created with sources=Single({t}) but resolved table is {} — \
+                         pass `table` argument matching the alias source",
+                        schema.table
+                    ));
+                }
+                SourceSpec::Multi(_) | SourceSpec::Pattern(_) => {
+                    return Err(
+                        "Multi/Pattern source aliases require an aggregator (Phase 2 limitation)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         let records = store
             .list(limit, offset, Some(filter))
             .await
@@ -1649,6 +1800,24 @@ impl MiniAppMcpServer {
         &self,
         Parameters(params): Parameters<AliasDeleteParams>,
     ) -> Result<String, String> {
+        if let Some(global) = self.global_aliases_handle() {
+            // Phase 2 path: try project scope first, fall back to user
+            // scope if the alias lives there only. This mirrors
+            // `alias_get` precedence (Project → User).
+            match global.alias_delete(AliasScope::Project, &params.name).await {
+                Ok(()) => {}
+                Err(MiniAppError::AliasNotFound { .. }) => {
+                    global
+                        .alias_delete(AliasScope::User, &params.name)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Err(other) => return Err(other.to_string()),
+            }
+            return serde_json::to_string(&serde_json::json!({ "deleted": params.name }))
+                .map_err(|e| e.to_string());
+        }
+        // Legacy single-table mode.
         let (store, _schema) = self
             .resolve_table(params.table.as_deref())
             .map_err(|e| e.to_string())?;
@@ -1695,10 +1864,10 @@ impl MiniAppMcpServer {
         let registry = self.tables.load_full();
         let tables = params.sources.tables();
         if tables.is_empty() {
-            return Err(MiniAppError::Aggregator(
-                "sources must contain at least one table".into(),
-            )
-            .to_string());
+            return Err(
+                MiniAppError::Aggregator("sources must contain at least one table".into())
+                    .to_string(),
+            );
         }
         // Phase 1: use the FIRST source table's schema as the validation
         // basis (caller is responsible for cross-source schema
@@ -3198,6 +3367,8 @@ fields:\n\
         server
             .tool_alias_create(Parameters(AliasCreateParams {
                 table: None,
+                sources: None,
+                aggregator: None,
                 name: "all_rows".to_string(),
                 filter: Some(crate::filter::ListFilter::Eq {
                     field: "state".to_string(),
@@ -3244,6 +3415,8 @@ fields:\n\
         server
             .tool_alias_create(Parameters(AliasCreateParams {
                 table: None,
+                sources: None,
+                aggregator: None,
                 name: "all_rows2".to_string(),
                 filter: Some(crate::filter::ListFilter::Eq {
                     field: "state".to_string(),
