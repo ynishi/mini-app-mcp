@@ -460,8 +460,7 @@ mod tests {
 
         // params arrives as Value::String containing a JSON-encoded object
         // (the failure mode observed via the Claude Code MCP transport).
-        let stringified_params =
-            serde_json::Value::String(r#"{"status": "closed"}"#.to_string());
+        let stringified_params = serde_json::Value::String(r#"{"status": "closed"}"#.to_string());
 
         let result = execute_alias_run(
             &registry,

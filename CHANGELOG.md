@@ -19,6 +19,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.12.0] - 2026-06-16
+
+### Added
+
+- **`mini_app_core::alias_run` module** (`crates/core/src/alias_run.rs`) — top-level orchestration for `alias_run` exposed as a single Core SDK entry point. `execute_alias_run(registry, record, params, table_fallback, limit_override, offset, fields)` accepts an `AliasRecord` and dispatches across the MiniJinja render → filter parse → source resolve → aggregator / rows path pipeline, returning a new `AliasRunValue` enum (`Rows(Vec<Record>)` / `Aggregate(AliasRunResult)`). SDK consumers can now invoke the full alias_run pipeline without re-implementing the ~120-line orchestration that previously lived in the MCP tool handler.
+
+### Changed
+
+- **`tool_alias_run` (MCP handler) is now a thin wrapper** (`crates/mcp/src/mcp/server.rs`) — orchestration body (~120 lines) was extracted to `mini_app_core::alias_run::execute_alias_run`. The MCP handler now resolves the `AliasRecord` (global storage vs legacy per-table fallback) via the private `alias_run_resolve_record` adapter, delegates the full pipeline to Core, and serialises the `AliasRunValue` back to the existing JSON shape via `alias_run_value_to_json`. MCP JSON output shape is unchanged (backward compat).
+- **`minijinja` dependency moved to `mini-app-core`** (`crates/mcp/Cargo.toml`) — `minijinja = "2"` is removed from the `mini-app-mcp` crate now that template rendering happens inside the Core SDK. The transport crate's dependency tree is one entry lighter.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **`alias_run` parameterised templates work over Claude Code MCP stdio transport** (`crates/core/src/alias_run.rs`) — the Claude Code stdio client delivers `Option<serde_json::Value>` argument fields as JSON-encoded strings (`Value::String("{...}")`) rather than parsed `Value::Object(...)`. minijinja received a String context with no resolvable keys, `{{ key }}` evaluated to undefined, and lenient render emitted an empty value — the rendered filter then matched rows whose target field was empty, silently returning incorrect results. Defensive parse now detects `Value::String` payloads and re-parses them via `serde_json::from_str` into the expected `Value::Object` shape before passing to minijinja. Object payloads (existing `e2e_mcp` subprocess MCP client, direct SDK callers) pass through unchanged. New unit test `jinja_render_with_stringified_params` exercises the failure mode and the re-parse path.
+
+### Security
+
 ## [0.11.0] - 2026-06-14
 
 ### Changed (MCP Resources)
