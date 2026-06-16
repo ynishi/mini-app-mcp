@@ -721,7 +721,6 @@ dependencies = [
  "dotenvy",
  "futures",
  "mini-app-core",
- "minijinja",
  "rmcp",
  "rusqlite",
  "schemars",

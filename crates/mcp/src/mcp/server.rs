@@ -249,6 +249,74 @@ fn alias_record_to_json(r: &AliasRecord) -> serde_json::Value {
 }
 
 // =============================================================================
+// alias_run ACL adapter helpers — private
+// =============================================================================
+
+/// Resolve an [`AliasRecord`] (alias_storage variant) for `alias_run`.
+///
+/// - **Phase 2 / multi-table mode**: reads from global alias storage; the
+///   record already carries `sources` and `aggregator`.
+/// - **Legacy / single-table mode**: reads from the per-table `_aliases`
+///   store and constructs an `alias_storage::AliasRecord` with
+///   `sources = Single("")` (empty sentinel) so the `execute_alias_run` core
+///   function uses `table_fallback` for the actual store lookup.
+///
+/// Returns `(record, table_fallback)` where `table_fallback` is `Some` only
+/// in legacy mode.
+async fn alias_run_resolve_record(
+    server: &MiniAppMcpServer,
+    params: &AliasRunParams,
+) -> Result<(AliasRecord, Option<String>), String> {
+    if let Some(g) = server.global_aliases_handle() {
+        let rec = g.alias_get(&params.name).await.map_err(|e| e.to_string())?;
+        Ok((rec, None))
+    } else {
+        // Legacy single-table mode: per-table _aliases (5-field schema,
+        // no sources / aggregator). Resolve the store first so TABLE_REQUIRED
+        // / TABLE_NOT_FOUND surfaces here rather than inside the core fn.
+        let (store, _) = server
+            .resolve_table(params.table.as_deref())
+            .map_err(|e| e.to_string())?;
+        let leg = store
+            .alias_get(&params.name)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Synthesise an alias_storage::AliasRecord from the legacy 5-field row.
+        // sources = Single("") is an empty sentinel; execute_alias_run uses
+        // table_fallback for the actual lookup when Single is empty.
+        let rec = AliasRecord::new(
+            leg.name,
+            crate::aggregator::SourceSpec::Single(String::new()),
+            None, // no aggregator in legacy mode
+            leg.filter,
+            leg.default_limit,
+            leg.description,
+            leg.params_schema,
+        );
+        Ok((rec, params.table.clone()))
+    }
+}
+
+/// Serialise an [`mini_app_core::alias_run::AliasRunValue`] to a JSON string
+/// with the same backward-compatible shape that the pre-refactor
+/// `tool_alias_run` produced.
+///
+/// - `Rows(records)` → JSON array of `RowRecord` objects (same as before).
+/// - `Aggregate(result)` → `AliasRunResult` externally-tagged JSON (same as before).
+fn alias_run_value_to_json(
+    value: mini_app_core::alias_run::AliasRunValue,
+) -> Result<String, String> {
+    match value {
+        mini_app_core::alias_run::AliasRunValue::Rows(records) => {
+            serde_json::to_string(&records).map_err(|e| e.to_string())
+        }
+        mini_app_core::alias_run::AliasRunValue::Aggregate(result) => {
+            serde_json::to_string(&result).map_err(|e| e.to_string())
+        }
+    }
+}
+
+// =============================================================================
 // Reload helpers — private
 // =============================================================================
 
@@ -1705,123 +1773,27 @@ impl MiniAppMcpServer {
         Parameters(params): Parameters<AliasRunParams>,
     ) -> Result<String, String> {
         // Phase 2: prefer global storage when available. Falls back to
-        // per-table store path for legacy single-table mode. The
-        // per-table `store` / `schema` handles are resolved lazily
-        // *after* the alias record is loaded so Multi / Pattern aliases
-        // can be queried without a `table` arg.
-        let global = self.global_aliases_handle();
-        let (filter_text, default_limit, params_schema, sources, aggregator): (
-            String,
-            Option<u32>,
-            Option<String>,
-            Option<SourceSpec>,
-            Option<AliasAggregator>,
-        ) = if let Some(g) = global {
-            let rec = g.alias_get(&params.name).await.map_err(|e| e.to_string())?;
-            (
-                rec.filter,
-                rec.default_limit,
-                rec.params_schema,
-                Some(rec.sources),
-                rec.aggregator,
-            )
-        } else {
-            // Legacy single-table mode: per-table _aliases.
-            let (store, _) = self
-                .resolve_table(params.table.as_deref())
-                .map_err(|e| e.to_string())?;
-            let rec = store
-                .alias_get(&params.name)
-                .await
-                .map_err(|e| e.to_string())?;
-            (rec.filter, rec.default_limit, rec.params_schema, None, None)
-        };
+        // per-table store path for legacy single-table mode.
+        let (record, table_fallback) = alias_run_resolve_record(self, &params).await?;
 
-        // Crux #1: render → parse → validate pipeline (params_schema=Some path).
-        // Crux #2: params_schema=None path skips render entirely (backward compat).
-        let filter: crate::filter::ListFilter = if params_schema.is_some() {
-            let params_value = params
-                .params
-                .ok_or_else(|| crate::error::MiniAppError::AliasParamsRequired {
-                    name: params.name.clone(),
-                })
-                .map_err(|e| e.to_string())?;
-            let env = minijinja::Environment::new();
-            let rendered = env
-                .render_str(&filter_text, &params_value)
-                .map_err(|e| crate::error::MiniAppError::AliasTemplateError(e.to_string()))
-                .map_err(|e| e.to_string())?;
-            serde_json::from_str(&rendered).map_err(|e| e.to_string())?
-        } else {
-            serde_json::from_str(&filter_text).map_err(|e| e.to_string())?
-        };
+        // Delegate all orchestration to the Core SDK.
+        let registry = self.tables.load_full();
+        let result = mini_app_core::alias_run::execute_alias_run(
+            &registry,
+            record,
+            params.params,
+            table_fallback.as_deref(),
+            params.limit,
+            params.offset,
+            params.fields,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
-        let limit = params.limit.or(default_limit);
-        let offset = params.offset;
-
-        // Aggregator path: dispatch to execute_aggregate when present.
-        // Pattern sources are resolved against the live registry's table
-        // list before execution (resolve_pattern is a no-op for
-        // Single/Multi). The schema used for filter / aggregator
-        // validation is the first source table's schema (Phase 2
-        // per-table-schema-assumption, same as execute_aggregate).
-        if let Some(agg) = aggregator {
-            let registry = self.tables.load_full();
-            let src = sources.expect("global path always produces sources");
-            let resolved = if src.requires_resolve() {
-                let table_names: Vec<String> =
-                    registry.table_names().map(|n| n.to_owned()).collect();
-                src.resolve_pattern(&table_names)
-                    .map_err(|e| e.to_string())?
-            } else {
-                src
-            };
-            let schema_table = resolved
-                .tables()
-                .first()
-                .cloned()
-                .ok_or_else(|| "alias sources resolved to zero tables".to_string())?;
-            let schema = self
-                .resolve_table(Some(schema_table.as_str()))
-                .map_err(|e| e.to_string())?
-                .1;
-            filter.validate(&schema).map_err(|e| e.to_string())?;
-            let result = crate::aggregator::execute_aggregate(
-                &registry,
-                resolved,
-                Some(filter),
-                agg,
-                &schema,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            return serde_json::to_string(&result).map_err(|e| e.to_string());
-        }
-
-        // Plain (Rows) path: resolve the per-table store from the alias
-        // sources (Single) or from the legacy `table` arg.
-        let (store, schema) = match &sources {
-            Some(SourceSpec::Single(t)) => self
-                .resolve_table(Some(t.as_str()))
-                .map_err(|e| e.to_string())?,
-            Some(SourceSpec::Multi(_)) | Some(SourceSpec::Pattern(_)) => {
-                return Err(
-                    "Multi/Pattern source aliases require an aggregator (Phase 2 limitation)"
-                        .to_string(),
-                );
-            }
-            None => self
-                .resolve_table(params.table.as_deref())
-                .map_err(|e| e.to_string())?,
-        };
-        filter.validate(&schema).map_err(|e| e.to_string())?;
-        let records = store
-            .list(limit, offset, Some(filter))
-            .await
-            .map_err(|e| e.to_string())?;
-        let records = materialize::apply_projection(records, &params.fields, &schema)
-            .map_err(|e| e.to_string())?;
-        serde_json::to_string(&records).map_err(|e| e.to_string())
+        // Backward-compat JSON serialisation: each variant maps to the
+        // same JSON shape that the previous in-handler implementation
+        // produced (records array or AliasRunResult object).
+        alias_run_value_to_json(result)
     }
 
     /// Delete a named query alias from a table.

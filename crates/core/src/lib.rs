@@ -60,5 +60,9 @@ pub mod backup;
 /// Snapshot utilities (SQLite-only online snapshot with retention).
 pub mod snapshot;
 
+/// Top-level orchestration for `alias_run` — single entry point exposed for
+/// both the MCP tool handler and direct SDK consumers.
+pub mod alias_run;
+
 /// Re-export of [`error::MiniAppError`] for convenient `use mini_app_core::MiniAppError`.
 pub use error::MiniAppError;
