@@ -19,6 +19,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.12.1] - 2026-06-17
+
+### Added
+
+- **`AliasCreateParams.scope` parameter** (`crates/mcp/src/mcp/server.rs`) — `tool_alias_create` accepts an optional `scope: "project" | "user"` argument. When omitted, the server selects `Project` if that scope is mounted (legacy backward-compatible default) and falls back to `User` otherwise. This lets callers (e.g. `persona-wire` Adapters consuming `mini-app://<table>?alias=<name>` URIs) explicitly target the User scope without setting `MINI_APP_PROJECT_DIR`, and lets `alias_create` succeed in the common Claude Code default env where Project scope unmounts because the CWD has no `.mini-app/` directory.
+- **`AliasScope` derives `Deserialize` / `Serialize` / `JsonSchema`** (`crates/core/src/alias_storage.rs`) — the SDK enum is now wire-representable as `"project"` / `"user"` (lowercase) so MCP tool layers can accept it as a JSON parameter. Pure additive derive (`Debug` / `Clone` / `Copy` / `PartialEq` / `Eq` preserved).
+- 4 new unit tests for the user-only mount environment (`crates/mcp/src/mcp/server.rs`):
+  - `alias_create_user_only_mount_default_scope_falls_back_to_user`
+  - `alias_create_user_only_mount_explicit_user_scope_succeeds`
+  - `alias_create_user_only_mount_explicit_project_scope_returns_clear_error`
+  - `alias_delete_user_only_mount_round_trip`
+
+### Changed
+
+- **`tool_alias_create` dispatch is no longer hardcoded to `AliasScope::Project`** (`crates/mcp/src/mcp/server.rs:1648` previously) — the handler now picks the target scope from `params.scope`, falling back to a runtime check (`global.path_for_scope(Project).is_some() ? Project : User`) when the caller omits the field. When the caller explicitly requests a scope that is not mounted, the handler surfaces a clear, actionable error mentioning both `MINI_APP_PROJECT_DIR` and `MINI_APP_USER_DIR` instead of the generic storage-layer "scope is not mounted" config error.
+- **`tool_alias_delete` dispatch handles single-scope mounts symmetrically** (`crates/mcp/src/mcp/server.rs:1830` previously) — when Project scope is mounted the existing Project-first / User-on-NotFound precedence is preserved (mirrors `alias_get`). When Project scope is unmounted the handler dispatches directly to User scope so the delete cannot fail with a Project-scope config error.
+
+### Fixed
+
+- **`alias_create` 5/5 fail with "GlobalAliasStorage scope Project is not mounted" in Claude Code default env** (`crates/mcp/src/mcp/server.rs`) — Claude Code launches `mini-app-mcp` from arbitrary consumer CWDs that often have no `.mini-app/` directory. `Config::load` resolves `MINI_APP_PROJECT_DIR` default to `./.mini-app/` (CWD-relative), but `TableRegistry::mount_from_dirs` at `registry.rs:109-110` filters non-existent directories out of `GlobalAliasStorage::open`, leaving only the User scope mounted. The pre-v0.12.1 `tool_alias_create` hardcoded `AliasScope::Project` and unconditionally failed in this single-scope environment, even though sibling tools (`list` / `alias_get` / `alias_list`) are scope-agnostic and fall back to User scope transparently. The new caller-supplied `scope` parameter plus runtime auto-fallback restores symmetry with the read-side tools and unblocks downstream consumers like `persona-wire` Adapters that integrate `mini-app-core 0.12.0`'s `execute_alias_run` path. The underlying SDK contract (`GlobalAliasStorage::open(project_dir, user_dir)` accepting `Option<&Path>` for either scope, `alias_create(scope, record)` accepting any mounted `AliasScope`) was already correct at the storage layer; only the MCP handler hardcode needed removing.
+
+### Carry (separate issue)
+
+- **SDK DomainEntity Layer purification** (`mini-app-core` v0.13.0 minor refactor, breaking) — `Config::load()` (env::var + dotenvy + dirs::home_dir 直読み), `dump.rs:85` `std::env::current_dir()`, and the `dotenvy` / `dirs` crate dependencies will be removed from `mini-app-core` and re-located to `mini-app-mcp` as an `env_loader` module. The SDK invariant "mini-app-core does not read env / FS / process state" will be documented in `core/src/lib.rs` and `CONTRIBUTING.md`. Trigger: お兄ちゃん明示 (`(B) pair-programming session`). Task plan: `workspace/tasks/sdk-refactor-domain-entity-purification/plan.md`.
+
 ## [0.12.0] - 2026-06-16
 
 ### Added

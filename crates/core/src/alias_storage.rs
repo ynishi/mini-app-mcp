@@ -39,11 +39,22 @@ use std::sync::{Arc, Mutex};
 /// Scope determines which `_global.db` (project or user) is written to.
 /// Lookup (`alias_get` / `alias_list`) always reads both with project
 /// taking precedence on name collisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Deserialize` / `Serialize` / `JsonSchema` are derived so callers
+/// (e.g. the MCP `alias_create` tool) can accept this enum as a JSON
+/// parameter. The wire representation is `"project"` / `"user"`
+/// (lowercase) for natural caller ergonomics.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum AliasScope {
-    /// Project-local `_global.db` (default for new aliases).
+    /// Project-local `_global.db` (default for new aliases when the
+    /// Project scope is mounted).
     Project,
-    /// User-wide `_global.db` (shared across projects).
+    /// User-wide `_global.db` (shared across projects). Used as the
+    /// fallback when Project scope is unmounted, or when the caller
+    /// explicitly opts in via the `scope` parameter.
     User,
 }
 

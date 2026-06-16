@@ -819,6 +819,17 @@ struct AliasCreateParams {
     limit: Option<u32>,
     /// Optional human-readable description for this alias.
     description: Option<String>,
+    /// Target alias storage scope. `Some(Project)` writes to the
+    /// project-local `_global.db`; `Some(User)` writes to the user-wide
+    /// `_global.db`. When omitted (default), the server selects
+    /// `Project` if that scope is mounted (= legacy backward-compatible
+    /// behaviour) and falls back to `User` otherwise. This lets callers
+    /// opt into User scope explicitly without setting
+    /// `MINI_APP_PROJECT_DIR`, and lets the server still write
+    /// successfully when only one scope is mounted (the common Claude
+    /// Code default env, where Project scope unmounts when the CWD has
+    /// no `.mini-app/` directory).
+    scope: Option<AliasScope>,
 }
 
 /// Parameters for the `alias_list` tool.
@@ -1545,7 +1556,11 @@ impl MiniAppMcpServer {
                        `filter_template`, supply `params_schema` (an array of parameter \
                        name strings) to declare which parameters `alias_run` must \
                        receive.  An optional `limit` is stored as the default row cap \
-                       when the alias is run.  The alias is scoped exclusively to the \
+                       when the alias is run.  An optional `scope` (\"project\" / \
+                       \"user\") selects the storage scope explicitly; when omitted, \
+                       the server writes to Project scope if mounted, falling back to \
+                       User scope otherwise (= safe default for Claude Code-style \
+                       single-scope envs).  The alias is scoped exclusively to the \
                        named `table`.  Returns ALIAS_ALREADY_EXISTS if the name is \
                        already taken.  In multi-table mode `table` is required; \
                        omitting it returns TABLE_REQUIRED (data.code=\"TABLE_REQUIRED\").",
@@ -1635,6 +1650,33 @@ impl MiniAppMcpServer {
             };
 
         if let Some(global) = self.global_aliases_handle() {
+            // Pick the target scope.  Caller-supplied `scope` wins; when
+            // omitted, prefer Project if it is mounted (legacy
+            // backward-compatible default) and fall back to User
+            // otherwise.  This lets `alias_create` succeed in the common
+            // Claude Code env where only the User scope (`~/.mini-app/`)
+            // is mounted because the CWD has no `.mini-app/` directory.
+            let target_scope = match params.scope {
+                Some(s) => s,
+                None => {
+                    if global.path_for_scope(AliasScope::Project).is_some() {
+                        AliasScope::Project
+                    } else {
+                        AliasScope::User
+                    }
+                }
+            };
+            // Defensive: if the caller explicitly asked for a scope that
+            // is not mounted, surface a clear error before hitting the
+            // storage layer's generic "scope is not mounted" config error.
+            if global.path_for_scope(target_scope).is_none() {
+                return Err(format!(
+                    "alias_create: requested scope {target_scope:?} is not mounted on this \
+                     server. Either omit the `scope` argument (the server will auto-select a \
+                     mounted scope) or configure the corresponding directory \
+                     (MINI_APP_PROJECT_DIR / MINI_APP_USER_DIR).",
+                ));
+            }
             let record = AliasRecord::new(
                 &params.name,
                 sources,
@@ -1645,7 +1687,7 @@ impl MiniAppMcpServer {
                 params_schema_json,
             );
             global
-                .alias_create(AliasScope::Project, record)
+                .alias_create(target_scope, record)
                 .await
                 .map_err(|e| e.to_string())?;
         } else {
@@ -1824,18 +1866,28 @@ impl MiniAppMcpServer {
         Parameters(params): Parameters<AliasDeleteParams>,
     ) -> Result<String, String> {
         if let Some(global) = self.global_aliases_handle() {
-            // Phase 2 path: try project scope first, fall back to user
-            // scope if the alias lives there only. This mirrors
-            // `alias_get` precedence (Project → User).
-            match global.alias_delete(AliasScope::Project, &params.name).await {
-                Ok(()) => {}
-                Err(MiniAppError::AliasNotFound { .. }) => {
-                    global
-                        .alias_delete(AliasScope::User, &params.name)
-                        .await
-                        .map_err(|e| e.to_string())?;
+            // Phase 2 path: try the mounted Project scope first, fall
+            // back to User on not-found (mirrors `alias_get`
+            // precedence). When Project scope is unmounted (= single-
+            // scope env, common Claude Code default), go directly to
+            // the User scope so delete cannot fail with a generic
+            // "scope is not mounted" config error.
+            if global.path_for_scope(AliasScope::Project).is_some() {
+                match global.alias_delete(AliasScope::Project, &params.name).await {
+                    Ok(()) => {}
+                    Err(MiniAppError::AliasNotFound { .. }) => {
+                        global
+                            .alias_delete(AliasScope::User, &params.name)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Err(other) => return Err(other.to_string()),
                 }
-                Err(other) => return Err(other.to_string()),
+            } else {
+                global
+                    .alias_delete(AliasScope::User, &params.name)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             return serde_json::to_string(&serde_json::json!({ "deleted": params.name }))
                 .map_err(|e| e.to_string());
@@ -3405,6 +3457,7 @@ fields:\n\
                 params_schema: None,
                 limit: None,
                 description: None,
+                scope: None,
             }))
             .await
             .unwrap();
@@ -3453,6 +3506,7 @@ fields:\n\
                 params_schema: None,
                 limit: None,
                 description: None,
+                scope: None,
             }))
             .await
             .unwrap();
@@ -3473,6 +3527,157 @@ fields:\n\
         assert!(
             err.contains("VALIDATION_ERROR") || err.contains("nonexistent"),
             "error must mention VALIDATION_ERROR or field name, got: {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // alias_create / alias_delete scope handling — covers the user-only mount
+    // environment (= Claude Code default env, where the CWD has no `.mini-app/`
+    // dir so Project scope is filtered out at `registry.rs:109-110`). Prior to
+    // the v0.12.1 fix, `tool_alias_create` hardcoded `AliasScope::Project` and
+    // always failed with "GlobalAliasStorage scope Project is not mounted" in
+    // this environment. The new dispatch auto-selects User scope as a fallback
+    // and accepts an explicit `scope` parameter from the caller.
+    // ---------------------------------------------------------------------------
+
+    async fn make_user_only_server() -> (MiniAppMcpServer, tempfile::TempDir) {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let user_dir = tmp_dir.path();
+        let table_dir = user_dir.join("test_table");
+        std::fs::create_dir_all(&table_dir).expect("create table_dir");
+        std::fs::write(
+            table_dir.join("schema.yaml"),
+            b"table: test_table\nfields:\n  - name: title\n    type: string\n    required: true\n",
+        )
+        .expect("write schema");
+        let registry = TableRegistry::mount_from_dirs(Some(user_dir), None)
+            .await
+            .expect("mount user-only");
+        let config = Arc::new(Config {
+            schema_path: None,
+            db_path: None,
+            user_dir: Some(user_dir.to_path_buf()),
+            project_dir: None,
+            backup_retention: None,
+            snapshot_retention: None,
+        });
+        let server = MiniAppMcpServer::new_multi(registry, config);
+        (server, tmp_dir)
+    }
+
+    #[tokio::test]
+    async fn alias_create_user_only_mount_default_scope_falls_back_to_user() {
+        let (server, _tmp) = make_user_only_server().await;
+        let result = server
+            .tool_alias_create(Parameters(AliasCreateParams {
+                table: Some("test_table".to_string()),
+                sources: None,
+                aggregator: None,
+                name: "u_default".to_string(),
+                filter: Some(crate::filter::ListFilter::Eq {
+                    field: "title".to_string(),
+                    value: serde_json::json!("hi"),
+                }),
+                filter_template: None,
+                params_schema: None,
+                limit: None,
+                description: None,
+                scope: None,
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "alias_create with default scope must succeed in user-only mount: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_create_user_only_mount_explicit_user_scope_succeeds() {
+        let (server, _tmp) = make_user_only_server().await;
+        let result = server
+            .tool_alias_create(Parameters(AliasCreateParams {
+                table: Some("test_table".to_string()),
+                sources: None,
+                aggregator: None,
+                name: "u_explicit".to_string(),
+                filter: Some(crate::filter::ListFilter::Eq {
+                    field: "title".to_string(),
+                    value: serde_json::json!("hi"),
+                }),
+                filter_template: None,
+                params_schema: None,
+                limit: None,
+                description: None,
+                scope: Some(AliasScope::User),
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "alias_create with explicit User scope must succeed in user-only mount: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_create_user_only_mount_explicit_project_scope_returns_clear_error() {
+        let (server, _tmp) = make_user_only_server().await;
+        let result = server
+            .tool_alias_create(Parameters(AliasCreateParams {
+                table: Some("test_table".to_string()),
+                sources: None,
+                aggregator: None,
+                name: "u_proj_fail".to_string(),
+                filter: Some(crate::filter::ListFilter::Eq {
+                    field: "title".to_string(),
+                    value: serde_json::json!("hi"),
+                }),
+                filter_template: None,
+                params_schema: None,
+                limit: None,
+                description: None,
+                scope: Some(AliasScope::Project),
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "alias_create with explicit Project scope must fail in user-only mount"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not mounted") && err.contains("Project"),
+            "error must mention unmounted Project scope, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_delete_user_only_mount_round_trip() {
+        let (server, _tmp) = make_user_only_server().await;
+        server
+            .tool_alias_create(Parameters(AliasCreateParams {
+                table: Some("test_table".to_string()),
+                sources: None,
+                aggregator: None,
+                name: "u_to_delete".to_string(),
+                filter: Some(crate::filter::ListFilter::Eq {
+                    field: "title".to_string(),
+                    value: serde_json::json!("bye"),
+                }),
+                filter_template: None,
+                params_schema: None,
+                limit: None,
+                description: None,
+                scope: None,
+            }))
+            .await
+            .expect("alias_create must succeed");
+        let result = server
+            .tool_alias_delete(Parameters(AliasDeleteParams {
+                table: Some("test_table".to_string()),
+                name: "u_to_delete".to_string(),
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "alias_delete must succeed in user-only mount: {result:?}"
         );
     }
 }
