@@ -106,9 +106,25 @@ pub async fn execute_alias_run(
     // -----------------------------------------------------------------
     let filter_text = record.filter;
     let filter: ListFilter = if record.params_schema.is_some() {
-        let params_value = params.ok_or_else(|| MiniAppError::AliasParamsRequired {
+        let mut params_value = params.ok_or_else(|| MiniAppError::AliasParamsRequired {
             name: record.name.clone(),
         })?;
+        // Defensive parse: some MCP transports (notably the Claude Code
+        // stdio client) stringify `serde_json::Value` argument fields, so
+        // a `params: {"k": "v"}` payload arrives here as
+        // `Value::String("{\"k\":\"v\"}")` rather than `Value::Object(..)`.
+        // When minijinja receives a String it cannot resolve `{{ k }}`
+        // (the String has no keys), the placeholder evaluates to undefined
+        // and lenient render emits an empty value. Re-parse JSON-encoded
+        // strings into their Object form so render works regardless of
+        // the transport.
+        if let serde_json::Value::String(ref s) = params_value {
+            params_value = serde_json::from_str(s).map_err(|e| {
+                MiniAppError::AliasTemplateError(format!(
+                    "params arrived as a string but failed JSON parse: {e}"
+                ))
+            })?;
+        }
         let env = minijinja::Environment::new();
         let rendered = env
             .render_str(&filter_text, &params_value)
@@ -400,6 +416,64 @@ mod tests {
         let result = execute_alias_run(&registry, record, Some(params), None, None, None, None)
             .await
             .expect("execute_alias_run");
+
+        match result {
+            AliasRunValue::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].data["status"], "closed");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: MCP transport stringified params — Value::String("{...}") path
+    //
+    // Some MCP transports (notably the Claude Code stdio client) deliver
+    // `Option<serde_json::Value>` argument fields as JSON-encoded strings
+    // rather than parsed objects. Verify the defensive re-parse path so
+    // `{{ key }}` still resolves when params arrives as Value::String.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn jinja_render_with_stringified_params() {
+        let schema = status_schema();
+        let store = make_store_with_rows(
+            &schema,
+            vec![
+                serde_json::json!({"status": "open"}),
+                serde_json::json!({"status": "closed"}),
+            ],
+        )
+        .await;
+        let registry = registry_from_store("items", store, schema);
+
+        let record = AliasRecord {
+            name: "templated_alias".into(),
+            sources: SourceSpec::Single("items".into()),
+            aggregator: None,
+            filter: r#"{"type":"eq","field":"status","value":"{{ status }}"}"#.into(),
+            default_limit: None,
+            description: None,
+            params_schema: Some(r#"["status"]"#.into()),
+            scope: None,
+        };
+
+        // params arrives as Value::String containing a JSON-encoded object
+        // (the failure mode observed via the Claude Code MCP transport).
+        let stringified_params =
+            serde_json::Value::String(r#"{"status": "closed"}"#.to_string());
+
+        let result = execute_alias_run(
+            &registry,
+            record,
+            Some(stringified_params),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_alias_run must re-parse stringified params");
 
         match result {
             AliasRunValue::Rows(rows) => {
