@@ -64,7 +64,7 @@ pub enum RowSelector {
 /// # Variants
 /// - `All` — include all schema fields in declaration order.
 /// - `List` — include only the listed fields, in the specified order.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum FieldSelector {
     /// Include every schema field in declaration order.

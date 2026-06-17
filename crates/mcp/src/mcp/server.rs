@@ -292,6 +292,7 @@ async fn alias_run_resolve_record(
             leg.default_limit,
             leg.description,
             leg.params_schema,
+            None, // legacy mode has no stored field projection
         );
         Ok((rec, params.table.clone()))
     }
@@ -830,6 +831,12 @@ struct AliasCreateParams {
     /// Code default env, where Project scope unmounts when the CWD has
     /// no `.mini-app/` directory).
     scope: Option<AliasScope>,
+    /// Optional default field-projection to store with this alias.
+    /// When set, `alias_run` will use this projection if no run-time
+    /// `fields` argument is supplied.  `null` / omitted means no stored
+    /// default — all fields are returned (Crux #3: never coerced to an
+    /// empty list by the storage or run layer).
+    fields: Option<FieldSelector>,
 }
 
 /// Parameters for the `alias_list` tool.
@@ -1677,6 +1684,13 @@ impl MiniAppMcpServer {
                      (MINI_APP_PROJECT_DIR / MINI_APP_USER_DIR).",
                 ));
             }
+            let fields_json = match params.fields {
+                Some(ref f) => Some(
+                    serde_json::to_string(f)
+                        .map_err(|e| format!("alias_create: serialise fields: {e}"))?,
+                ),
+                None => None,
+            };
             let record = AliasRecord::new(
                 &params.name,
                 sources,
@@ -1685,6 +1699,7 @@ impl MiniAppMcpServer {
                 params.limit,
                 params.description,
                 params_schema_json,
+                fields_json,
             );
             global
                 .alias_create(target_scope, record)
@@ -1694,6 +1709,13 @@ impl MiniAppMcpServer {
             // Legacy single-table mode: per-table `_aliases`. Pattern
             // sources are rejected here because no concrete store is
             // available to back them.
+            if params.fields.is_some() {
+                return Err(
+                    "alias_create: 'fields' is not supported in legacy single-table mode \
+                     (per-table _aliases). Use the global alias path (multi-table mode)."
+                        .to_string(),
+                );
+            }
             let store = legacy_store.ok_or_else(|| {
                 "Pattern sources are not supported in legacy single-table mode".to_string()
             })?;
@@ -3457,6 +3479,7 @@ fields:\n\
                 params_schema: None,
                 limit: None,
                 description: None,
+                fields: None,
                 scope: None,
             }))
             .await
@@ -3506,6 +3529,7 @@ fields:\n\
                 params_schema: None,
                 limit: None,
                 description: None,
+                fields: None,
                 scope: None,
             }))
             .await
@@ -3582,6 +3606,7 @@ fields:\n\
                 params_schema: None,
                 limit: None,
                 description: None,
+                fields: None,
                 scope: None,
             }))
             .await;
@@ -3608,6 +3633,7 @@ fields:\n\
                 params_schema: None,
                 limit: None,
                 description: None,
+                fields: None,
                 scope: Some(AliasScope::User),
             }))
             .await;
@@ -3634,6 +3660,7 @@ fields:\n\
                 params_schema: None,
                 limit: None,
                 description: None,
+                fields: None,
                 scope: Some(AliasScope::Project),
             }))
             .await;
@@ -3665,6 +3692,7 @@ fields:\n\
                 params_schema: None,
                 limit: None,
                 description: None,
+                fields: None,
                 scope: None,
             }))
             .await
