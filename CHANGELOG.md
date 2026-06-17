@@ -9,13 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`AliasCreateParams.fields` parameter** (`crates/mcp/src/mcp/server.rs`) — `tool_alias_create` accepts an optional `fields: FieldSelector` argument. The selector is serialized to JSON and persisted in the new `_global_aliases.fields` column, then applied as the default projection when `alias_run` is invoked without a run-time `fields` override. Callers can now register an alias once with `fields={"mode":"list","fields":[...]}` and re-run it without re-specifying the projection each call.
+- **`_global_aliases.fields` column** (`crates/core/src/alias_storage.rs`) — new `TEXT` column appended at index 7. Idempotent migration via `PRAGMA table_info` + conditional `ALTER TABLE ADD COLUMN` runs on every `open_scope_db`, so existing `_global.db` files are upgraded in place with `fields = NULL` (no behavioral change for pre-existing aliases).
+- **`FieldSelector` derives `Serialize`** (`crates/core/src/materialize.rs`) — symmetric with the existing `Deserialize` derive. No wire shape change.
+- 2 new e2e tests (`crates/mcp/tests/e2e_mcp.rs`):
+  - `alias_create_with_fields_then_alias_run_uses_stored_fields` — stored `fields` applies when run-time argument is omitted.
+  - `alias_create_without_fields_alias_run_no_projection` — NULL regression guard (NULL stored `fields` ≠ empty projection list; full rows return when neither stored nor run-time `fields` is set).
+
 ### Changed
+
+- **`AliasRecord::new` signature gains an 8th positional parameter** (`crates/core/src/alias_storage.rs`) — `fields: Option<String>` appended at the end. All existing call sites updated to pass `None` or the serialized `FieldSelector` JSON.
+- **`execute_alias_run` falls back to `record.fields`** (`crates/core/src/alias_run.rs`) — when the caller does not pass a run-time `fields` argument, the persisted alias projection is now applied. `None` stored value preserves the legacy "no projection / full rows" behavior; only an explicit `Some` projection is applied.
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+
+- **Legacy single-table `alias_create` path now rejects `fields` explicitly** (`crates/mcp/src/mcp/server.rs`) — when the per-table `_aliases` storage path is taken and the caller passes `fields`, the handler returns a clear actionable error instead of silently dropping the projection.
 
 ### Security
 
