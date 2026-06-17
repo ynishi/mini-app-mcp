@@ -139,6 +139,28 @@ pub async fn execute_alias_run(
     let limit = limit_override.or(record.default_limit);
 
     // -----------------------------------------------------------------
+    // Crux #2: Field-projection fallback.
+    //
+    // When the caller supplies `fields` at run-time, use it as-is.
+    // When the caller omits `fields` (None), fall back to the stored
+    // default from `record.fields`.
+    // When `record.fields` is also None, no projection is applied — all
+    // fields are returned (Crux #3: NULL must never become an empty list).
+    // -----------------------------------------------------------------
+    let fields = match fields {
+        Some(f) => Some(f),
+        None => match record.fields.as_deref() {
+            Some(json) => Some(serde_json::from_str(json).map_err(|e| {
+                MiniAppError::Schema(format!(
+                    "alias '{}' stored fields parse error: {e}",
+                    record.name
+                ))
+            })?),
+            None => None,
+        },
+    };
+
+    // -----------------------------------------------------------------
     // Step 2: Aggregator path dispatch.
     // -----------------------------------------------------------------
     if let Some(agg) = record.aggregator {
@@ -297,7 +319,7 @@ mod tests {
         TableRegistry::from_entries(entries, Some(table.to_string()))
     }
 
-    /// Build a minimal [`AliasRecord`] (no aggregator, no params).
+    /// Build a minimal [`AliasRecord`] (no aggregator, no params, no stored fields).
     fn plain_alias(sources: SourceSpec, filter_json: &str) -> AliasRecord {
         AliasRecord {
             name: "test_alias".into(),
@@ -307,6 +329,7 @@ mod tests {
             default_limit: None,
             description: None,
             params_schema: None,
+            fields: None,
             scope: None,
         }
     }
@@ -370,6 +393,7 @@ mod tests {
             default_limit: None,
             description: None,
             params_schema: None,
+            fields: None,
             scope: None,
         };
 
@@ -408,6 +432,7 @@ mod tests {
             default_limit: None,
             description: None,
             params_schema: Some(r#"["status"]"#.into()),
+            fields: None,
             scope: None,
         };
 
@@ -455,6 +480,7 @@ mod tests {
             default_limit: None,
             description: None,
             params_schema: Some(r#"["status"]"#.into()),
+            fields: None,
             scope: None,
         };
 
@@ -503,6 +529,7 @@ mod tests {
             default_limit: None,
             description: None,
             params_schema: None,
+            fields: None,
             scope: None,
         };
 
@@ -533,6 +560,7 @@ mod tests {
             default_limit: None,
             description: None,
             params_schema: None,
+            fields: None,
             scope: None,
         };
 
