@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.13.0] - 2026-06-17
+
+### Added
+
 - **`AliasCreateParams.fields` parameter** (`crates/mcp/src/mcp/server.rs`) — `tool_alias_create` accepts an optional `fields: FieldSelector` argument. The selector is serialized to JSON and persisted in the new `_global_aliases.fields` column, then applied as the default projection when `alias_run` is invoked without a run-time `fields` override. Callers can now register an alias once with `fields={"mode":"list","fields":[...]}` and re-run it without re-specifying the projection each call.
 - **`_global_aliases.fields` column** (`crates/core/src/alias_storage.rs`) — new `TEXT` column appended at index 7. Idempotent migration via `PRAGMA table_info` + conditional `ALTER TABLE ADD COLUMN` runs on every `open_scope_db`, so existing `_global.db` files are upgraded in place with `fields = NULL` (no behavioral change for pre-existing aliases).
 - **`FieldSelector` derives `Serialize`** (`crates/core/src/materialize.rs`) — symmetric with the existing `Deserialize` derive. No wire shape change.
