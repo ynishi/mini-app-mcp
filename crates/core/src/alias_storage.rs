@@ -81,6 +81,11 @@ pub struct AliasRecord {
     /// Optional JSON array of parameter name strings (e.g. `["project","owner"]`).
     /// `None` means the alias takes no parameters.
     pub params_schema: Option<String>,
+    /// Optional default field projection stored as a serialised
+    /// [`crate::materialize::FieldSelector`] JSON string.
+    /// `None` means no stored default — all fields are returned (Crux #3: must
+    /// never be coerced to an empty projection list).
+    pub fields: Option<String>,
     /// Origin scope of this record after `alias_get` / `alias_list`.
     /// `None` for newly-constructed records that have not yet been
     /// persisted or loaded.
@@ -90,6 +95,18 @@ pub struct AliasRecord {
 impl AliasRecord {
     /// Construct a new record with `scope = None`. Persistence assigns
     /// the scope via [`GlobalAliasStorage::alias_create`].
+    ///
+    /// # Arguments
+    /// - `name` — alias name (PRIMARY KEY within scope).
+    /// - `sources` — source-table specifier.
+    /// - `aggregator` — optional aggregator; `None` for plain Rows aliases.
+    /// - `filter` — serialised filter JSON or MiniJinja template string.
+    /// - `default_limit` — optional row-count cap applied when `alias_run` omits a limit.
+    /// - `description` — optional human-readable description.
+    /// - `params_schema` — optional JSON array of parameter names.
+    /// - `fields` — optional serialised [`crate::materialize::FieldSelector`]; `None`
+    ///   means no stored default projection (all fields returned).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: impl Into<String>,
         sources: SourceSpec,
@@ -98,6 +115,7 @@ impl AliasRecord {
         default_limit: Option<u32>,
         description: Option<String>,
         params_schema: Option<String>,
+        fields: Option<String>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -107,6 +125,7 @@ impl AliasRecord {
             default_limit,
             description,
             params_schema,
+            fields,
             scope: None,
         }
     }
@@ -122,7 +141,8 @@ const CREATE_GLOBAL_ALIASES_SQL: &str = "
         filter          TEXT    NOT NULL,
         default_limit   INTEGER,
         description     TEXT,
-        params_schema   TEXT
+        params_schema   TEXT,
+        fields          TEXT
     )
 ";
 
@@ -267,14 +287,15 @@ impl GlobalAliasStorage {
         let default_limit = record.default_limit;
         let description = record.description.clone();
         let params_schema = record.params_schema.clone();
+        let fields = record.fields.clone();
         tokio::task::spawn_blocking(move || -> Result<(), MiniAppError> {
             let conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".into()))?;
             conn.execute(
                 "INSERT OR IGNORE INTO _global_aliases \
-                 (name, sources_json, aggregator_json, filter, default_limit, description, params_schema) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     name,
                     sources_json,
@@ -283,6 +304,7 @@ impl GlobalAliasStorage {
                     default_limit,
                     description,
                     params_schema,
+                    fields,
                 ],
             )?;
             if conn.changes() == 0 {
@@ -331,7 +353,7 @@ impl GlobalAliasStorage {
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".into()))?;
             let mut stmt = conn.prepare(
-                "SELECT name, sources_json, aggregator_json, filter, default_limit, description, params_schema \
+                "SELECT name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields \
                  FROM _global_aliases WHERE name = ?1",
             )?;
             let row = stmt
@@ -465,8 +487,8 @@ impl GlobalAliasStorage {
                 for (name, filter, default_limit, description, params_schema) in rows {
                     dst.execute(
                         "INSERT OR IGNORE INTO _global_aliases \
-                         (name, sources_json, aggregator_json, filter, default_limit, description, params_schema) \
-                         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
+                         (name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields) \
+                         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL)",
                         rusqlite::params![
                             name,
                             sources_json,
@@ -500,6 +522,22 @@ fn open_scope_db(dir: &Path) -> Result<(Arc<Mutex<rusqlite::Connection>>, PathBu
     // "wal" row; rusqlite errors are propagated as `MiniAppError::Storage`.
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(CREATE_GLOBAL_ALIASES_SQL)?;
+    // Idempotent migration: add `fields` column to existing databases that
+    // were created before this column was introduced.  PRAGMA table_info
+    // returns one row per column; we check for a row whose second field
+    // (the column name) equals "fields".  If absent, ALTER TABLE appends it.
+    // This is safe to run on every open because the column either already
+    // exists (no-op branch) or is added exactly once.
+    let has_fields: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM pragma_table_info('_global_aliases') WHERE name = 'fields'",
+        )?;
+        stmt.query_row([], |row| row.get::<_, i64>(0))
+            .map(|n| n > 0)?
+    };
+    if !has_fields {
+        conn.execute_batch("ALTER TABLE _global_aliases ADD COLUMN fields TEXT")?;
+    }
     Ok((Arc::new(Mutex::new(conn)), db_path))
 }
 
@@ -511,6 +549,7 @@ fn extract_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AliasRecord> {
     let default_limit: Option<u32> = row.get(4)?;
     let description: Option<String> = row.get(5)?;
     let params_schema: Option<String> = row.get(6)?;
+    let fields: Option<String> = row.get(7)?;
     let sources: SourceSpec = serde_json::from_str(&sources_json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
             1,
@@ -540,6 +579,7 @@ fn extract_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AliasRecord> {
         default_limit,
         description,
         params_schema,
+        fields,
         scope: None,
     })
 }
@@ -553,7 +593,7 @@ async fn list_scope(
             .lock()
             .map_err(|_| MiniAppError::Schema("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT name, sources_json, aggregator_json, filter, default_limit, description, params_schema \
+            "SELECT name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields \
              FROM _global_aliases ORDER BY name ASC",
         )?;
         let rows = stmt
@@ -589,6 +629,7 @@ mod tests {
             r#"{"type":"eq","field":"status","value":"open"}"#,
             Some(20),
             Some("sample".into()),
+            None,
             None,
         )
     }
@@ -626,6 +667,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         storage
             .alias_create(AliasScope::Project, rec)
@@ -657,6 +699,7 @@ mod tests {
             SourceSpec::Pattern("shi_*".into()),
             Some(AliasAggregator::Count),
             "{}".to_string(),
+            None,
             None,
             None,
             None,

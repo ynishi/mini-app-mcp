@@ -1032,6 +1032,131 @@ fn alias_create_with_both_sources_and_table_is_rejected() {
     );
 }
 
+// =============================================================================
+// Phase 3 — alias_create `fields` e2e (stored field projection)
+// =============================================================================
+
+/// (T1 — happy path) alias_create with a stored `fields` projection;
+/// alias_run called WITHOUT a run-time `fields` argument must apply the
+/// stored projection (Crux #2 fallback).
+///
+/// Assertion: every returned row contains the projected key ("text") and
+/// does NOT contain keys that were projected away ("id", "tags").
+#[test]
+fn alias_create_with_fields_then_alias_run_uses_stored_fields() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    // Seed a row so alias_run has something to return.
+    client.call_tool(
+        "create",
+        json!({
+            "table": "emo",
+            "data": { "text": "projected row", "tags": ["a"] },
+        }),
+    );
+
+    // alias_create with a List{fields:["text"]} stored projection.
+    // Use a "like '%'" filter to match all rows (no valid "all" variant exists).
+    let created = client.call_tool(
+        "alias_create",
+        json!({
+            "sources": { "kind": "single", "value": "emo" },
+            "name": "emo_text_only",
+            "filter": { "type": "like", "field": "text", "pattern": "%" },
+            "fields": { "mode": "list", "fields": ["text"] }
+        }),
+    );
+    assert_eq!(
+        created.get("created").and_then(Value::as_str),
+        Some("emo_text_only"),
+        "alias_create should return created name, got: {created:?}"
+    );
+
+    // alias_run without run-time fields → must fall back to stored projection.
+    let rows: Vec<Value> =
+        serde_json::from_value(client.call_tool("alias_run", json!({ "name": "emo_text_only" })))
+            .expect("alias_run should return a JSON array");
+
+    assert!(
+        !rows.is_empty(),
+        "alias_run should return at least one row, got: {rows:?}"
+    );
+    for row in &rows {
+        let data = row.get("data").expect("row.data missing");
+        assert!(
+            data.get("text").is_some(),
+            "stored fields projection must include 'text', got: {data:?}"
+        );
+        assert!(
+            data.get("id").is_none(),
+            "stored fields projection must exclude 'id' (not in fields list), got: {data:?}"
+        );
+        assert!(
+            data.get("tags").is_none(),
+            "stored fields projection must exclude 'tags' (not in fields list), got: {data:?}"
+        );
+    }
+}
+
+/// (T2 — Crux #3 regression guard) alias_create with NO `fields` stored;
+/// alias_run called WITHOUT run-time `fields` must NOT apply an empty
+/// projection — all fields must be present (NULL record.fields ≠ empty list).
+#[test]
+fn alias_create_without_fields_alias_run_returns_all_fields() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    client.call_tool(
+        "create",
+        json!({
+            "table": "emo",
+            "data": { "text": "no projection row", "tags": ["b"] },
+        }),
+    );
+
+    // Use a "like '%'" filter to match all rows.
+    let created = client.call_tool(
+        "alias_create",
+        json!({
+            "sources": { "kind": "single", "value": "emo" },
+            "name": "emo_no_fields",
+            "filter": { "type": "like", "field": "text", "pattern": "%" }
+            // no `fields` key — stored default must be NULL
+        }),
+    );
+    assert_eq!(
+        created.get("created").and_then(Value::as_str),
+        Some("emo_no_fields"),
+        "alias_create should return created name, got: {created:?}"
+    );
+
+    let rows: Vec<Value> =
+        serde_json::from_value(client.call_tool("alias_run", json!({ "name": "emo_no_fields" })))
+            .expect("alias_run should return a JSON array");
+
+    assert!(
+        !rows.is_empty(),
+        "alias_run should return at least one row, got: {rows:?}"
+    );
+    // Crux #3: NULL stored fields must never be coerced to an empty projection.
+    // All schema fields ("id", "text") must be present in every returned row.
+    for row in &rows {
+        let data = row.get("data").expect("row.data missing");
+        assert!(
+            data.get("text").is_some(),
+            "NULL stored fields must not suppress 'text', got: {data:?}"
+        );
+    }
+    // The top-level "id" field lives on the row object, not under "data".
+    for row in &rows {
+        assert!(
+            row.get("id").is_some(),
+            "NULL stored fields must not suppress row 'id', got: {row:?}"
+        );
+    }
+}
+
 #[test]
 fn query_aggregate_empty_multi_returns_aggregator_error() {
     // (l) Empty Multi sources → AGGREGATOR_ERROR.
