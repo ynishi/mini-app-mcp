@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.14.0] - 2026-06-21
+
+### Added
+
 - **`ListFilter::ArrayContains` / `ArrayNotContains` primitives** (`crates/core/src/filter.rs`) — server-side filtering for array-typed schema fields. Wire form `{"type": "array_contains", "field": "<name>", "value": <scalar>}` (and `array_not_contains` sibling). SQL generated as `EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.<field>')) WHERE value = ?)` (and `NOT EXISTS` for the negative variant). Validation rejects non-array fields with a `MiniAppError::Validation` mirroring the existing `Like`/`String` guard pattern. Note: `ArrayNotContains` matches rows where `<field>` is absent or NULL (SQLite `json_each` returns an empty set → `NOT EXISTS` is true) — documented in `FILTERS_DOC`.
 - New private helper `validate_array_element_scalar` (`crates/core/src/filter.rs`) — scalar guard (string/number/boolean accept; null/object/array reject) without field-type matching, used by the two new variants.
 - 8 new unit tests in `crates/core/src/filter.rs` covering: ok / unknown field reject / non-array field reject / null value reject / object value reject / `ArrayContains` build_sql / `ArrayNotContains` build_sql / serde roundtrip.

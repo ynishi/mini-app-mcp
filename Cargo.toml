@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/mcp"]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Yutaka Nishimura"]
@@ -11,4 +11,4 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ynishi/mini-app-mcp"
 
 [workspace.dependencies]
-mini-app-core = { path = "crates/core", version = "0.13.0" }
+mini-app-core = { path = "crates/core", version = "0.14.0" }
