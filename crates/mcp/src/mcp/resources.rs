@@ -300,6 +300,33 @@ Match rows where `field` matches a SQL LIKE pattern.  Only `string`-typed fields
 - `_`: matches any single character.
 - Restricted to `string`-typed fields; non-string fields are rejected with `VALIDATION_ERROR`.
 
+## `ArrayContains` — array element containment
+
+Match rows where the JSON array at `field` contains at least one element equal to `value`.
+
+```json
+{ "type": "array_contains", "field": "tags", "value": "rust" }
+```
+
+- `field`: must be an `array`-typed field in `schema.yaml`.
+- `value`: must be a scalar (string, number, or boolean); `null`, objects, and arrays are rejected.
+- Restricted to `array`-typed fields; non-array fields are rejected with `VALIDATION_ERROR`.
+
+## `ArrayNotContains` — array element exclusion
+
+Match rows where the JSON array at `field` does **not** contain any element equal to `value`.
+
+```json
+{ "type": "array_not_contains", "field": "read_by", "value": "mia" }
+```
+
+- `field`: must be an `array`-typed field in `schema.yaml`.
+- `value`: must be a scalar (string, number, or boolean); `null`, objects, and arrays are rejected.
+- Restricted to `array`-typed fields; non-array fields are rejected with `VALIDATION_ERROR`.
+- **Note on NULL/non-array rows**: if `field` is `NULL` or not a valid JSON array in a given
+  row, SQLite's `json_each` returns zero rows → `NOT EXISTS` is `true` → those rows **are**
+  matched.  Add an `Eq`/`In` guard if you need to exclude rows with missing/non-array values.
+
 ## `Or` — logical OR
 
 Match rows that satisfy **at least one** of the nested filters.
@@ -335,6 +362,7 @@ Match rows that satisfy **all** of the nested filters.
   "type": "and",
   "filters": [
     { "type": "eq", "field": "project", "value": "my-project" },
+    { "type": "array_contains", "field": "tags", "value": "urgent" },
     {
       "type": "or",
       "filters": [
@@ -614,7 +642,15 @@ mod tests {
 
     #[test]
     fn filters_doc_contains_all_filter_types() {
-        for filter_type in &["Eq", "In", "Like", "Or", "And"] {
+        for filter_type in &[
+            "Eq",
+            "In",
+            "Like",
+            "ArrayContains",
+            "ArrayNotContains",
+            "Or",
+            "And",
+        ] {
             assert!(
                 FILTERS_DOC.contains(&format!("## `{filter_type}`")),
                 "FILTERS_DOC must contain section for '{filter_type}'"

@@ -725,9 +725,10 @@ struct ListParams {
     /// `MINI_APP_DB`) this may be omitted and the single configured table is
     /// used automatically.
     table: Option<String>,
-    /// Optional server-side filter.  Supports `Eq`, `In`, `Or`, and `And`
-    /// variants.  All field names must be present in the table's `schema.yaml`
-    /// and values must match the schema-declared type.  Omitting this argument
+    /// Optional server-side filter.  Supports `Eq`, `In`, `Like`,
+    /// `ArrayContains`, `ArrayNotContains`, `Or`, and `And` variants.
+    /// All field names must be present in the table's `schema.yaml` and
+    /// values must match the schema-declared type.  Omitting this argument
     /// (or passing `null`) returns all rows unfiltered (backward-compatible).
     #[serde(default)]
     filter: Option<ListFilter>,
@@ -1036,7 +1037,7 @@ impl MiniAppMcpServer {
     #[tool(
         name = "list",
         description = "List rows ordered by created_at descending. Supports limit (default 100, max 1000) and offset. \
-                       Optional `filter` argument supports Eq/In/Or/And composition over schema-validated fields. \
+                       Optional `filter` argument supports Eq/In/Like/ArrayContains/ArrayNotContains/Or/And composition over schema-validated fields. \
                        In multi-table mode, `table` is required; omitting it returns a \
                        TABLE_REQUIRED error (data.code=\"TABLE_REQUIRED\"). \
                        In legacy single-table mode (`MINI_APP_SCHEMA`+`MINI_APP_DB`), `table` may be omitted. \

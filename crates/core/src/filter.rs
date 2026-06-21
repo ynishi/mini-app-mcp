@@ -65,6 +65,10 @@ impl rusqlite::ToSql for FilterParam {
 /// - `And` — logical AND of a non-empty list of sub-filters (parenthesised)
 /// - `Like` — SQL LIKE pattern match: `json_extract(data, '$.field') LIKE ?`
 ///   (`%` matches any substring, `_` matches any single character)
+/// - `ArrayContains` — array element containment:
+///   `EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.field')) WHERE value = ?)`
+/// - `ArrayNotContains` — array element exclusion:
+///   `NOT EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.field')) WHERE value = ?)`
 ///
 /// # Example JSON
 /// ```json
@@ -122,6 +126,52 @@ pub enum ListFilter {
         /// SQL LIKE pattern.  Use `%` for any substring and `_` for any single
         /// character (e.g. `"%hello%"`, `"prefix_%"`).
         pattern: String,
+    },
+    /// Array element containment filter.
+    ///
+    /// Matches rows where the JSON array stored at `field` contains at least
+    /// one element equal to `value`.
+    ///
+    /// SQL generated:
+    /// `EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.field')) WHERE value = ?)`
+    ///
+    /// Only supported on `array`-typed schema fields.  `value` must be a
+    /// scalar (string, number, or boolean); `null`, objects, and arrays are
+    /// rejected during validation.
+    ///
+    /// **Note on NULL/non-array rows**: if the stored value for `field` is
+    /// `NULL` or is not a valid JSON array, SQLite's `json_each` returns zero
+    /// rows → `EXISTS` evaluates to `false` → those rows are **not** matched.
+    ArrayContains {
+        /// Schema field name.  Must be an `array`-typed field.
+        field: String,
+        /// Scalar element to look for inside the array.  Must be a string,
+        /// number, or boolean.
+        value: serde_json::Value,
+    },
+    /// Array element exclusion filter.
+    ///
+    /// Matches rows where the JSON array stored at `field` does **not**
+    /// contain any element equal to `value`.
+    ///
+    /// SQL generated:
+    /// `NOT EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.field')) WHERE value = ?)`
+    ///
+    /// Only supported on `array`-typed schema fields.  `value` must be a
+    /// scalar (string, number, or boolean); `null`, objects, and arrays are
+    /// rejected during validation.
+    ///
+    /// **Note on NULL/non-array rows**: if the stored value for `field` is
+    /// `NULL` or is not a valid JSON array, SQLite's `json_each` returns zero
+    /// rows → `NOT EXISTS` evaluates to `true` → those rows **are** matched.
+    /// Combine with an `Eq`/`In` guard if you need to exclude rows with
+    /// missing or non-array values.
+    ArrayNotContains {
+        /// Schema field name.  Must be an `array`-typed field.
+        field: String,
+        /// Scalar element to exclude from the array.  Must be a string,
+        /// number, or boolean.
+        value: serde_json::Value,
     },
 }
 
@@ -209,6 +259,46 @@ impl ListFilter {
                     });
                 }
             }
+            ListFilter::ArrayContains { field, value } => {
+                let field_def = schema.fields.iter().find(|f| &f.name == field);
+                let fd = field_def.ok_or_else(|| MiniAppError::Validation {
+                    field: field.clone(),
+                    reason: format!(
+                        "unknown field '{field}' — only schema-registered fields are allowed in filter"
+                    ),
+                })?;
+                if fd.ty != crate::schema::FieldType::Array {
+                    return Err(MiniAppError::Validation {
+                        field: field.clone(),
+                        reason: format!(
+                            "array_contains filter is only supported on array fields, \
+                             but field '{field}' has type {}",
+                            fd.ty.as_str(),
+                        ),
+                    });
+                }
+                validate_array_element_scalar(field, value)?;
+            }
+            ListFilter::ArrayNotContains { field, value } => {
+                let field_def = schema.fields.iter().find(|f| &f.name == field);
+                let fd = field_def.ok_or_else(|| MiniAppError::Validation {
+                    field: field.clone(),
+                    reason: format!(
+                        "unknown field '{field}' — only schema-registered fields are allowed in filter"
+                    ),
+                })?;
+                if fd.ty != crate::schema::FieldType::Array {
+                    return Err(MiniAppError::Validation {
+                        field: field.clone(),
+                        reason: format!(
+                            "array_not_contains filter is only supported on array fields, \
+                             but field '{field}' has type {}",
+                            fd.ty.as_str(),
+                        ),
+                    });
+                }
+                validate_array_element_scalar(field, value)?;
+            }
         }
         Ok(())
     }
@@ -249,6 +339,20 @@ impl ListFilter {
             ListFilter::Like { field, pattern } => {
                 let sql = format!("json_extract(data, '$.{field}') LIKE ?");
                 Ok((sql, vec![FilterParam::Text(pattern.clone())]))
+            }
+            ListFilter::ArrayContains { field, value } => {
+                let param = json_value_to_param(field, value)?;
+                let sql = format!(
+                    "EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.{field}')) WHERE value = ?)"
+                );
+                Ok((sql, vec![param]))
+            }
+            ListFilter::ArrayNotContains { field, value } => {
+                let param = json_value_to_param(field, value)?;
+                let sql = format!(
+                    "NOT EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.{field}')) WHERE value = ?)"
+                );
+                Ok((sql, vec![param]))
             }
         }
     }
@@ -320,6 +424,35 @@ fn validate_scalar_value(
                  got {}",
                 field_ty.as_str(),
                 json_type_name(value),
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate that `value` is a scalar element suitable for an
+/// `array_contains` / `array_not_contains` filter.
+///
+/// Accepts string, number, and boolean values.  Rejects `null`, objects, and
+/// arrays.  Unlike [`validate_scalar_value`], does **not** check the schema
+/// field type: array element types are not declared in `schema.yaml`, so SQLite's
+/// `json_each` performs the comparison dynamically at query time.
+fn validate_array_element_scalar(
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<(), MiniAppError> {
+    if value.is_null() {
+        return Err(MiniAppError::Validation {
+            field: field.to_string(),
+            reason: format!("filter value for field '{field}' must not be null"),
+        });
+    }
+    if value.is_object() || value.is_array() {
+        return Err(MiniAppError::Validation {
+            field: field.to_string(),
+            reason: format!(
+                "filter value for field '{field}' must be a scalar (string, number, or boolean), \
+                 got an object or array"
             ),
         });
     }
@@ -882,6 +1015,150 @@ mod tests {
                 FilterParam::Text("inbox".to_string()),
             ]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ArrayContains / ArrayNotContains variant tests
+    // -----------------------------------------------------------------------
+
+    /// ArrayContains validates successfully against an `array`-typed field
+    /// with a string scalar value.
+    #[test]
+    fn array_contains_validate_ok() {
+        let schema = make_schema(vec![("tags", FieldType::Array)]);
+        let f = ListFilter::ArrayContains {
+            field: "tags".to_string(),
+            value: serde_json::json!("rust"),
+        };
+        assert!(f.validate(&schema).is_ok());
+    }
+
+    /// ArrayContains with an unknown field name is rejected.
+    #[test]
+    fn array_contains_unknown_field_reject() {
+        let schema = make_schema(vec![("tags", FieldType::Array)]);
+        let f = ListFilter::ArrayContains {
+            field: "nonexistent_field".to_string(),
+            value: serde_json::json!("rust"),
+        };
+        let err = f.validate(&schema).unwrap_err();
+        match err {
+            MiniAppError::Validation { field, reason } => {
+                assert_eq!(field, "nonexistent_field");
+                assert!(reason.contains("unknown field"), "got: {reason}");
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// ArrayContains against a non-array (String) field is rejected with a
+    /// message mentioning "array fields".
+    #[test]
+    fn array_contains_non_array_field_reject() {
+        let schema = make_schema(vec![("subject", FieldType::String)]);
+        let f = ListFilter::ArrayContains {
+            field: "subject".to_string(),
+            value: serde_json::json!("hello"),
+        };
+        let err = f.validate(&schema).unwrap_err();
+        match err {
+            MiniAppError::Validation { field, reason } => {
+                assert_eq!(field, "subject");
+                assert!(
+                    reason.contains("array fields"),
+                    "expected reason to contain 'array fields', got: {reason}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// ArrayContains with a null value is rejected.
+    #[test]
+    fn array_contains_null_value_reject() {
+        let schema = make_schema(vec![("tags", FieldType::Array)]);
+        let f = ListFilter::ArrayContains {
+            field: "tags".to_string(),
+            value: serde_json::Value::Null,
+        };
+        let err = f.validate(&schema).unwrap_err();
+        match err {
+            MiniAppError::Validation { field, .. } => assert_eq!(field, "tags"),
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// ArrayContains with an object value is rejected.
+    #[test]
+    fn array_contains_object_value_reject() {
+        let schema = make_schema(vec![("tags", FieldType::Array)]);
+        let f = ListFilter::ArrayContains {
+            field: "tags".to_string(),
+            value: serde_json::json!({}),
+        };
+        let err = f.validate(&schema).unwrap_err();
+        match err {
+            MiniAppError::Validation { field, reason } => {
+                assert_eq!(field, "tags");
+                assert!(
+                    reason.contains("scalar"),
+                    "expected reason to mention 'scalar', got: {reason}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// ArrayContains builds the correct EXISTS SQL fragment and bound param.
+    #[test]
+    fn array_contains_build_sql() {
+        let f = ListFilter::ArrayContains {
+            field: "tags".to_string(),
+            value: serde_json::json!("rust"),
+        };
+        let (sql, params) = f.build_sql().unwrap();
+        assert_eq!(
+            sql,
+            "EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.tags')) WHERE value = ?)"
+        );
+        assert_eq!(params, vec![FilterParam::Text("rust".to_string())]);
+    }
+
+    /// ArrayNotContains builds the correct NOT EXISTS SQL fragment and bound param.
+    #[test]
+    fn array_not_contains_build_sql() {
+        let f = ListFilter::ArrayNotContains {
+            field: "read_by".to_string(),
+            value: serde_json::json!("mia"),
+        };
+        let (sql, params) = f.build_sql().unwrap();
+        assert_eq!(
+            sql,
+            "NOT EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.read_by')) WHERE value = ?)"
+        );
+        assert_eq!(params, vec![FilterParam::Text("mia".to_string())]);
+    }
+
+    /// ArrayContains serializes to `"type": "array_contains"` and round-trips
+    /// through serde correctly.
+    #[test]
+    fn array_contains_serde_roundtrip() {
+        let f = ListFilter::ArrayContains {
+            field: "tags".to_string(),
+            value: serde_json::json!("rust"),
+        };
+        let val = serde_json::to_value(&f).unwrap();
+        assert_eq!(val["type"], "array_contains");
+        assert_eq!(val["field"], "tags");
+        assert_eq!(val["value"], "rust");
+        let roundtrip: ListFilter = serde_json::from_value(val).unwrap();
+        match roundtrip {
+            ListFilter::ArrayContains { field, value } => {
+                assert_eq!(field, "tags");
+                assert_eq!(value, serde_json::json!("rust"));
+            }
+            other => panic!("expected ArrayContains variant, got {other:?}"),
+        }
     }
 
     /// Like variant serializes to `"type": "like"` and round-trips through
