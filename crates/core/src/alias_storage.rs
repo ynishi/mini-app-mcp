@@ -86,6 +86,11 @@ pub struct AliasRecord {
     /// `None` means no stored default — all fields are returned (Crux #3: must
     /// never be coerced to an empty projection list).
     pub fields: Option<String>,
+    /// Optional default order-by stored as a serialised
+    /// `Vec<`[`crate::order_by::OrderByItem`]`>` JSON string.
+    /// `None` means no stored default — falls back to the store's default
+    /// `ORDER BY created_at DESC`.
+    pub order_by: Option<String>,
     /// Origin scope of this record after `alias_get` / `alias_list`.
     /// `None` for newly-constructed records that have not yet been
     /// persisted or loaded.
@@ -106,6 +111,8 @@ impl AliasRecord {
     /// - `params_schema` — optional JSON array of parameter names.
     /// - `fields` — optional serialised [`crate::materialize::FieldSelector`]; `None`
     ///   means no stored default projection (all fields returned).
+    /// - `order_by` — optional serialised `Vec<OrderByItem>`; `None` means no stored
+    ///   default sort order (store default `ORDER BY created_at DESC` applies).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: impl Into<String>,
@@ -116,6 +123,7 @@ impl AliasRecord {
         description: Option<String>,
         params_schema: Option<String>,
         fields: Option<String>,
+        order_by: Option<String>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -126,6 +134,7 @@ impl AliasRecord {
             description,
             params_schema,
             fields,
+            order_by,
             scope: None,
         }
     }
@@ -142,7 +151,8 @@ const CREATE_GLOBAL_ALIASES_SQL: &str = "
         default_limit   INTEGER,
         description     TEXT,
         params_schema   TEXT,
-        fields          TEXT
+        fields          TEXT,
+        order_by        TEXT
     )
 ";
 
@@ -288,14 +298,15 @@ impl GlobalAliasStorage {
         let description = record.description.clone();
         let params_schema = record.params_schema.clone();
         let fields = record.fields.clone();
+        let order_by = record.order_by.clone();
         tokio::task::spawn_blocking(move || -> Result<(), MiniAppError> {
             let conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".into()))?;
             conn.execute(
                 "INSERT OR IGNORE INTO _global_aliases \
-                 (name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields, order_by) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     name,
                     sources_json,
@@ -305,6 +316,7 @@ impl GlobalAliasStorage {
                     description,
                     params_schema,
                     fields,
+                    order_by,
                 ],
             )?;
             if conn.changes() == 0 {
@@ -353,7 +365,7 @@ impl GlobalAliasStorage {
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".into()))?;
             let mut stmt = conn.prepare(
-                "SELECT name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields \
+                "SELECT name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields, order_by \
                  FROM _global_aliases WHERE name = ?1",
             )?;
             let row = stmt
@@ -487,8 +499,8 @@ impl GlobalAliasStorage {
                 for (name, filter, default_limit, description, params_schema) in rows {
                     dst.execute(
                         "INSERT OR IGNORE INTO _global_aliases \
-                         (name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields) \
-                         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL)",
+                         (name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields, order_by) \
+                         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, NULL)",
                         rusqlite::params![
                             name,
                             sources_json,
@@ -538,6 +550,19 @@ fn open_scope_db(dir: &Path) -> Result<(Arc<Mutex<rusqlite::Connection>>, PathBu
     if !has_fields {
         conn.execute_batch("ALTER TABLE _global_aliases ADD COLUMN fields TEXT")?;
     }
+    // Idempotent migration: add `order_by` column to existing databases that
+    // were created before this column was introduced.  Same pattern as the
+    // `fields` migration above.
+    let has_order_by: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM pragma_table_info('_global_aliases') WHERE name = 'order_by'",
+        )?;
+        stmt.query_row([], |row| row.get::<_, i64>(0))
+            .map(|n| n > 0)?
+    };
+    if !has_order_by {
+        conn.execute_batch("ALTER TABLE _global_aliases ADD COLUMN order_by TEXT")?;
+    }
     Ok((Arc::new(Mutex::new(conn)), db_path))
 }
 
@@ -550,6 +575,7 @@ fn extract_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AliasRecord> {
     let description: Option<String> = row.get(5)?;
     let params_schema: Option<String> = row.get(6)?;
     let fields: Option<String> = row.get(7)?;
+    let order_by: Option<String> = row.get(8)?;
     let sources: SourceSpec = serde_json::from_str(&sources_json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
             1,
@@ -580,6 +606,7 @@ fn extract_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AliasRecord> {
         description,
         params_schema,
         fields,
+        order_by,
         scope: None,
     })
 }
@@ -593,7 +620,7 @@ async fn list_scope(
             .lock()
             .map_err(|_| MiniAppError::Schema("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields \
+            "SELECT name, sources_json, aggregator_json, filter, default_limit, description, params_schema, fields, order_by \
              FROM _global_aliases ORDER BY name ASC",
         )?;
         let rows = stmt
@@ -629,6 +656,7 @@ mod tests {
             r#"{"type":"eq","field":"status","value":"open"}"#,
             Some(20),
             Some("sample".into()),
+            None,
             None,
             None,
         )
@@ -668,6 +696,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         storage
             .alias_create(AliasScope::Project, rec)
@@ -699,6 +728,7 @@ mod tests {
             SourceSpec::Pattern("shi_*".into()),
             Some(AliasAggregator::Count),
             "{}".to_string(),
+            None,
             None,
             None,
             None,
@@ -990,5 +1020,51 @@ mod tests {
         assert_eq!(migrated, 0);
         let got = storage.alias_get("shared").await.unwrap();
         assert_eq!(got.description.as_deref(), Some("existing-global"));
+    }
+
+    #[tokio::test]
+    async fn order_by_roundtrip() {
+        let storage = GlobalAliasStorage::open_in_memory().unwrap();
+        let order_by_json =
+            r#"[{"field":"priority","direction":"asc"},{"field":"due","direction":"asc"}]"#;
+        let rec = AliasRecord::new(
+            "sorted_alias",
+            SourceSpec::Single("todo".into()),
+            None,
+            "{}",
+            None,
+            None,
+            None,
+            None,
+            Some(order_by_json.to_string()),
+        );
+        storage
+            .alias_create(AliasScope::Project, rec)
+            .await
+            .unwrap();
+        let got = storage.alias_get("sorted_alias").await.unwrap();
+        assert_eq!(got.order_by.as_deref(), Some(order_by_json));
+    }
+
+    #[tokio::test]
+    async fn order_by_none_roundtrip() {
+        let storage = GlobalAliasStorage::open_in_memory().unwrap();
+        let rec = AliasRecord::new(
+            "unsorted_alias",
+            SourceSpec::Single("todo".into()),
+            None,
+            "{}",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        storage
+            .alias_create(AliasScope::Project, rec)
+            .await
+            .unwrap();
+        let got = storage.alias_get("unsorted_alias").await.unwrap();
+        assert!(got.order_by.is_none());
     }
 }

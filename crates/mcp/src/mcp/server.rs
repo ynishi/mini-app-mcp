@@ -55,6 +55,7 @@ use crate::mcp::schema_tools::{
 use crate::schema::SchemaConfig;
 use crate::snapshot::{self, DataSnapshotParams};
 use crate::store::{Store, UpdateMode};
+use mini_app_core::order_by::OrderByItem;
 
 // =============================================================================
 // Public entry point
@@ -241,6 +242,8 @@ fn alias_record_to_json(r: &AliasRecord) -> serde_json::Value {
         "default_limit": r.default_limit,
         "description": r.description,
         "params_schema": r.params_schema,
+        "fields": r.fields,
+        "order_by": r.order_by,
         "scope": r.scope.map(|s| match s {
             AliasScope::Project => "project",
             AliasScope::User => "user",
@@ -293,6 +296,7 @@ async fn alias_run_resolve_record(
             leg.description,
             leg.params_schema,
             None, // legacy mode has no stored field projection
+            None, // legacy mode has no stored order_by
         );
         Ok((rec, params.table.clone()))
     }
@@ -354,6 +358,7 @@ const URI_DOCS_QUICKSTART: &str = "docs://quickstart";
 const URI_DOCS_TOOLS: &str = "docs://tools";
 const URI_DOCS_ERRORS: &str = "docs://errors";
 const URI_DOCS_FILTERS: &str = "docs://filters";
+const URI_DOCS_ORDER_BY: &str = "docs://order-by";
 
 /// Parse the `table=<name>` query parameter from a URI of the form
 /// `<base>[?table=<name>[&...]]`.
@@ -491,6 +496,16 @@ impl MiniAppMcpServer {
                 .with_mime_type("text/markdown")
                 .no_annotation(),
         );
+        resources.push(
+            RawResource::new(URI_DOCS_ORDER_BY, "ORDER BY Reference")
+                .with_description(
+                    "Reference for the `order_by` argument — shape, multi-key sort, \
+                     backward-compat rules, and examples for `list`, `alias_create`, \
+                     and `alias_run`.",
+                )
+                .with_mime_type("text/markdown")
+                .no_annotation(),
+        );
 
         resources
     }
@@ -544,6 +559,9 @@ impl MiniAppMcpServer {
             }
             URI_DOCS_FILTERS => {
                 ResourceContents::text(res::FILTERS_DOC, uri).with_mime_type("text/markdown")
+            }
+            URI_DOCS_ORDER_BY => {
+                ResourceContents::text(res::ORDER_BY_DOC, uri).with_mime_type("text/markdown")
             }
             _ => {
                 return Err(McpError::resource_not_found(
@@ -741,6 +759,17 @@ struct ListParams {
     /// `VALIDATION_ERROR` (data.code="VALIDATION_ERROR").
     #[serde(default)]
     fields: Option<FieldSelector>,
+    /// Optional sort order. An ordered list of `{field, direction}` objects.
+    ///
+    /// Each `field` must be present in the table's `schema.yaml`; unknown fields
+    /// return `VALIDATION_ERROR`. `direction` is `"asc"` or `"desc"` (default
+    /// `"asc"` when omitted).  Multi-key sort is supported — keys are applied
+    /// left-to-right.  When omitted the store default (`ORDER BY created_at DESC`)
+    /// is used (backward-compatible).
+    ///
+    /// See the `docs://order-by` resource for the full reference and examples.
+    #[serde(default)]
+    order_by: Option<Vec<OrderByItem>>,
 }
 
 /// Parameters for the `update` tool.
@@ -838,6 +867,21 @@ struct AliasCreateParams {
     /// default — all fields are returned (Crux #3: never coerced to an
     /// empty list by the storage or run layer).
     fields: Option<FieldSelector>,
+    /// Optional default sort order to store with this alias.
+    ///
+    /// An ordered list of `{field, direction}` objects. Each `field` must be
+    /// present in the target table's `schema.yaml`; unknown fields are rejected
+    /// with `VALIDATION_ERROR` at run time.  `direction` is `"asc"` or `"desc"`
+    /// (default `"asc"` when omitted).  Multi-key sort is supported — keys are
+    /// applied left-to-right.
+    ///
+    /// When set, `alias_run` uses this sort order if no run-time `order_by`
+    /// override is supplied.  `null` / omitted means no stored default — the
+    /// store default (`ORDER BY created_at DESC`) applies (backward-compatible).
+    ///
+    /// See the `docs://order-by` resource for the full reference and examples.
+    #[serde(default)]
+    order_by: Option<Vec<OrderByItem>>,
 }
 
 /// Parameters for the `alias_list` tool.
@@ -886,6 +930,16 @@ struct AliasRunParams {
     /// `VALIDATION_ERROR` (data.code="VALIDATION_ERROR").
     #[serde(default)]
     fields: Option<FieldSelector>,
+    /// Optional run-time sort order override.
+    ///
+    /// An ordered list of `{field, direction}` objects. When supplied, overrides
+    /// any stored default sort order on the alias.  When omitted, the alias's
+    /// stored `order_by` default is used; if that is also absent, the store
+    /// default (`ORDER BY created_at DESC`) applies (backward-compatible).
+    ///
+    /// See the `docs://order-by` resource for the full reference and examples.
+    #[serde(default)]
+    order_by: Option<Vec<OrderByItem>>,
 }
 
 /// Parameters for the `query_aggregate` tool.
@@ -1064,7 +1118,7 @@ impl MiniAppMcpServer {
             f.validate(&schema).map_err(|e| e.to_string())?;
         }
         let records = store
-            .list(params.limit, params.offset, params.filter)
+            .list(params.limit, params.offset, params.filter, params.order_by)
             .await
             .map_err(|e| e.to_string())?;
         let records = materialize::apply_projection(records, &params.fields, &schema)
@@ -1692,6 +1746,13 @@ impl MiniAppMcpServer {
                 ),
                 None => None,
             };
+            let order_by_json = match params.order_by {
+                Some(ref v) => Some(
+                    serde_json::to_string(v)
+                        .map_err(|e| format!("alias_create: serialise order_by: {e}"))?,
+                ),
+                None => None,
+            };
             let record = AliasRecord::new(
                 &params.name,
                 sources,
@@ -1701,6 +1762,7 @@ impl MiniAppMcpServer {
                 params.description,
                 params_schema_json,
                 fields_json,
+                order_by_json,
             );
             global
                 .alias_create(target_scope, record)
@@ -1713,6 +1775,13 @@ impl MiniAppMcpServer {
             if params.fields.is_some() {
                 return Err(
                     "alias_create: 'fields' is not supported in legacy single-table mode \
+                     (per-table _aliases). Use the global alias path (multi-table mode)."
+                        .to_string(),
+                );
+            }
+            if params.order_by.is_some() {
+                return Err(
+                    "alias_create: 'order_by' is not supported in legacy single-table mode \
                      (per-table _aliases). Use the global alias path (multi-table mode)."
                         .to_string(),
                 );
@@ -1851,6 +1920,7 @@ impl MiniAppMcpServer {
             params.limit,
             params.offset,
             params.fields,
+            params.order_by,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -2089,6 +2159,7 @@ fields:\n\
                 table: None,
                 filter: None,
                 fields: None,
+                order_by: None,
             }))
             .await?;
         Ok(serde_json::from_str(&json).unwrap())
@@ -2465,13 +2536,13 @@ fields:\n\
     #[tokio::test]
     async fn list_resources_legacy_mode_has_schema_and_docs() {
         // In legacy (single-table) mode, resource_list() emits 3 schema URIs
-        // (with ?table=<name> query) + 4 docs URIs = 7 total.
+        // (with ?table=<name> query) + 5 docs URIs = 8 total.
         let (server, _tmp) = make_server().await;
         let resources = server.resource_list();
         assert_eq!(
             resources.len(),
-            7,
-            "expected exactly 7 resources in legacy mode, got: {:?}",
+            8,
+            "expected exactly 8 resources in legacy mode, got: {:?}",
             resources.iter().map(|r| &r.uri).collect::<Vec<_>>()
         );
         // Docs URIs must be present without query string.
@@ -2481,6 +2552,7 @@ fields:\n\
             "docs://tools",
             "docs://errors",
             "docs://filters",
+            "docs://order-by",
         ] {
             assert!(
                 uris.contains(expected),
@@ -2716,11 +2788,11 @@ fields:\n\
     async fn multi_table_resource_list_has_entries_for_each_table() {
         let server = make_multi_table_server().await;
         let resources = server.resource_list();
-        // 2 tables × 3 schema resources + 4 docs = 10
+        // 2 tables × 3 schema resources + 5 docs = 11
         assert_eq!(
             resources.len(),
-            10,
-            "expected 10 resources for 2 tables (2×3 schema + 4 docs), got: {:?}",
+            11,
+            "expected 11 resources for 2 tables (2×3 schema + 5 docs), got: {:?}",
             resources.iter().map(|r| &r.uri).collect::<Vec<_>>()
         );
         let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
@@ -3299,6 +3371,7 @@ fields:\n\
                 table: None,
                 filter: None,
                 fields,
+                order_by: None,
             }))
             .await?;
         Ok(serde_json::from_str(&json).unwrap())
@@ -3481,6 +3554,7 @@ fields:\n\
                 limit: None,
                 description: None,
                 fields: None,
+                order_by: None,
                 scope: None,
             }))
             .await
@@ -3496,6 +3570,7 @@ fields:\n\
                 fields: Some(FieldSelector::List {
                     fields: vec!["title".to_string()],
                 }),
+                order_by: None,
             }))
             .await
             .unwrap();
@@ -3531,6 +3606,7 @@ fields:\n\
                 limit: None,
                 description: None,
                 fields: None,
+                order_by: None,
                 scope: None,
             }))
             .await
@@ -3545,6 +3621,7 @@ fields:\n\
                 fields: Some(FieldSelector::List {
                     fields: vec!["nonexistent".to_string()],
                 }),
+                order_by: None,
             }))
             .await;
         assert!(result.is_err(), "unknown field must return error");
@@ -3608,6 +3685,7 @@ fields:\n\
                 limit: None,
                 description: None,
                 fields: None,
+                order_by: None,
                 scope: None,
             }))
             .await;
@@ -3635,6 +3713,7 @@ fields:\n\
                 limit: None,
                 description: None,
                 fields: None,
+                order_by: None,
                 scope: Some(AliasScope::User),
             }))
             .await;
@@ -3662,6 +3741,7 @@ fields:\n\
                 limit: None,
                 description: None,
                 fields: None,
+                order_by: None,
                 scope: Some(AliasScope::Project),
             }))
             .await;
@@ -3694,6 +3774,7 @@ fields:\n\
                 limit: None,
                 description: None,
                 fields: None,
+                order_by: None,
                 scope: None,
             }))
             .await

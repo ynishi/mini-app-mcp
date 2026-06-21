@@ -21,6 +21,7 @@ use rusqlite::{OptionalExtension, params_from_iter};
 
 use crate::error::MiniAppError;
 use crate::filter::ListFilter;
+use crate::order_by::OrderByItem;
 use crate::schema::SchemaConfig;
 
 // ---------------------------------------------------------------------------
@@ -512,6 +513,7 @@ impl Store {
         limit: Option<u32>,
         offset: Option<u32>,
         filter: Option<ListFilter>,
+        order_by: Option<Vec<OrderByItem>>,
     ) -> Result<Vec<RowRecord>, MiniAppError> {
         let conn = self.conn.clone();
         let limit = limit.unwrap_or(100).min(1000) as i64;
@@ -526,13 +528,22 @@ impl Store {
             }
         };
 
+        // Build ORDER BY clause from order_by items. Falls back to the legacy
+        // `created_at DESC` default when not supplied or when an empty slice is
+        // provided (callers should reject empty via validate_order_by first, but
+        // the store layer is defensive here for backward-compat).
+        let order_by_clause = match &order_by {
+            None => " ORDER BY created_at DESC".to_string(),
+            Some(items) if items.is_empty() => " ORDER BY created_at DESC".to_string(),
+            Some(items) => format!(" ORDER BY {}", crate::order_by::build_order_by_sql(items)),
+        };
+
         tokio::task::spawn_blocking(move || -> Result<Vec<RowRecord>, MiniAppError> {
             let conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             let sql = format!(
-                "SELECT id, data, created_at, updated_at FROM rows{where_clause} \
-                 ORDER BY created_at DESC LIMIT ? OFFSET ?"
+                "SELECT id, data, created_at, updated_at FROM rows{where_clause}{order_by_clause} LIMIT ? OFFSET ?"
             );
             // Combine filter params with LIMIT/OFFSET params in order.
             let mut all_params: Vec<Box<dyn rusqlite::ToSql>> = filter_params
@@ -1100,7 +1111,7 @@ mod tests {
             .create(serde_json::json!({"title": "t1"}))
             .await
             .unwrap();
-        let rows = store.list(None, None, None).await.unwrap();
+        let rows = store.list(None, None, None, None).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -1113,11 +1124,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let page1 = store.list(Some(2), Some(0), None).await.unwrap();
+        let page1 = store.list(Some(2), Some(0), None, None).await.unwrap();
         assert_eq!(page1.len(), 2);
-        let page2 = store.list(Some(2), Some(2), None).await.unwrap();
+        let page2 = store.list(Some(2), Some(2), None, None).await.unwrap();
         assert_eq!(page2.len(), 2);
-        let page3 = store.list(Some(2), Some(4), None).await.unwrap();
+        let page3 = store.list(Some(2), Some(4), None, None).await.unwrap();
         assert_eq!(page3.len(), 1);
     }
 
@@ -1228,7 +1239,7 @@ mod tests {
             .collect();
         let results: Vec<_> = futures::future::join_all(handles).await;
         assert!(results.iter().all(|r| r.as_ref().unwrap().is_ok()));
-        let rows = store.list(None, None, None).await.unwrap();
+        let rows = store.list(None, None, None, None).await.unwrap();
         assert_eq!(rows.len(), 4);
     }
 
@@ -1271,7 +1282,7 @@ mod tests {
             })
             .collect();
         futures::future::join_all(handles).await;
-        assert_eq!(store.list(None, None, None).await.unwrap().len(), 8);
+        assert_eq!(store.list(None, None, None, None).await.unwrap().len(), 8);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1446,7 +1457,7 @@ mod tests {
         );
 
         // After rollback: the row must not exist.
-        let rows = store.list(Some(1000), None, None).await.unwrap();
+        let rows = store.list(Some(1000), None, None, None).await.unwrap();
         assert_eq!(
             rows.len(),
             0,
@@ -1458,7 +1469,7 @@ mod tests {
             .create(serde_json::json!({"title": "after-rollback"}))
             .await
             .expect("store must be usable after SAVEPOINT rollback");
-        assert_eq!(store.list(None, None, None).await.unwrap().len(), 1);
+        assert_eq!(store.list(None, None, None, None).await.unwrap().len(), 1);
     }
 
     /// Test that execute_under_savepoint commits on success.
@@ -1483,7 +1494,7 @@ mod tests {
         );
 
         // The INSERT must be committed.
-        let rows = store.list(Some(10), None, None).await.unwrap();
+        let rows = store.list(Some(10), None, None, None).await.unwrap();
         assert_eq!(rows.len(), 1, "committed INSERT must persist");
     }
 
@@ -1513,7 +1524,11 @@ mod tests {
             .into_iter()
             .for_each(|r| r.expect("task must not panic"));
 
-        let total = store.list(Some(1000), None, None).await.unwrap().len();
+        let total = store
+            .list(Some(1000), None, None, None)
+            .await
+            .unwrap()
+            .len();
         assert_eq!(
             total,
             task_count * rows_per_task,
@@ -1562,7 +1577,7 @@ mod tests {
             .for_each(|r| r.expect("task must not panic"));
 
         // Final state: exactly 1 row, title is one of the last writes.
-        let rows = store.list(None, None, None).await.unwrap();
+        let rows = store.list(None, None, None, None).await.unwrap();
         assert_eq!(rows.len(), 1, "update must not insert extra rows");
         assert!(
             rows[0].data["title"].is_string(),

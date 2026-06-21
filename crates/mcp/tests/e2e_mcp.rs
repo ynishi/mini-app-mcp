@@ -709,7 +709,7 @@ fn alias_parameterized_run_missing_params() {
 // ---------------------------------------------------------------------------
 // query_aggregate scenarios (Phase 1 MultiTableQuery Aggregate)
 //
-// Scenarios (h)-(l) per workspace/tasks/aggregator-phase-1/subtask-3.md:
+// Scenarios (h)-(l) — Phase 1 aggregator scope:
 //   (h) Single source COUNT
 //   (i) Multi UNION ALL COUNT (Crux #3: UNION ALL, never JOIN)
 //   (j) Multi GROUP BY + HAVING + inner Sum (Crux #2: HAVING positioning)

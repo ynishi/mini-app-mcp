@@ -28,6 +28,14 @@ pub use store::UpdateMode;
 /// Server-side row filter for the `list` tool.
 pub mod filter;
 
+/// Server-side ORDER BY primitive for the `list` tool.
+///
+/// Provides [`order_by::OrderByItem`] (field + direction pair) and
+/// [`order_by::Direction`] (`Asc` / `Desc`), along with
+/// [`order_by::validate_order_by`] (schema-whitelist check) and
+/// [`order_by::build_order_by_sql`] (infallible SQL clause builder).
+pub mod order_by;
+
 /// Multi-table aggregation primitives (`query_aggregate` tool backend).
 ///
 /// Provides `AliasAggregator` (Count / Sum / Avg / Min / Max / GroupBy),

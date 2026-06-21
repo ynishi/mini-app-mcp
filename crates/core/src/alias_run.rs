@@ -31,6 +31,7 @@ use crate::alias_storage::AliasRecord;
 use crate::error::MiniAppError;
 use crate::filter::ListFilter;
 use crate::materialize::{FieldSelector, apply_projection};
+use crate::order_by::OrderByItem;
 use crate::registry::TableRegistry;
 
 // =============================================================================
@@ -92,6 +93,7 @@ pub enum AliasRunValue {
 /// - [`MiniAppError::TableNotFound`] — a referenced table is not in the
 ///   registry.
 /// - [`MiniAppError::Storage`] — underlying SQLite error.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_alias_run(
     registry: &TableRegistry,
     record: AliasRecord,
@@ -100,6 +102,7 @@ pub async fn execute_alias_run(
     limit_override: Option<u32>,
     offset: Option<u32>,
     fields: Option<FieldSelector>,
+    order_by_override: Option<Vec<OrderByItem>>,
 ) -> Result<AliasRunValue, MiniAppError> {
     // -----------------------------------------------------------------
     // Step 1: Render the filter template (Crux #1/#2).
@@ -161,10 +164,32 @@ pub async fn execute_alias_run(
     };
 
     // -----------------------------------------------------------------
+    // Order-by fallback (mirrors the fields fallback above).
+    //
+    // When the caller supplies `order_by_override` at run-time, use it.
+    // Otherwise fall back to the stored default from `record.order_by`.
+    // When both are None, no ORDER BY is applied — the store default
+    // (`ORDER BY created_at DESC`) is used instead.
+    // -----------------------------------------------------------------
+    let order_by = match order_by_override {
+        Some(v) => Some(v),
+        None => match record.order_by.as_deref() {
+            Some(json) => Some(serde_json::from_str(json).map_err(|e| {
+                MiniAppError::Schema(format!(
+                    "alias '{}' stored order_by parse error: {e}",
+                    record.name
+                ))
+            })?),
+            None => None,
+        },
+    };
+
+    // -----------------------------------------------------------------
     // Step 2: Aggregator path dispatch.
     // -----------------------------------------------------------------
     if let Some(agg) = record.aggregator {
-        return execute_aggregator_path(registry, record.sources, filter, agg, limit).await;
+        return execute_aggregator_path(registry, record.sources, filter, agg, limit, order_by)
+            .await;
     }
 
     // -----------------------------------------------------------------
@@ -178,6 +203,7 @@ pub async fn execute_alias_run(
         limit,
         offset,
         fields,
+        order_by,
     )
     .await
 }
@@ -188,13 +214,24 @@ pub async fn execute_alias_run(
 
 /// Aggregator execution path: resolves Pattern sources, validates, and calls
 /// [`execute_aggregate`].
+///
+/// `order_by` is silently ignored on this path — aggregator results have their
+/// own structure and do not map onto a per-row SQL ORDER BY.  A [`tracing::warn!`]
+/// is emitted so callers can diagnose unexpected sort arguments.
 async fn execute_aggregator_path(
     registry: &TableRegistry,
     sources: SourceSpec,
     filter: ListFilter,
     agg: AliasAggregator,
     _limit: Option<u32>,
+    order_by: Option<Vec<OrderByItem>>,
 ) -> Result<AliasRunValue, MiniAppError> {
+    if order_by.is_some() {
+        tracing::warn!(
+            "alias_run: order_by is set but the alias uses an aggregator — \
+             order_by is silently ignored on the aggregator path"
+        );
+    }
     let resolved = if sources.requires_resolve() {
         let table_names: Vec<String> = registry.table_names().map(str::to_owned).collect();
         sources.resolve_pattern(&table_names)?
@@ -216,7 +253,8 @@ async fn execute_aggregator_path(
 }
 
 /// Plain rows execution path: resolves a single-table store and returns rows
-/// after applying optional field projection.
+/// after applying optional field projection and order-by.
+#[allow(clippy::too_many_arguments)]
 async fn execute_rows_path(
     registry: &TableRegistry,
     sources: SourceSpec,
@@ -225,6 +263,7 @@ async fn execute_rows_path(
     limit: Option<u32>,
     offset: Option<u32>,
     fields: Option<FieldSelector>,
+    order_by: Option<Vec<OrderByItem>>,
 ) -> Result<AliasRunValue, MiniAppError> {
     let table_name: Option<&str> = match &sources {
         // Non-empty Single → use it directly.
@@ -248,7 +287,7 @@ async fn execute_rows_path(
     let schema = Arc::clone(&entry.schema);
 
     filter.validate(&schema)?;
-    let records = store.list(limit, offset, Some(filter)).await?;
+    let records = store.list(limit, offset, Some(filter), order_by).await?;
     let records = apply_projection(records, &fields, &schema)?;
     Ok(AliasRunValue::Rows(records))
 }
@@ -330,6 +369,7 @@ mod tests {
             description: None,
             params_schema: None,
             fields: None,
+            order_by: None,
             scope: None,
         }
     }
@@ -354,7 +394,7 @@ mod tests {
         let filter_json = r#"{"type":"eq","field":"status","value":"open"}"#;
         let record = plain_alias(SourceSpec::Single("items".into()), filter_json);
 
-        let result = execute_alias_run(&registry, record, None, None, None, None, None)
+        let result = execute_alias_run(&registry, record, None, None, None, None, None, None)
             .await
             .expect("execute_alias_run");
 
@@ -394,10 +434,11 @@ mod tests {
             description: None,
             params_schema: None,
             fields: None,
+            order_by: None,
             scope: None,
         };
 
-        let result = execute_alias_run(&registry, record, None, None, None, None, None)
+        let result = execute_alias_run(&registry, record, None, None, None, None, None, None)
             .await
             .expect("execute_alias_run");
 
@@ -433,14 +474,24 @@ mod tests {
             description: None,
             params_schema: Some(r#"["status"]"#.into()),
             fields: None,
+            order_by: None,
             scope: None,
         };
 
         let params = serde_json::json!({"status": "closed"});
 
-        let result = execute_alias_run(&registry, record, Some(params), None, None, None, None)
-            .await
-            .expect("execute_alias_run");
+        let result = execute_alias_run(
+            &registry,
+            record,
+            Some(params),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_alias_run");
 
         match result {
             AliasRunValue::Rows(rows) => {
@@ -481,6 +532,7 @@ mod tests {
             description: None,
             params_schema: Some(r#"["status"]"#.into()),
             fields: None,
+            order_by: None,
             scope: None,
         };
 
@@ -492,6 +544,7 @@ mod tests {
             &registry,
             record,
             Some(stringified_params),
+            None,
             None,
             None,
             None,
@@ -530,12 +583,22 @@ mod tests {
             description: None,
             params_schema: None,
             fields: None,
+            order_by: None,
             scope: None,
         };
 
-        let result = execute_alias_run(&registry, record, None, Some("items"), None, None, None)
-            .await
-            .expect("execute_alias_run");
+        let result = execute_alias_run(
+            &registry,
+            record,
+            None,
+            Some("items"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_alias_run");
 
         match result {
             AliasRunValue::Rows(rows) => assert!(!rows.is_empty()),
@@ -561,10 +624,11 @@ mod tests {
             description: None,
             params_schema: None,
             fields: None,
+            order_by: None,
             scope: None,
         };
 
-        let err = execute_alias_run(&registry, record, None, None, None, None, None)
+        let err = execute_alias_run(&registry, record, None, None, None, None, None, None)
             .await
             .expect_err("should fail");
 

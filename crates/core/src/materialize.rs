@@ -487,7 +487,7 @@ pub async fn do_materialize(
             limit,
             offset,
         } => {
-            let rows = store.list(limit, offset, Some(filter)).await?;
+            let rows = store.list(limit, offset, Some(filter), None).await?;
             if rows.is_empty() {
                 tracing::warn!("row_materialize: by_filter selector matched zero rows");
                 return Err(MiniAppError::MaterializeEmptyResult);

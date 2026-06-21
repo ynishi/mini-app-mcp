@@ -396,6 +396,106 @@ Then execute it with `alias_run`, optionally overriding `limit` and `offset` at 
 ```
 "#;
 
+/// Hand-written reference guide for the `order_by` argument.
+///
+/// Served via the `docs://order-by` MCP resource. Agents that use the `list`,
+/// `alias_create`, or `alias_run` tools can read this resource to understand
+/// how to construct valid `order_by` arrays.
+pub const ORDER_BY_DOC: &str = r#"# mini-app-mcp — ORDER BY Reference
+
+The `order_by` argument lets you control the sort order of rows returned by
+the `list` tool, stored as a default in `alias_create`, and overridden at
+run time in `alias_run`.
+
+## Shape
+
+`order_by` is a JSON array of sort-key objects:
+
+```json
+[
+  { "field": "<field_name>", "direction": "asc" | "desc" },
+  ...
+]
+```
+
+- **`field`**: must be a field name present in the table's `schema.yaml`.
+  Unknown field names are rejected with `VALIDATION_ERROR`
+  (`data.code="VALIDATION_ERROR"`).
+- **`direction`**: `"asc"` (ascending) or `"desc"` (descending).
+  When omitted the default is `"asc"`.
+
+## Multi-key sort
+
+Multiple keys are applied left-to-right (primary sort first):
+
+```json
+[
+  { "field": "priority", "direction": "asc" },
+  { "field": "due", "direction": "asc" }
+]
+```
+
+## Backward compatibility
+
+When `order_by` is omitted the store default (`ORDER BY created_at DESC`) is
+used — identical to the behaviour in versions before `order_by` was added.
+
+## `list` tool
+
+Pass `order_by` alongside `filter`, `limit`, and `offset`:
+
+```json
+{
+  "table": "mia_todo",
+  "filter": { "type": "eq", "field": "status", "value": "open" },
+  "order_by": [
+    { "field": "priority", "direction": "asc" },
+    { "field": "due", "direction": "asc" }
+  ]
+}
+```
+
+## `alias_create` — stored default
+
+Attach a default sort order to an alias:
+
+```json
+{
+  "table": "mia_todo",
+  "name": "open_high_priority",
+  "filter": { "type": "eq", "field": "status", "value": "open" },
+  "order_by": [
+    { "field": "priority", "direction": "asc" },
+    { "field": "due", "direction": "asc" }
+  ]
+}
+```
+
+When the alias is run without an `order_by` override the stored default is
+applied automatically.
+
+## `alias_run` — run-time override
+
+Override the alias's stored default at run time:
+
+```json
+{
+  "name": "open_high_priority",
+  "order_by": [{ "field": "due", "direction": "desc" }]
+}
+```
+
+If both a run-time `order_by` and a stored alias default exist, the run-time
+value takes precedence.
+
+## Notes
+
+- Aggregator aliases (those with an `aggregator` field in `alias_create`)
+  ignore `order_by`; a warning is logged but no error is returned.
+- `order_by` is silently ignored on the aggregator path — only row-result
+  aliases honour it.
+"#;
+
 // ---------------------------------------------------------------------------
 // JSON Schema derivation
 // ---------------------------------------------------------------------------
@@ -663,6 +763,32 @@ mod tests {
         assert!(
             FILTERS_DOC.contains("alias_create"),
             "FILTERS_DOC must mention alias_create"
+        );
+    }
+
+    #[test]
+    fn order_by_doc_contains_basic_sections() {
+        for section in &[
+            "## Shape",
+            "## Multi-key sort",
+            "## `list` tool",
+            "## `alias_create`",
+            "## `alias_run`",
+        ] {
+            assert!(
+                ORDER_BY_DOC.contains(section),
+                "ORDER_BY_DOC must contain section '{section}'"
+            );
+        }
+        // Must describe direction values
+        assert!(
+            ORDER_BY_DOC.contains("\"asc\"") && ORDER_BY_DOC.contains("\"desc\""),
+            "ORDER_BY_DOC must document direction values asc and desc"
+        );
+        // Must mention VALIDATION_ERROR for unknown fields
+        assert!(
+            ORDER_BY_DOC.contains("VALIDATION_ERROR"),
+            "ORDER_BY_DOC must mention VALIDATION_ERROR for unknown fields"
         );
     }
 }
