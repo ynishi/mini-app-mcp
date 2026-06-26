@@ -19,6 +19,7 @@ pub use mini_app_core::error;
 pub use mini_app_core::filter;
 pub use mini_app_core::materialize;
 pub use mini_app_core::registry;
+pub use mini_app_core::row_history;
 pub use mini_app_core::schema;
 pub use mini_app_core::snapshot;
 pub use mini_app_core::store;

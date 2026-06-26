@@ -72,5 +72,13 @@ pub mod snapshot;
 /// both the MCP tool handler and direct SDK consumers.
 pub mod alias_run;
 
+/// Row-level change history (`_row_history` table).
+///
+/// Records every `create`, `update`, and `delete` atomically (same SQLite
+/// transaction as the data DML).  Exposes [`row_history::ensure_history_table`],
+/// [`row_history::record_in_tx`], [`row_history::fetch_at`],
+/// [`row_history::list_versions`], and [`row_history::purge_old_history`].
+pub mod row_history;
+
 /// Re-export of [`error::MiniAppError`] for convenient `use mini_app_core::MiniAppError`.
 pub use error::MiniAppError;

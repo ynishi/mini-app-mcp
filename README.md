@@ -718,6 +718,46 @@ deleted, preserving a rollback path until a future minor release.
   falls back to the per-table `Store::alias_*` path; `Pattern` sources
   are rejected in this mode.
 
+## Row history auto log
+
+Every `create`, `update`, and `delete` call automatically writes a full-JSON snapshot of the affected row into a `_row_history` table inside the same SQLite database. The snapshot is written atomically inside the same transaction as the data change — either both the data DML and the history record commit, or neither does.
+
+### What gets recorded
+
+| Event | `op` value | `data_json` | `prev_data_json` |
+|---|---|---|---|
+| `create` | `"create"` | new row JSON | `null` |
+| `update` | `"update"` | merged result JSON | previous row JSON |
+| `delete` | `"delete"` | deleted row JSON | `null` |
+
+Every history record also carries a monotonically increasing `version` counter (scoped per `table + row id`) and a `recorded_at` Unix seconds timestamp.
+
+### Restoring a row with `row_restore`
+
+`row_restore` fetches the latest snapshot at or before a given Unix timestamp and writes it back as the live row. If the row was deleted it is re-inserted with the same `id`; if the row still exists it is replaced with the snapshot data.
+
+```json
+{
+  "name": "row_restore",
+  "arguments": {
+    "table": "issues",
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "at_unix_secs": 1750000000
+  }
+}
+```
+
+The response is the same shape as `get` — a full row object with `id`, `data`, `created_at`, and `updated_at`.
+
+### Purge SOP
+
+History records are **not** purged on every update. Purge is a separate operation performed by calling `purge_old_history` in application code with the desired retention policy:
+
+- **Retention window**: 30 days (records older than 30 days are deleted)
+- **Max versions per row**: 100 (oldest versions beyond 100 are deleted per row)
+
+Purge is intentionally not wired to any automatic hook so that history accumulation does not add latency to normal `create` / `update` / `delete` calls.
+
 ## Storage notes
 
 SQLite databases are opened in WAL journal mode for safe concurrent access during `reload`. Sidecar files `<db>.db-wal` and `<db>.db-shm` are created next to each `.db` file — these are managed by SQLite and should not be deleted manually.
