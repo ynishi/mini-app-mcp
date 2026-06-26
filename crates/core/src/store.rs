@@ -22,7 +22,7 @@ use rusqlite::{OptionalExtension, params_from_iter};
 use crate::error::MiniAppError;
 use crate::filter::ListFilter;
 use crate::order_by::OrderByItem;
-use crate::schema::SchemaConfig;
+use crate::schema::{FieldType, SchemaConfig};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -140,6 +140,13 @@ pub struct AliasRecord {
     /// Optional JSON array of parameter name strings (e.g. `["project","owner"]`).
     /// `None` means the alias takes no parameters and the filter text is plain JSON.
     pub params_schema: Option<String>,
+}
+
+/// Result returned by [`Store::replace_string_field`].
+#[derive(Debug, serde::Serialize)]
+pub struct ReplaceResult {
+    /// Number of replacements performed.
+    pub matches: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -874,7 +881,9 @@ impl Store {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            let data_str = data_str.ok_or_else(|| MiniAppError::NotFound { id: resolved.clone() })?;
+            let data_str = data_str.ok_or_else(|| MiniAppError::NotFound {
+                id: resolved.clone(),
+            })?;
             let tx = conn.transaction()?;
             let n = tx.execute(
                 "DELETE FROM rows WHERE id = ?1",
@@ -987,13 +996,15 @@ impl Store {
         let conn = self.conn.clone();
         let table_name = self.schema.table.clone();
         let id_str = id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<crate::row_history::HistoryRecord>, MiniAppError> {
-            let conn = conn
-                .lock()
-                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
-            crate::row_history::fetch_at(&conn, &table_name, &id_str, at_unix_secs)
-                .map_err(MiniAppError::Storage)
-        })
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<crate::row_history::HistoryRecord>, MiniAppError> {
+                let conn = conn
+                    .lock()
+                    .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+                crate::row_history::fetch_at(&conn, &table_name, &id_str, at_unix_secs)
+                    .map_err(MiniAppError::Storage)
+            },
+        )
         .await
         .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
     }
@@ -1172,6 +1183,414 @@ impl Store {
         })
         .await
         .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
+    }
+
+    // -----------------------------------------------------------------------
+    // Partial-edit helpers
+    // -----------------------------------------------------------------------
+
+    /// Return the contents of a string field with `cat -n` style line numbers.
+    ///
+    /// Line numbers are 1-indexed. `view_range` is an inclusive `[start, end]`
+    /// bound; `None` shows all lines.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::NotFound`] — row does not exist.
+    /// - [`MiniAppError::FieldTypeError`] — field is not `FieldType::String`.
+    /// - [`MiniAppError::Schema`] — field absent from schema, or mutex poisoned.
+    pub async fn view_string_field(
+        &self,
+        id: &str,
+        field: &str,
+        view_range: Option<(u32, u32)>,
+    ) -> Result<String, MiniAppError> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let field = field.to_string();
+        let schema = self.schema.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<String, MiniAppError> {
+            let conn = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let id_str = resolve_id(&conn, &id_str)?;
+
+            let field_def = schema
+                .fields
+                .iter()
+                .find(|f| f.name == field)
+                .ok_or_else(|| MiniAppError::Schema(format!("field `{field}` not in schema")))?;
+            if field_def.ty != FieldType::String {
+                return Err(MiniAppError::FieldTypeError {
+                    field: field.clone(),
+                    actual_type: field_def.ty.as_str().to_string(),
+                });
+            }
+
+            let row_data: Option<String> = conn
+                .query_row(
+                    "SELECT data FROM rows WHERE id = ?1",
+                    rusqlite::params![id_str],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let data_str = row_data.ok_or_else(|| MiniAppError::NotFound { id: id_str.clone() })?;
+
+            let data = parse_data(&data_str)?;
+            let text = data
+                .get(&field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let lines: Vec<&str> = text.split('\n').collect();
+            let total = lines.len() as u32;
+            let (start, end) = match view_range {
+                Some((s, e)) => (s.max(1), e.min(total)),
+                None => (1, total),
+            };
+
+            let mut out = String::new();
+            for (i, line) in lines.iter().enumerate() {
+                let lineno = i as u32 + 1;
+                if lineno >= start && lineno <= end {
+                    out.push_str(&format!("{:6}  {}\n", lineno, line));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
+    }
+
+    /// Replace occurrences of `old_str` in a string field.
+    ///
+    /// Default mode (`replace_all = false`): exactly one occurrence is
+    /// required. Zero matches → [`MiniAppError::StringNotFound`]; two or more
+    /// → [`MiniAppError::AmbiguousMatch`]. Pass `replace_all = true` to batch
+    /// all occurrences and get back the total replacement count.
+    ///
+    /// The uniqueness check and the write are performed inside a single SQLite
+    /// transaction (atomic). History is recorded via `row_history::record_in_tx`.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::NotFound`] — row does not exist.
+    /// - [`MiniAppError::FieldTypeError`] — field is not `FieldType::String`.
+    /// - [`MiniAppError::StringNotFound`] — no occurrence of `old_str` found.
+    /// - [`MiniAppError::AmbiguousMatch`] — ≥2 occurrences when `replace_all` is false.
+    /// - [`MiniAppError::Schema`] — field absent from schema, or mutex poisoned.
+    pub async fn replace_string_field(
+        &self,
+        id: &str,
+        field: &str,
+        old_str: &str,
+        new_str: &str,
+        view_range: Option<(u32, u32)>,
+        replace_all: bool,
+    ) -> Result<ReplaceResult, MiniAppError> {
+        let now = now_secs();
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let field = field.to_string();
+        let old_str = old_str.to_string();
+        let new_str = new_str.to_string();
+        let schema = self.schema.clone();
+        let table_name = self.schema.table.clone();
+
+        let (record, matches) =
+            tokio::task::spawn_blocking(move || -> Result<(RowRecord, u32), MiniAppError> {
+                let mut conn = conn
+                    .lock()
+                    .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+                let id_str = resolve_id(&conn, &id_str)?;
+
+                let field_def =
+                    schema
+                        .fields
+                        .iter()
+                        .find(|f| f.name == field)
+                        .ok_or_else(|| {
+                            MiniAppError::Schema(format!("field `{field}` not in schema"))
+                        })?;
+                if field_def.ty != FieldType::String {
+                    return Err(MiniAppError::FieldTypeError {
+                        field: field.clone(),
+                        actual_type: field_def.ty.as_str().to_string(),
+                    });
+                }
+
+                // Fix 4: reject empty old_str before touching the DB.
+                if old_str.is_empty() {
+                    return Err(MiniAppError::Validation {
+                        field: field.clone(),
+                        reason: "old_str must not be empty".to_string(),
+                    });
+                }
+
+                let row_data: Option<(String, i64)> = conn
+                    .query_row(
+                        "SELECT data, created_at FROM rows WHERE id = ?1",
+                        rusqlite::params![id_str],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                let (data_str, created_at) =
+                    row_data.ok_or_else(|| MiniAppError::NotFound { id: id_str.clone() })?;
+
+                let mut data = parse_data(&data_str)?;
+                let text = data
+                    .get(&field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                // Fix 1: validate view_range before constructing the search scope.
+                if let Some((s, e)) = view_range {
+                    if s == 0 || s > e {
+                        return Err(MiniAppError::Validation {
+                            field: field.clone(),
+                            reason: format!(
+                                "view_range [{s}, {e}] is invalid: start must be ≥ 1 and ≤ end"
+                            ),
+                        });
+                    }
+                }
+
+                // Determine the search scope (optionally restricted to view_range lines).
+                let search_scope = if let Some((s, e)) = view_range {
+                    let lines: Vec<&str> = text.split('\n').collect();
+                    let total = lines.len() as u32;
+                    let si = (s.max(1).saturating_sub(1)) as usize;
+                    let ei = (e.min(total) as usize).min(lines.len());
+                    lines[si..ei].join("\n")
+                } else {
+                    text.clone()
+                };
+
+                // Find all non-overlapping occurrences in the search scope.
+                // Fix 3: cap candidates at CAND_CAP to prevent DoS via huge allocations;
+                //        match_count tracks the true total across all occurrences.
+                // Fix 5: expand snippet window to ≈30 bytes and respect UTF-8 char
+                //        boundaries to avoid panics on multibyte characters.
+                const CAND_CAP: usize = 20;
+                let mut candidates: Vec<crate::error::MatchCandidate> = Vec::new();
+                let mut match_count = 0u32;
+                let mut pos = 0usize;
+                let old_len = old_str.len().max(1);
+                while let Some(rel) = search_scope[pos..].find(old_str.as_str()) {
+                    let abs = pos + rel;
+                    match_count += 1;
+                    if candidates.len() < CAND_CAP {
+                        let before = &search_scope[..abs];
+                        let line_no = (before.matches('\n').count() as u32) + 1;
+                        let col = (abs - before.rfind('\n').map(|p| p + 1).unwrap_or(0)) as u32 + 1;
+                        let mut snip_start = abs.saturating_sub(30);
+                        while snip_start < abs && !search_scope.is_char_boundary(snip_start) {
+                            snip_start += 1;
+                        }
+                        let mut snip_end = (abs + old_str.len() + 30).min(search_scope.len());
+                        while snip_end > abs + old_str.len()
+                            && !search_scope.is_char_boundary(snip_end)
+                        {
+                            snip_end -= 1;
+                        }
+                        candidates.push(crate::error::MatchCandidate {
+                            line: line_no,
+                            col,
+                            snippet: search_scope[snip_start..snip_end].to_string(),
+                        });
+                    }
+                    pos = abs + old_len;
+                }
+                if match_count == 0 {
+                    return Err(MiniAppError::StringNotFound {
+                        field: field.clone(),
+                    });
+                }
+                if !replace_all && match_count >= 2 {
+                    return Err(MiniAppError::AmbiguousMatch {
+                        field: field.clone(),
+                        matches: match_count,
+                        candidates,
+                    });
+                }
+
+                // Perform the replacement within the correct scope.
+                let new_text = if let Some((s, e)) = view_range {
+                    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+                    let total = lines.len() as u32;
+                    let si = (s.max(1).saturating_sub(1)) as usize;
+                    let ei = (e.min(total) as usize).min(lines.len());
+                    let scoped = lines[si..ei].join("\n");
+                    let replaced_scoped = if replace_all {
+                        scoped.replace(old_str.as_str(), new_str.as_str())
+                    } else {
+                        scoped.replacen(old_str.as_str(), new_str.as_str(), 1)
+                    };
+                    let mut all_lines: Vec<String> = lines[..si].to_vec();
+                    all_lines.extend(replaced_scoped.split('\n').map(str::to_string));
+                    all_lines.extend_from_slice(&lines[ei..]);
+                    all_lines.join("\n")
+                } else if replace_all {
+                    text.replace(old_str.as_str(), new_str.as_str())
+                } else {
+                    text.replacen(old_str.as_str(), new_str.as_str(), 1)
+                };
+
+                // Update the field value and validate the full object.
+                data.as_object_mut()
+                    .expect("data is always a JSON object")
+                    .insert(field.clone(), serde_json::Value::String(new_text));
+                schema.validate(&data)?;
+
+                let new_data_str =
+                    serde_json::to_string(&data).expect("serialization is infallible");
+
+                // Atomic write + history inside a single transaction.
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "UPDATE rows SET data = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![new_data_str, now, id_str],
+                )?;
+                crate::row_history::record_in_tx(
+                    &tx,
+                    &table_name,
+                    &id_str,
+                    crate::row_history::HistoryOp::Update,
+                    Some(&new_data_str),
+                    Some(&data_str),
+                    now,
+                )?;
+                tx.commit()?;
+
+                Ok((
+                    RowRecord {
+                        id: id_str,
+                        data,
+                        created_at,
+                        updated_at: now,
+                    },
+                    match_count,
+                ))
+            })
+            .await
+            .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))??;
+
+        crate::dump::on_change(&self.schema, &record).await?;
+        Ok(ReplaceResult { matches })
+    }
+
+    /// Insert `content` into a string field at the given 1-indexed line
+    /// position.
+    ///
+    /// - `line = 0` → prepend (insert before the first line).
+    /// - `line = N` → insert after line N (1-indexed).
+    /// - `line > total_lines + 1` → [`MiniAppError::LineOutOfRange`].
+    ///
+    /// # Errors
+    /// - [`MiniAppError::NotFound`] — row does not exist.
+    /// - [`MiniAppError::FieldTypeError`] — field is not `FieldType::String`.
+    /// - [`MiniAppError::LineOutOfRange`] — `line` is out of bounds.
+    /// - [`MiniAppError::Schema`] — field absent from schema, or mutex poisoned.
+    pub async fn insert_into_string_field(
+        &self,
+        id: &str,
+        field: &str,
+        line: u32,
+        content: &str,
+    ) -> Result<(), MiniAppError> {
+        let now = now_secs();
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let field = field.to_string();
+        let content = content.to_string();
+        let schema = self.schema.clone();
+        let table_name = self.schema.table.clone();
+
+        let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
+            let mut conn = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let id_str = resolve_id(&conn, &id_str)?;
+
+            let field_def = schema
+                .fields
+                .iter()
+                .find(|f| f.name == field)
+                .ok_or_else(|| MiniAppError::Schema(format!("field `{field}` not in schema")))?;
+            if field_def.ty != FieldType::String {
+                return Err(MiniAppError::FieldTypeError {
+                    field: field.clone(),
+                    actual_type: field_def.ty.as_str().to_string(),
+                });
+            }
+
+            let row_data: Option<(String, i64)> = conn
+                .query_row(
+                    "SELECT data, created_at FROM rows WHERE id = ?1",
+                    rusqlite::params![id_str],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let (data_str, created_at) =
+                row_data.ok_or_else(|| MiniAppError::NotFound { id: id_str.clone() })?;
+
+            let mut data = parse_data(&data_str)?;
+            let text = data
+                .get(&field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+            let total = lines.len() as u32;
+
+            // Fix 2: line > total is out of range (Vec::insert panics at index > len).
+            if line > total {
+                return Err(MiniAppError::LineOutOfRange {
+                    line,
+                    total_lines: total,
+                });
+            }
+            // line = 0 → prepend; line = N → insert after line N (1-indexed).
+            lines.insert(line as usize, content.clone());
+
+            let new_text = lines.join("\n");
+            data.as_object_mut()
+                .expect("data is always a JSON object")
+                .insert(field.clone(), serde_json::Value::String(new_text));
+            schema.validate(&data)?;
+
+            let new_data_str = serde_json::to_string(&data).expect("serialization is infallible");
+
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE rows SET data = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![new_data_str, now, id_str],
+            )?;
+            crate::row_history::record_in_tx(
+                &tx,
+                &table_name,
+                &id_str,
+                crate::row_history::HistoryOp::Update,
+                Some(&new_data_str),
+                Some(&data_str),
+                now,
+            )?;
+            tx.commit()?;
+
+            Ok(RowRecord {
+                id: id_str,
+                data,
+                created_at,
+                updated_at: now,
+            })
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))??;
+
+        crate::dump::on_change(&self.schema, &record).await?;
+        Ok(())
     }
 }
 

@@ -758,6 +758,63 @@ History records are **not** purged on every update. Purge is a separate operatio
 
 Purge is intentionally not wired to any automatic hook so that history accumulation does not add latency to normal `create` / `update` / `delete` calls.
 
+## Partial edit tools
+
+Three tools let agents view and surgically edit individual string fields without fetching or replacing the entire row. Non-string fields (arrays, objects, numbers, booleans) are rejected with `TYPE_ERROR`.
+
+### content_view
+
+Return the contents of a string field with line numbers (`cat -n` style). Pass `view_range` to limit output to a contiguous slice (1-indexed, inclusive on both ends).
+
+```jsonc
+// View lines 12–30 of a body field
+content_view(table="issue", id="26a8a7f9", field="body", view_range=[12, 30])
+// → {"content": "    12  first visible line\n    13  ...\n"}
+
+// Omit view_range to get the full field
+content_view(table="issue", id="26a8a7f9", field="body")
+```
+
+### content_replace
+
+Replace a unique occurrence of `old_str` with `new_str` inside a string field.
+
+```jsonc
+// Unique replacement — returns the number of substitutions
+content_replace(table="issue", id="26a8a7f9", field="body",
+                old_str="foo", new_str="bar")
+// → {"matches": 1}
+
+// Scope the search to a line range before replacing
+content_replace(table="issue", id="26a8a7f9", field="body",
+                old_str="foo", new_str="bar", view_range=[1, 10])
+
+// Replace every occurrence in one call
+content_replace(table="issue", id="26a8a7f9", field="body",
+                old_str="foo", new_str="bar", replace_all=true)
+// → {"matches": 4}
+```
+
+If `old_str` does not appear the tool returns `STRING_NOT_FOUND`. If it appears more than once and `replace_all` is not set, the tool returns `AMBIGUOUS` with a `candidates` list.
+
+### content_insert
+
+Insert one or more lines into a string field at a specific position.
+
+```jsonc
+// Prepend (line=0 inserts before the first line)
+content_insert(table="issue", id="26a8a7f9", field="body",
+               line=0, content="Prepended line")
+// → {"line": 0, "inserted_lines": 1}
+
+// Insert after line N (1-indexed)
+content_insert(table="issue", id="26a8a7f9", field="body",
+               line=5, content="Inserted after line 5")
+// → {"line": 5, "inserted_lines": 1}
+```
+
+`line` values greater than `total_lines + 1` return `OUT_OF_RANGE`. All three tools record changes through the normal `row_history` hook, so every edit is fully auditable and restorable via `row_restore`.
+
 ## Storage notes
 
 SQLite databases are opened in WAL journal mode for safe concurrent access during `reload`. Sidecar files `<db>.db-wal` and `<db>.db-shm` are created next to each `.db` file — these are managed by SQLite and should not be deleted manually.

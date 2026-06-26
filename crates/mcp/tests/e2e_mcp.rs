@@ -1187,3 +1187,696 @@ fn query_aggregate_empty_multi_returns_aggregator_error() {
         "expected AGGREGATOR_ERROR in error text, got: {text:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Partial-edit tools: content_view / content_replace / content_insert
+// ---------------------------------------------------------------------------
+
+#[test]
+fn content_view_full_text_line_numbers() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "line one\nline two\nline three"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_view",
+        json!({"table": "emo", "id": id, "field": "text"}),
+    );
+    let content = result
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("content field");
+    assert!(
+        content.contains("1  line one"),
+        "missing line 1: {content:?}"
+    );
+    assert!(
+        content.contains("2  line two"),
+        "missing line 2: {content:?}"
+    );
+    assert!(
+        content.contains("3  line three"),
+        "missing line 3: {content:?}"
+    );
+}
+
+#[test]
+fn content_view_with_range() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "line one\nline two\nline three\nline four"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_view",
+        json!({"table": "emo", "id": id, "field": "text", "view_range": [2, 3]}),
+    );
+    let content = result
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("content field");
+    assert!(
+        content.contains("2  line two"),
+        "should include line 2: {content:?}"
+    );
+    assert!(
+        content.contains("3  line three"),
+        "should include line 3: {content:?}"
+    );
+    assert!(
+        !content.contains("1  line one"),
+        "should NOT include line 1: {content:?}"
+    );
+    assert!(
+        !content.contains("4  line four"),
+        "should NOT include line 4: {content:?}"
+    );
+}
+
+#[test]
+fn content_view_type_error_on_array_field() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "hello", "tags": ["a", "b"]}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_view",
+        json!({"table": "emo", "id": id, "field": "tags"}),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("TYPE_ERROR"),
+        "expected TYPE_ERROR, got: {result:?}"
+    );
+}
+
+#[test]
+fn content_replace_unique_match() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "hello foo world"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_replace",
+        json!({"table": "emo", "id": id, "field": "text", "old_str": "foo", "new_str": "bar"}),
+    );
+    assert_eq!(
+        result.get("matches").and_then(Value::as_u64),
+        Some(1),
+        "expected matches=1, got: {result:?}"
+    );
+
+    let fetched = client.call_tool("get", json!({"table": "emo", "id": id}));
+    let text = fetched
+        .pointer("/data/text")
+        .and_then(Value::as_str)
+        .expect("text");
+    assert_eq!(
+        text, "hello bar world",
+        "unexpected text after replace: {text:?}"
+    );
+}
+
+#[test]
+fn content_replace_not_found() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "hello world"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_replace",
+        json!({"table": "emo", "id": id, "field": "text", "old_str": "xyz", "new_str": "abc"}),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("STRING_NOT_FOUND"),
+        "expected STRING_NOT_FOUND, got: {result:?}"
+    );
+}
+
+#[test]
+fn content_replace_ambiguous_match_with_candidates() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "foo bar\nfoo baz"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_replace",
+        json!({"table": "emo", "id": id, "field": "text", "old_str": "foo", "new_str": "qux"}),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("AMBIGUOUS"),
+        "expected AMBIGUOUS error, got: {result:?}"
+    );
+    assert_eq!(
+        result.pointer("/data/code").and_then(Value::as_str),
+        Some("AMBIGUOUS_MATCH"),
+        "expected data.code=AMBIGUOUS_MATCH, got: {result:?}"
+    );
+    assert_eq!(
+        result.pointer("/data/matches").and_then(Value::as_u64),
+        Some(2),
+        "expected data.matches=2, got: {result:?}"
+    );
+    let candidates = result
+        .pointer("/data/candidates")
+        .and_then(Value::as_array)
+        .expect("data.candidates array");
+    assert_eq!(
+        candidates.len(),
+        2,
+        "expected 2 candidates, got: {candidates:?}"
+    );
+    assert_eq!(
+        candidates[0].get("line").and_then(Value::as_u64),
+        Some(1),
+        "first candidate should be on line 1"
+    );
+    assert_eq!(
+        candidates[0].get("col").and_then(Value::as_u64),
+        Some(1),
+        "first candidate col should be 1"
+    );
+    assert_eq!(
+        candidates[1].get("line").and_then(Value::as_u64),
+        Some(2),
+        "second candidate should be on line 2"
+    );
+    assert_eq!(
+        candidates[1].get("col").and_then(Value::as_u64),
+        Some(1),
+        "second candidate col should be 1"
+    );
+}
+
+#[test]
+fn content_replace_view_range_scoping() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "foo bar\nhello world\nfoo again"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_replace",
+        json!({
+            "table": "emo", "id": id, "field": "text",
+            "old_str": "foo", "new_str": "baz",
+            "view_range": [1, 1],
+        }),
+    );
+    assert_eq!(
+        result.get("matches").and_then(Value::as_u64),
+        Some(1),
+        "expected matches=1 within view_range, got: {result:?}"
+    );
+
+    let fetched = client.call_tool("get", json!({"table": "emo", "id": id}));
+    let text = fetched
+        .pointer("/data/text")
+        .and_then(Value::as_str)
+        .expect("text");
+    assert!(
+        text.contains("foo again"),
+        "line 3 outside view_range should still contain 'foo again': {text:?}"
+    );
+    assert!(
+        !text.starts_with("foo"),
+        "line 1 should have been replaced: {text:?}"
+    );
+}
+
+#[test]
+fn content_replace_all_returns_count() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "x a\nx b\nx c"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_replace",
+        json!({
+            "table": "emo", "id": id, "field": "text",
+            "old_str": "x", "new_str": "y",
+            "replace_all": true,
+        }),
+    );
+    assert_eq!(
+        result.get("matches").and_then(Value::as_u64),
+        Some(3),
+        "expected matches=3 for replace_all, got: {result:?}"
+    );
+}
+
+#[test]
+fn content_replace_type_error_on_array_field() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "hello", "tags": ["a", "b"]}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_replace",
+        json!({
+            "table": "emo", "id": id, "field": "tags",
+            "old_str": "a", "new_str": "z",
+        }),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("TYPE_ERROR"),
+        "expected TYPE_ERROR for array field, got: {result:?}"
+    );
+}
+
+#[test]
+fn content_insert_prepend_line_zero() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "line one\nline two"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_insert",
+        json!({"table": "emo", "id": id, "field": "text", "line": 0, "content": "prepended"}),
+    );
+    assert_eq!(
+        result.get("line").and_then(Value::as_u64),
+        Some(0),
+        "expected line=0 in response, got: {result:?}"
+    );
+    assert_eq!(
+        result.get("inserted_lines").and_then(Value::as_u64),
+        Some(1),
+        "expected inserted_lines=1, got: {result:?}"
+    );
+
+    let fetched = client.call_tool("get", json!({"table": "emo", "id": id}));
+    let text = fetched
+        .pointer("/data/text")
+        .and_then(Value::as_str)
+        .expect("text");
+    assert!(
+        text.starts_with("prepended\n"),
+        "text should start with 'prepended\\n': {text:?}"
+    );
+}
+
+#[test]
+fn content_insert_after_last_line() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "line one\nline two\nline three"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_insert",
+        json!({"table": "emo", "id": id, "field": "text", "line": 3, "content": "appended"}),
+    );
+    assert_eq!(
+        result.get("line").and_then(Value::as_u64),
+        Some(3),
+        "expected line=3 in response, got: {result:?}"
+    );
+    assert_eq!(
+        result.get("inserted_lines").and_then(Value::as_u64),
+        Some(1),
+        "expected inserted_lines=1, got: {result:?}"
+    );
+
+    let fetched = client.call_tool("get", json!({"table": "emo", "id": id}));
+    let text = fetched
+        .pointer("/data/text")
+        .and_then(Value::as_str)
+        .expect("text");
+    assert!(
+        text.ends_with("\nappended"),
+        "text should end with '\\nappended': {text:?}"
+    );
+}
+
+#[test]
+fn content_insert_out_of_range() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "line one\nline two\nline three"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_insert",
+        json!({"table": "emo", "id": id, "field": "text", "line": 10, "content": "oops"}),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("OUT_OF_RANGE"),
+        "expected OUT_OF_RANGE, got: {result:?}"
+    );
+    assert_eq!(
+        result.pointer("/data/line").and_then(Value::as_u64),
+        Some(10),
+        "expected data.line=10, got: {result:?}"
+    );
+    assert_eq!(
+        result.pointer("/data/total_lines").and_then(Value::as_u64),
+        Some(3),
+        "expected data.total_lines=3, got: {result:?}"
+    );
+}
+
+#[test]
+fn content_insert_type_error_on_array_field() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "hello", "tags": ["a", "b"]}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_insert",
+        json!({"table": "emo", "id": id, "field": "tags", "line": 0, "content": "x"}),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("TYPE_ERROR"),
+        "expected TYPE_ERROR for array field, got: {result:?}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Regression tests for Auto-Fix Queue (5 fixes)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Fix 1 — inverted view_range (start > end) must return VALIDATION error.
+#[test]
+fn content_replace_inverted_view_range_validation() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "line1\nline2\nline3"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    // view_range start (5) > end (2) — must be rejected before any slice.
+    let result = client.call_tool(
+        "content_replace",
+        json!({
+            "table": "emo",
+            "id": id,
+            "field": "text",
+            "old_str": "line2",
+            "new_str": "LINE2",
+            "view_range": [5, 2]
+        }),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("VALIDATION"),
+        "expected VALIDATION for inverted view_range, got: {result:?}"
+    );
+}
+
+/// Fix 2 — content_insert at line = total_lines + 1 must be rejected (Vec::insert panic guard).
+#[test]
+fn content_insert_line_equals_total_plus_one_rejected() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "a\nb\nc"}}), // 3 lines
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    // 3-line text → total=3; line=4 (total+1) must return OUT_OF_RANGE.
+    let result = client.call_tool(
+        "content_insert",
+        json!({
+            "table": "emo",
+            "id": id,
+            "field": "text",
+            "line": 4,
+            "content": "d"
+        }),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("OUT_OF_RANGE"),
+        "expected OUT_OF_RANGE for line=total+1, got: {result:?}"
+    );
+}
+
+/// Fix 3 — AmbiguousMatch with >20 matches must cap candidates at 20 and report true total.
+#[test]
+fn content_replace_ambiguous_caps_candidates() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    // Build a text with 25 occurrences of "X".
+    let body = (0..25)
+        .map(|i| format!("line{i} X"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let created = client.call_tool("create", json!({"table": "emo", "data": {"text": body}}));
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_replace",
+        json!({
+            "table": "emo",
+            "id": id,
+            "field": "text",
+            "old_str": "X",
+            "new_str": "Y"
+        }),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("AMBIGUOUS"),
+        "expected AMBIGUOUS for 25 matches, got: {result:?}"
+    );
+
+    let data = result.get("data").expect("data");
+
+    let matches = data
+        .pointer("/matches")
+        .and_then(Value::as_u64)
+        .expect("matches");
+    assert_eq!(matches, 25, "match_count should be 25");
+
+    let candidates_len = data
+        .pointer("/candidates")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .expect("candidates array");
+    assert_eq!(candidates_len, 20, "candidates Vec should be capped at 20");
+
+    let hint = data.pointer("/hint").and_then(Value::as_str).expect("hint");
+    assert!(
+        hint.contains("showing first 20 of 25"),
+        "hint should mention truncation, got: {hint:?}"
+    );
+}
+
+/// Fix 4 — empty old_str must return VALIDATION error before touching the DB.
+#[test]
+fn content_replace_empty_old_str_rejected() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    let created = client.call_tool(
+        "create",
+        json!({"table": "emo", "data": {"text": "hello world"}}),
+    );
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_replace",
+        json!({
+            "table": "emo",
+            "id": id,
+            "field": "text",
+            "old_str": "",
+            "new_str": "something"
+        }),
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("VALIDATION"),
+        "expected VALIDATION for empty old_str, got: {result:?}"
+    );
+}
+
+/// Fix 5 — snippet slicing must not panic on multibyte (UTF-8) characters.
+#[test]
+fn content_replace_ambiguous_with_multibyte() {
+    let layout = make_layout();
+    let mut client = McpClient::spawn(&layout.user_dir, &layout.project_dir);
+
+    // Japanese text with two occurrences of "対象"; each char is 3 UTF-8 bytes.
+    // Surrounding characters ("テスト" etc.) would cause a panic if we slice at
+    // byte offsets that fall inside a multibyte code point.
+    let text = "テスト対象データ\nもう一つの対象テスト";
+    let created = client.call_tool("create", json!({"table": "emo", "data": {"text": text}}));
+    let id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id")
+        .to_string();
+
+    let result = client.call_tool(
+        "content_replace",
+        json!({
+            "table": "emo",
+            "id": id,
+            "field": "text",
+            "old_str": "対象",
+            "new_str": "TARGET"
+        }),
+    );
+    // Two occurrences → AMBIGUOUS (not a panic).
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("AMBIGUOUS"),
+        "expected AMBIGUOUS for multibyte text, got: {result:?}"
+    );
+
+    let candidates = result
+        .pointer("/data/candidates")
+        .and_then(Value::as_array)
+        .expect("candidates");
+    assert_eq!(candidates.len(), 2, "should have 2 candidates");
+    // Each snippet must be valid UTF-8 (non-empty string means it serialised OK).
+    for c in candidates {
+        let snippet = c
+            .get("snippet")
+            .and_then(Value::as_str)
+            .expect("snippet string");
+        assert!(!snippet.is_empty(), "snippet should not be empty");
+    }
+}

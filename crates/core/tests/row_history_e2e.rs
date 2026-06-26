@@ -106,8 +106,7 @@ async fn case1_fetch_at_intermediate_state() {
     } // conn dropped
 
     let conn = store.conn_for_test();
-    let versions =
-        row_history::list_versions(&conn, "test", row_id).expect("list_versions");
+    let versions = row_history::list_versions(&conn, "test", row_id).expect("list_versions");
 
     // Expect 4 entries: create + 3 updates
     assert_eq!(versions.len(), 4, "expected 4 history entries");
@@ -129,8 +128,7 @@ async fn case1_fetch_at_intermediate_state() {
         .expect("fetch_at 200")
         .expect("must find snapshot at ts=200");
 
-    let data: serde_json::Value =
-        serde_json::from_str(snap.data_json.as_deref().unwrap()).unwrap();
+    let data: serde_json::Value = serde_json::from_str(snap.data_json.as_deref().unwrap()).unwrap();
     assert_eq!(
         data["title"].as_str(),
         Some("v1"),
@@ -182,7 +180,11 @@ async fn case2_restore_live_row_to_original_state() {
         let conn = store.conn_for_test();
         let versions_before =
             row_history::list_versions(&conn, "test", &id).expect("list before restore");
-        assert_eq!(versions_before.len(), 2, "create + update = 2 history entries");
+        assert_eq!(
+            versions_before.len(),
+            2,
+            "create + update = 2 history entries"
+        );
     }
     // We know the original data from the create call — no fetch_at needed.
     // (Avoids same-second timestamp collision when all ops happen within 1 s.)
@@ -272,7 +274,11 @@ async fn case3_restore_deleted_row_same_id() {
         let conn = store.conn_for_test();
         row_history::list_versions(&conn, "test", &id).expect("list after restore")
     };
-    assert_eq!(versions_after.len(), 3, "three history entries after restore");
+    assert_eq!(
+        versions_after.len(),
+        3,
+        "three history entries after restore"
+    );
     assert_eq!(
         versions_after[2].op,
         row_history::HistoryOp::Create,
