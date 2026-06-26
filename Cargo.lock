@@ -689,7 +689,7 @@ checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
 
 [[package]]
 name = "mini-app-core"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "mini-app-mcp"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "arc-swap",

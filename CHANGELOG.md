@@ -19,6 +19,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.15.0] - 2026-06-26
+
+### Added
+
+- **`_row_history` table + auto history log** (`crates/core/src/row_history.rs` — new module) — populated atomically inside `Store::create` / `update` / `delete` Tx. Stores full row JSON (post-state + pre-state) so any past row state can be reconstructed. Schema-side backup pairs are untouched.
+- **`row_restore(table, id, at_unix_secs)` MCP tool** (`crates/mcp/src/mcp/server.rs`) — locates the latest history entry with `recorded_at <= at_unix_secs` and replays it: existing rows are replaced, deleted rows are re-inserted under the same id. The restore itself is recorded as a new history version, so it remains reversible.
+- **`purge_old_history(retention_days, max_per_row)`** (`crates/core/src/row_history.rs`) — modeled on `backup::purge_old_backups` for retention control. Default scope keeps full JSON per version; jsonpatch diff form carried to a later phase.
+- 5 row_history e2e tests (`crates/core/tests/row_history_e2e.rs`) — multi-update fetch_at / restore round-trip / delete re-insert / purge bounds / Tx rollback atomicity.
+- **3 partial-edit MCP tools** (`crates/mcp/src/mcp/server.rs`) — `content_view` / `content_replace` / `content_insert`. Anthropic `str_replace_based_edit_tool` 互換の緩 form で string field の partial edit を提供する。 row_history v0.14.0 を backstop として「事故を起こさせない IF」 を構造化:
+  - `content_view(table, id, field, view_range?=[s,e])` — cat -n 形式の line# 付き出力。 1-indexed inclusive、 range 省略 = 全文。
+  - `content_replace(table, id, field, old_str, new_str, view_range?, replace_all?=false)` — default unique 強制、 0 match → STRING_NOT_FOUND、 複数 match → AMBIGUOUS_MATCH error + line# candidates (最大 20 件、 真の match 数は `matches` field で別途返却)。 view_range で絞り込み、 replace_all で一括置換。 hint 文字列に「Pass view_range=[start,end] to scope, or replace_all=true to batch.」 を含める。
+  - `content_insert(table, id, field, line, content)` — `line=0` 先頭挿入、 `line=N` で N 行目の後。 末尾追加対応 (`line=total`)。 line > total は OUT_OF_RANGE。
+  - 3 tool すべて `Store::update(mode=replace)` 経路を通過するため、 row_history hook で自動記録される (別 hook 追加なし)。
+  - string field 専任 (Number / Array / Object は TYPE_ERROR で reject、 `actual_type` を error data に含める)。
+  - unique 検査 + 適用は同一 Store Tx 内 atomic。
+- **3 internal store APIs** (`crates/core/src/store.rs`) — `view_string_field` / `replace_string_field` / `insert_into_string_field` + `ReplaceResult { matches: u32 }` 型。 上記 MCP tool の backend。
+- **4 new error codes + variants** (`crates/core/src/error.rs`) — `AmbiguousMatch { matches, candidates }` / `StringNotFound` / `OutOfRange { line, total_lines }` / `TypeError { field, actual_type }` を `MiniAppError` enum に追加。 `MatchCandidate { line: u32, col: u32, snippet: String }` struct も同 file に新設。
+- 13 new e2e tests (`crates/mcp/tests/e2e_mcp.rs`) — view 全文 / view_range / out_of_range、 replace unique pass / 0-match / ambiguous (candidates 検証) / view_range scoping / replace_all count、 insert line=0 / line=last / out_of_range、 TYPE_ERROR (Array field)。
+- 5 hardening regression tests (holistic-reviewer Auto-Fix 由来) — inverted view_range guard / off-by-one (`line > total` reject) / AMBIGUOUS candidates cap (20 件) / empty old_str reject / UTF-8 char boundary safe snippet。
+
+### Changed
+
+- `format_partial_edit_error` (`crates/mcp/src/mcp/server.rs`) — `MiniAppError::Validation` arm を追加し、 empty old_str 等の VALIDATION_ERROR が `error: "VALIDATION"` で正しく serialize されるよう修正。 AMBIGUOUS hint 文字列は `matches > 20` (CAND_CAP 超過) 時に「First 20 of {N} candidates shown.」 prefix を付ける form に拡張。
+
 ## [0.14.0] - 2026-06-21
 
 ### Added
