@@ -1,9 +1,9 @@
 /// MCP server implementation for mini-app-mcp.
 ///
-/// Exposes 18 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
+/// Exposes 19 tools (`info`, `create`, `get`, `list`, `update`, `delete`,
 /// `reload`, `schema_create`, `schema_update`, `schema_delete`, `schema_batch`,
 /// `data_snapshot`, `row_materialize`, `alias_create`, `alias_list`, `alias_run`,
-/// `alias_delete`, `query_aggregate`) and resources
+/// `alias_delete`, `query_aggregate`, `row_restore`) and resources
 /// (`schema://yaml`, `schema://json`, `schema://json-schema`, `docs://quickstart`,
 /// `docs://tools`, `docs://errors`, `docs://filters`) as MCP capabilities over stdio transport.
 /// No HTTP / REST / CLI-CRUD entry points are provided (Crux "MCP-only entry
@@ -971,6 +971,23 @@ struct AliasDeleteParams {
     table: Option<String>,
     /// Name of the alias to delete.
     name: String,
+}
+
+/// Parameters for the `row_restore` tool.
+#[derive(Deserialize, JsonSchema)]
+struct RowRestoreParams {
+    /// Name of the table that owns the row.
+    ///
+    /// In multi-table mode this argument is required; omitting it returns a
+    /// TABLE_REQUIRED error. In legacy single-table mode (`MINI_APP_SCHEMA` +
+    /// `MINI_APP_DB`) this may be omitted.
+    table: Option<String>,
+    /// Full UUID of the row to restore.
+    id: String,
+    /// Unix timestamp (seconds since epoch) of the point-in-time to restore.
+    ///
+    /// The latest history record whose `recorded_at <= at_unix_secs` is used.
+    at_unix_secs: i64,
 }
 
 /// Result returned by the `reload` tool.
@@ -2057,6 +2074,92 @@ impl MiniAppMcpServer {
         .map_err(|e| e.to_string())?;
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
+
+    /// Restore a row to a point-in-time snapshot.
+    ///
+    /// Looks up the latest history record for `id` with
+    /// `recorded_at <= at_unix_secs`. If the row currently exists in the live
+    /// table, it is updated via `Store::update(mode=replace)` (which records a
+    /// `HistoryOp::Update` entry). If the row was previously deleted, it is
+    /// re-inserted via `Store::restore_row` (which records a
+    /// `HistoryOp::Create` entry). Returns the resulting [`RowRecord`] as
+    /// JSON.
+    ///
+    /// Returns `NOT_FOUND` (data.code) when no history entry exists for the
+    /// given `id` at or before `at_unix_secs`.
+    #[tool(
+        name = "row_restore",
+        description = "Restore a row to its state at a given unix timestamp. \
+                       Finds the latest history entry for `id` where \
+                       `recorded_at <= at_unix_secs`. \
+                       If the row currently exists: updates it via replace mode \
+                       (records HistoryOp::Update). \
+                       If the row was deleted: re-inserts it with the same id \
+                       (records HistoryOp::Create). \
+                       Returns the restored RowRecord as JSON. \
+                       In multi-table mode, `table` is required; omitting it returns a \
+                       TABLE_REQUIRED error (data.code=\"TABLE_REQUIRED\"). \
+                       In legacy single-table mode (`MINI_APP_SCHEMA`+`MINI_APP_DB`), `table` may be omitted. \
+                       Returns NOT_FOUND (data.code=\"NOT_FOUND\") when no history entry exists \
+                       for `id` at or before `at_unix_secs`.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_row_restore(
+        &self,
+        Parameters(params): Parameters<RowRestoreParams>,
+    ) -> Result<String, String> {
+        let (store, _schema) = self
+            .resolve_table(params.table.as_deref())
+            .map_err(|e| e.to_string())?;
+
+        // Fetch the history snapshot at the requested point in time.
+        let snapshot = store
+            .fetch_history_at(&params.id, params.at_unix_secs)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                MiniAppError::NotFound {
+                    id: params.id.clone(),
+                }
+                .to_string()
+            })?;
+
+        // Parse the snapshot data JSON back into a serde_json::Value.
+        let data_str = snapshot
+            .data_json
+            .as_deref()
+            .ok_or_else(|| "snapshot has no data".to_string())?;
+        let data: serde_json::Value =
+            serde_json::from_str(data_str).map_err(|e| e.to_string())?;
+
+        // Determine whether the row currently exists in the live table.
+        let row_exists = match store.get(&params.id).await {
+            Ok(_) => true,
+            Err(MiniAppError::NotFound { .. }) => false,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let record = if row_exists {
+            // Live row — roll back via replace update (records HistoryOp::Update).
+            store
+                .update(&params.id, data, UpdateMode::Replace)
+                .await
+                .map_err(|e| e.to_string())?
+        } else {
+            // Row was deleted — re-insert with the same id (records HistoryOp::Create).
+            store
+                .restore_row(&params.id, data)
+                .await
+                .map_err(|e| e.to_string())?
+        };
+
+        serde_json::to_string(&record).map_err(|e| e.to_string())
+    }
 }
 
 // =============================================================================
@@ -2221,13 +2324,14 @@ fields:\n\
             "alias_run",
             "alias_delete",
             "query_aggregate",
+            "row_restore",
         ] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(tools.len(), 18, "expected exactly 18 tools");
+        assert_eq!(tools.len(), 19, "expected exactly 19 tools");
     }
 
     /// RED: ensure create/update tools advertise `data` as an object in their

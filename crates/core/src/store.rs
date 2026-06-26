@@ -325,6 +325,7 @@ impl Store {
                 }
                 c.execute_batch(CREATE_TABLE_SQL)?;
                 c.execute_batch(CREATE_ALIASES_TABLE_SQL)?;
+                crate::row_history::ensure_history_table(&c)?;
                 // Idempotent migration: add params_schema column if absent (K-1 st1-entries).
                 // SQLite does not support `ALTER TABLE ADD COLUMN IF NOT EXISTS`, so we
                 // use PRAGMA table_info to check for the column first.
@@ -371,6 +372,14 @@ impl Store {
         Arc::clone(&self.conn)
     }
 
+    /// Return a raw `MutexGuard` for test-only low-level SQL access.
+    ///
+    /// The guard MUST be dropped before calling any `async` methods on this
+    /// `Store` to avoid deadlocks.
+    pub fn conn_for_test(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().expect("not poisoned")
+    }
+
     /// Validate `value` against the schema and insert a new row with a
     /// generated UUID primary key.
     ///
@@ -409,16 +418,28 @@ impl Store {
         let data_str =
             serde_json::to_string(&value).expect("serde_json::Value serialization is infallible");
 
+        let table_name = self.schema.table.clone();
         let conn = self.conn.clone();
         let id_inner = id.clone();
         let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![id_inner, data_str, now, now],
             )?;
+            crate::row_history::record_in_tx(
+                &tx,
+                &table_name,
+                &id_inner,
+                crate::row_history::HistoryOp::Create,
+                Some(&serde_json::to_string(&value).expect("infallible")),
+                None,
+                now,
+            )?;
+            tx.commit()?;
             Ok(RowRecord {
                 id: id_inner,
                 data: value,
@@ -662,9 +683,10 @@ impl Store {
         let conn = self.conn.clone();
         let id_str = id.to_string();
         let schema = self.schema.clone();
+        let table_name = self.schema.table.clone();
 
         let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             let id_str = resolve_id(&conn, &id_str)?;
@@ -702,10 +724,21 @@ impl Store {
             let merged_str = serde_json::to_string(&merged)
                 .expect("serde_json::Value serialization is infallible");
 
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 "UPDATE rows SET data = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![merged_str, now, id_str],
             )?;
+            crate::row_history::record_in_tx(
+                &tx,
+                &table_name,
+                &id_str,
+                crate::row_history::HistoryOp::Update,
+                Some(&merged_str),
+                Some(&current_data_str),
+                now,
+            )?;
+            tx.commit()?;
 
             Ok(RowRecord {
                 id: id_str,
@@ -823,21 +856,44 @@ impl Store {
     pub async fn delete(&self, id: &str) -> Result<(), MiniAppError> {
         let conn = self.conn.clone();
         let id = id.to_string();
+        let table_name = self.schema.table.clone();
+        let now = now_secs();
 
         // The closure returns the resolved (full) UUID so that on_delete
         // receives a complete UUID rather than a prefix string (CF-1).
         let resolved_id = tokio::task::spawn_blocking(move || -> Result<String, MiniAppError> {
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
             let resolved = resolve_id(&conn, &id)?;
-            let n = conn.execute(
+            // Fetch row data before deletion for history recording.
+            let data_str: Option<String> = conn
+                .query_row(
+                    "SELECT data FROM rows WHERE id = ?1",
+                    rusqlite::params![resolved],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let data_str = data_str.ok_or_else(|| MiniAppError::NotFound { id: resolved.clone() })?;
+            let tx = conn.transaction()?;
+            let n = tx.execute(
                 "DELETE FROM rows WHERE id = ?1",
                 rusqlite::params![resolved],
             )?;
             if n == 0 {
+                // Row disappeared between SELECT and DELETE (race); roll back naturally.
                 return Err(MiniAppError::NotFound { id: resolved });
             }
+            crate::row_history::record_in_tx(
+                &tx,
+                &table_name,
+                &resolved,
+                crate::row_history::HistoryOp::Delete,
+                Some(&data_str),
+                None,
+                now,
+            )?;
+            tx.commit()?;
             Ok(resolved)
         })
         .await
@@ -847,6 +903,99 @@ impl Store {
         crate::dump::on_delete(&self.schema, &resolved_id).await?;
 
         Ok(())
+    }
+
+    /// Re-insert a previously-deleted row with the same `id` and the given `data`.
+    ///
+    /// This is the internal path for point-in-time restore of a deleted row.
+    /// The row is inserted with `created_at = updated_at = now_secs()` and
+    /// a `HistoryOp::Create` history entry is appended atomically.
+    ///
+    /// For restoring a *live* (non-deleted) row to an earlier snapshot, use
+    /// [`Store::update`] with [`UpdateMode::Replace`] instead, which records
+    /// `HistoryOp::Update`.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::Schema`] — `data` fails schema validation, or mutex poisoned,
+    ///   or blocking thread panicked.
+    /// - [`MiniAppError::Storage`] — rusqlite error (e.g. UNIQUE constraint on `id`
+    ///   if the row still exists).
+    pub async fn restore_row(
+        &self,
+        id: &str,
+        data: serde_json::Value,
+    ) -> Result<RowRecord, MiniAppError> {
+        self.schema.validate(&data)?;
+        let now = now_secs();
+        let id_str = id.to_string();
+        let data_str =
+            serde_json::to_string(&data).expect("serde_json::Value serialization is infallible");
+        let table_name = self.schema.table.clone();
+        let conn = self.conn.clone();
+
+        let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
+            let mut conn = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id_str, data_str, now, now],
+            )?;
+            crate::row_history::record_in_tx(
+                &tx,
+                &table_name,
+                &id_str,
+                crate::row_history::HistoryOp::Create,
+                Some(&data_str),
+                None,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(RowRecord {
+                id: id_str,
+                data,
+                created_at: now,
+                updated_at: now,
+            })
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))??;
+
+        crate::dump::on_change(&self.schema, &record).await?;
+
+        Ok(record)
+    }
+
+    // -----------------------------------------------------------------------
+    // Row history
+    // -----------------------------------------------------------------------
+
+    /// Return the row-history snapshot at or before `at_unix_secs`.
+    ///
+    /// Returns `Ok(Some(record))` when a history entry exists for `id` with
+    /// `recorded_at <= at_unix_secs`, `Ok(None)` when no such entry exists.
+    ///
+    /// # Errors
+    /// - [`MiniAppError::Storage`] — rusqlite error.
+    /// - [`MiniAppError::Schema`] — blocking thread panicked (JoinError).
+    pub async fn fetch_history_at(
+        &self,
+        id: &str,
+        at_unix_secs: i64,
+    ) -> Result<Option<crate::row_history::HistoryRecord>, MiniAppError> {
+        let conn = self.conn.clone();
+        let table_name = self.schema.table.clone();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<crate::row_history::HistoryRecord>, MiniAppError> {
+            let conn = conn
+                .lock()
+                .map_err(|_| MiniAppError::Schema("mutex poisoned".to_string()))?;
+            crate::row_history::fetch_at(&conn, &table_name, &id_str, at_unix_secs)
+                .map_err(MiniAppError::Storage)
+        })
+        .await
+        .map_err(|e| MiniAppError::Schema(format!("blocking task panic: {e}")))?
     }
 
     // -----------------------------------------------------------------------
