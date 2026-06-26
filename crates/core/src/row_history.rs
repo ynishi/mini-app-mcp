@@ -101,9 +101,7 @@ impl HistoryOp {
 }
 
 impl rusqlite::types::FromSql for HistoryOp {
-    fn column_result(
-        value: rusqlite::types::ValueRef<'_>,
-    ) -> rusqlite::types::FromSqlResult<Self> {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         let s = String::column_result(value)?;
         match s.as_str() {
             "create" => Ok(HistoryOp::Create),
@@ -440,7 +438,16 @@ mod tests {
     fn record_and_list_versions() {
         let conn = open_mem();
         let tx = conn.unchecked_transaction().unwrap();
-        record_in_tx(&tx, "t", "r1", HistoryOp::Create, Some("{\"a\":1}"), None, 1000).unwrap();
+        record_in_tx(
+            &tx,
+            "t",
+            "r1",
+            HistoryOp::Create,
+            Some("{\"a\":1}"),
+            None,
+            1000,
+        )
+        .unwrap();
         record_in_tx(
             &tx,
             "t",
@@ -466,8 +473,16 @@ mod tests {
         let conn = open_mem();
         {
             let tx = conn.unchecked_transaction().unwrap();
-            record_in_tx(&tx, "t", "r1", HistoryOp::Create, Some("{\"v\":1}"), None, 1000)
-                .unwrap();
+            record_in_tx(
+                &tx,
+                "t",
+                "r1",
+                HistoryOp::Create,
+                Some("{\"v\":1}"),
+                None,
+                1000,
+            )
+            .unwrap();
             record_in_tx(
                 &tx,
                 "t",

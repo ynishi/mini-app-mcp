@@ -990,6 +990,37 @@ struct RowRestoreParams {
     at_unix_secs: i64,
 }
 
+/// Parameters for the `content_view` tool.
+#[derive(Deserialize, JsonSchema)]
+struct ContentViewParams {
+    table: Option<String>,
+    id: String,
+    field: String,
+    view_range: Option<[u32; 2]>,
+}
+
+/// Parameters for the `content_replace` tool.
+#[derive(Deserialize, JsonSchema)]
+struct ContentReplaceParams {
+    table: Option<String>,
+    id: String,
+    field: String,
+    old_str: String,
+    new_str: String,
+    view_range: Option<[u32; 2]>,
+    replace_all: Option<bool>,
+}
+
+/// Parameters for the `content_insert` tool.
+#[derive(Deserialize, JsonSchema)]
+struct ContentInsertParams {
+    table: Option<String>,
+    id: String,
+    field: String,
+    line: u32,
+    content: String,
+}
+
 /// Result returned by the `reload` tool.
 ///
 /// Reports the outcome of the registry reload: how many tables are now mounted,
@@ -1002,6 +1033,52 @@ pub struct ReloadResult {
     pub added: Vec<String>,
     /// Table names that were removed (absent in new registry, present in old).
     pub removed: Vec<String>,
+}
+
+fn format_partial_edit_error(e: &MiniAppError) -> String {
+    let kind = match e {
+        MiniAppError::FieldTypeError { .. } => "TYPE_ERROR",
+        MiniAppError::StringNotFound { .. } => "STRING_NOT_FOUND",
+        MiniAppError::AmbiguousMatch { .. } => "AMBIGUOUS",
+        MiniAppError::LineOutOfRange { .. } => "OUT_OF_RANGE",
+        MiniAppError::Validation { .. } => "VALIDATION",
+        _ => "ERROR",
+    };
+    let code = e.code();
+    let data = match e {
+        MiniAppError::FieldTypeError { field, actual_type } => serde_json::json!({
+            "code": code, "field": field, "actual_type": actual_type,
+        }),
+        MiniAppError::StringNotFound { field } => serde_json::json!({
+            "code": code, "field": field,
+        }),
+        MiniAppError::AmbiguousMatch {
+            matches,
+            candidates,
+            ..
+        } => {
+            // Fix 3: note truncation when candidates were capped at 20.
+            let hint = if candidates.len() < *matches as usize {
+                format!(
+                    "Pass view_range=[start,end] to scope, or replace_all=true to batch. \
+                     (showing first {} of {} matches)",
+                    candidates.len(),
+                    matches
+                )
+            } else {
+                "Pass view_range=[start,end] to scope, or replace_all=true to batch.".to_string()
+            };
+            serde_json::json!({
+                "code": code, "matches": matches, "candidates": candidates,
+                "hint": hint,
+            })
+        }
+        MiniAppError::LineOutOfRange { line, total_lines } => serde_json::json!({
+            "code": code, "line": line, "total_lines": total_lines,
+        }),
+        _ => serde_json::json!({"code": code, "message": e.to_string()}),
+    };
+    serde_json::json!({"error": kind, "data": data}).to_string()
 }
 
 // =============================================================================
@@ -2134,8 +2211,7 @@ impl MiniAppMcpServer {
             .data_json
             .as_deref()
             .ok_or_else(|| "snapshot has no data".to_string())?;
-        let data: serde_json::Value =
-            serde_json::from_str(data_str).map_err(|e| e.to_string())?;
+        let data: serde_json::Value = serde_json::from_str(data_str).map_err(|e| e.to_string())?;
 
         // Determine whether the row currently exists in the live table.
         let row_exists = match store.get(&params.id).await {
@@ -2159,6 +2235,110 @@ impl MiniAppMcpServer {
         };
 
         serde_json::to_string(&record).map_err(|e| e.to_string())
+    }
+
+    #[tool(
+        name = "content_view",
+        description = "Read a string field with cat-n style line-numbered output. \
+                       Each line is formatted as `N  text\\n` (1-indexed). \
+                       Pass `view_range=[start, end]` (inclusive) to restrict the output. \
+                       Returns TYPE_ERROR when the field is not a string type.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_content_view(
+        &self,
+        Parameters(params): Parameters<ContentViewParams>,
+    ) -> Result<String, String> {
+        let (store, _schema) = self
+            .resolve_table(params.table.as_deref())
+            .map_err(|e| e.to_string())?;
+        let view_range = params.view_range.map(|[s, e]| (s, e));
+        match store
+            .view_string_field(&params.id, &params.field, view_range)
+            .await
+        {
+            Ok(content) => serde_json::to_string(&serde_json::json!({"content": content}))
+                .map_err(|e| e.to_string()),
+            Err(e) => Ok(format_partial_edit_error(&e)),
+        }
+    }
+
+    #[tool(
+        name = "content_replace",
+        description = "Replace text in a string field. By default requires exactly one match \
+                       (STRING_NOT_FOUND if none, AMBIGUOUS_MATCH if multiple). \
+                       Set `replace_all=true` to replace every occurrence. \
+                       Use `view_range=[start, end]` to scope the search. \
+                       Returns `{\"matches\": N}` on success. \
+                       Edits are recorded in row_history.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_content_replace(
+        &self,
+        Parameters(params): Parameters<ContentReplaceParams>,
+    ) -> Result<String, String> {
+        let (store, _schema) = self
+            .resolve_table(params.table.as_deref())
+            .map_err(|e| e.to_string())?;
+        let view_range = params.view_range.map(|[s, e]| (s, e));
+        let replace_all = params.replace_all.unwrap_or(false);
+        match store
+            .replace_string_field(
+                &params.id,
+                &params.field,
+                &params.old_str,
+                &params.new_str,
+                view_range,
+                replace_all,
+            )
+            .await
+        {
+            Ok(result) => serde_json::to_string(&result).map_err(|e| e.to_string()),
+            Err(e) => Ok(format_partial_edit_error(&e)),
+        }
+    }
+
+    #[tool(
+        name = "content_insert",
+        description = "Insert a line into a string field. \
+                       `line=0` prepends before line 1; `line=N` inserts after line N (1-indexed). \
+                       Returns `{\"line\": N, \"inserted_lines\": 1}` on success. \
+                       Returns OUT_OF_RANGE when `line > total_lines + 1`. \
+                       Edits are recorded in row_history.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_content_insert(
+        &self,
+        Parameters(params): Parameters<ContentInsertParams>,
+    ) -> Result<String, String> {
+        let (store, _schema) = self
+            .resolve_table(params.table.as_deref())
+            .map_err(|e| e.to_string())?;
+        match store
+            .insert_into_string_field(&params.id, &params.field, params.line, &params.content)
+            .await
+        {
+            Ok(()) => serde_json::to_string(
+                &serde_json::json!({"line": params.line, "inserted_lines": 1}),
+            )
+            .map_err(|e| e.to_string()),
+            Err(e) => Ok(format_partial_edit_error(&e)),
+        }
     }
 }
 
@@ -2325,13 +2505,16 @@ fields:\n\
             "alias_delete",
             "query_aggregate",
             "row_restore",
+            "content_view",
+            "content_replace",
+            "content_insert",
         ] {
             assert!(
                 names.contains(expected),
                 "tool '{expected}' missing from list_tools"
             );
         }
-        assert_eq!(tools.len(), 19, "expected exactly 19 tools");
+        assert_eq!(tools.len(), 22, "expected exactly 22 tools");
     }
 
     /// RED: ensure create/update tools advertise `data` as an object in their

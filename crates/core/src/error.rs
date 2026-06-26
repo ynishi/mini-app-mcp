@@ -11,7 +11,20 @@
 /// constraint. The actual `rmcp::ErrorData` conversion lives in the mcp crate
 /// (`crates/mcp/src/error_conv.rs`) as a `pub(crate)` free function (ACL
 /// adapter, Outline rust book §5-1-10 K-orphan-rule).
+use serde::Serialize;
 use thiserror::Error;
+
+/// A single occurrence of `old_str` found inside a string field, used to
+/// populate the `candidates` array in an `AMBIGUOUS_MATCH` error response.
+#[derive(Debug, Clone, Serialize)]
+pub struct MatchCandidate {
+    /// 1-indexed line number where the match starts.
+    pub line: u32,
+    /// 1-indexed column (byte offset within the line + 1) where the match starts.
+    pub col: u32,
+    /// Short surrounding context (~30 chars) for display in error responses.
+    pub snippet: String,
+}
 
 /// Structured error codes emitted in the `data.code` field of every MCP error
 /// response. These are `&'static str` constants so callers can pattern-match
@@ -83,6 +96,19 @@ pub mod codes {
     /// errors (those use `VALIDATION_ERROR`) and from raw SQLite failures
     /// (those use `STORAGE_ERROR`).
     pub const AGGREGATOR_ERROR: &str = "AGGREGATOR_ERROR";
+    /// Returned when a partial-edit tool (`content_view` / `content_replace` /
+    /// `content_insert`) targets a field whose schema type is not `String`.
+    pub const TYPE_ERROR: &str = "TYPE_ERROR";
+    /// Returned when `content_replace` finds zero occurrences of `old_str` in
+    /// the target field (or within the scoped `view_range`).
+    pub const STRING_NOT_FOUND: &str = "STRING_NOT_FOUND";
+    /// Returned when `content_replace` finds two or more occurrences of
+    /// `old_str` and `replace_all` was not set — caller must scope with
+    /// `view_range` or pass `replace_all=true`.
+    pub const AMBIGUOUS_MATCH: &str = "AMBIGUOUS_MATCH";
+    /// Returned when `content_insert` receives a `line` value that exceeds
+    /// `total_lines + 1`.
+    pub const OUT_OF_RANGE: &str = "OUT_OF_RANGE";
 }
 
 /// All errors that can arise inside mini-app-core.
@@ -200,6 +226,27 @@ pub enum MiniAppError {
     /// (empty sources, ATTACH-limit exceeded, inner-without-group-by, etc.).
     #[error("aggregator error: {0}")]
     Aggregator(String),
+
+    /// A partial-edit tool targeted a field whose schema type is not `String`.
+    #[error("field '{field}' is not a string field (type: {actual_type})")]
+    FieldTypeError { field: String, actual_type: String },
+
+    /// `content_replace` found zero occurrences of `old_str`.
+    #[error("old_str not found in field '{field}'")]
+    StringNotFound { field: String },
+
+    /// `content_replace` found multiple occurrences of `old_str` and
+    /// `replace_all` was not requested.
+    #[error("ambiguous match: {matches} occurrences of old_str in field '{field}'")]
+    AmbiguousMatch {
+        field: String,
+        matches: u32,
+        candidates: Vec<MatchCandidate>,
+    },
+
+    /// `content_insert` received a `line` that exceeds `total_lines + 1`.
+    #[error("line {line} is out of range (field has {total_lines} lines)")]
+    LineOutOfRange { line: u32, total_lines: u32 },
 }
 
 impl MiniAppError {
@@ -233,6 +280,10 @@ impl MiniAppError {
             MiniAppError::AliasTemplateError(_) => codes::ALIAS_TEMPLATE_ERROR,
             MiniAppError::AmbiguousId { .. } => codes::AMBIGUOUS_ID,
             MiniAppError::Aggregator(_) => codes::AGGREGATOR_ERROR,
+            MiniAppError::FieldTypeError { .. } => codes::TYPE_ERROR,
+            MiniAppError::StringNotFound { .. } => codes::STRING_NOT_FOUND,
+            MiniAppError::AmbiguousMatch { .. } => codes::AMBIGUOUS_MATCH,
+            MiniAppError::LineOutOfRange { .. } => codes::OUT_OF_RANGE,
         }
     }
 }
@@ -362,6 +413,34 @@ mod tests {
             (
                 codes::AGGREGATOR_ERROR,
                 MiniAppError::Aggregator("empty sources".into()),
+            ),
+            (
+                codes::TYPE_ERROR,
+                MiniAppError::FieldTypeError {
+                    field: "count".into(),
+                    actual_type: "Number".into(),
+                },
+            ),
+            (
+                codes::STRING_NOT_FOUND,
+                MiniAppError::StringNotFound {
+                    field: "body".into(),
+                },
+            ),
+            (
+                codes::AMBIGUOUS_MATCH,
+                MiniAppError::AmbiguousMatch {
+                    field: "body".into(),
+                    matches: 2,
+                    candidates: vec![],
+                },
+            ),
+            (
+                codes::OUT_OF_RANGE,
+                MiniAppError::LineOutOfRange {
+                    line: 100,
+                    total_lines: 50,
+                },
             ),
         ];
         for (expected_code, err) in cases {
