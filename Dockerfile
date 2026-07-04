@@ -3,8 +3,8 @@
 FROM rust:1.88-slim-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-RUN cargo build --release --locked
+COPY crates ./crates
+RUN cargo build --release --locked --package mini-app-mcp
 
 FROM debian:bookworm-slim
 LABEL io.modelcontextprotocol.server.name="io.github.ynishi/mini-app-mcp"
