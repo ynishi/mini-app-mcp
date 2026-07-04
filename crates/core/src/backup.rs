@@ -109,7 +109,7 @@ fn write_backup_pair_sync(
 
     let db_dst = backup_dir.join(format!("{}.{}.db", table, unix_secs));
     src_conn
-        .backup(rusqlite::DatabaseName::Main, &db_dst, None)
+        .backup(rusqlite::MAIN_DB, &db_dst, None)
         .map_err(|e| MiniAppError::Backup(format!("rusqlite backup failed: {e}")))?;
 
     Ok(())

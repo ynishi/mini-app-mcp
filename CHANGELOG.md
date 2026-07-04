@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **rusqlite 0.32 → 0.37 (libsqlite3-sys 0.30 → 0.35)** (`crates/core/Cargo.toml` / `crates/mcp/Cargo.toml`) — aligns with the `libsqlite3-sys 0.35` cluster used by ai-store-sqlite 0.7 / rusqlite-isle 0.4, so downstream projects that combine mini-app-core with crates on the 0.35 band resolve without the `links = "sqlite3"` conflict. Cross-ref: ynishi/journal-mcp#1.
+- `rusqlite::DatabaseName::Main` → `rusqlite::MAIN_DB` (`crates/core/src/backup.rs` / `crates/core/src/snapshot.rs`) — follows the rusqlite 0.37 API change that replaced the `DatabaseName` enum with the `Name` trait + `MAIN_DB` constant.
+
 ### Deprecated
 
 ### Removed

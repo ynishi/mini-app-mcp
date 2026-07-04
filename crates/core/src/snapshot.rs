@@ -48,7 +48,7 @@ use crate::registry::TableRegistry;
 /// directory is created if it does not exist.
 ///
 /// The snapshot file is created via
-/// `rusqlite::Connection::backup(DatabaseName::Main, …, None)` using a fresh
+/// `rusqlite::Connection::backup(rusqlite::MAIN_DB, …, None)` using a fresh
 /// source connection opened from `db_path` — the existing Store connection is
 /// never borrowed (K-103).  This satisfies the SQLite Online Backup API
 /// contract that "the source can be used while the backup is running".
@@ -122,7 +122,7 @@ fn write_snapshot_db_sync(
     let db_dst = snapshot_dir.join(format!("{}.{}.db", table, unix_secs));
     // Crux: use rusqlite::Connection::backup (hot backup API), never std::fs::copy.
     src_conn
-        .backup(rusqlite::DatabaseName::Main, &db_dst, None)
+        .backup(rusqlite::MAIN_DB, &db_dst, None)
         .map_err(|e| MiniAppError::Snapshot(format!("rusqlite backup failed: {e}")))?;
 
     Ok(())
