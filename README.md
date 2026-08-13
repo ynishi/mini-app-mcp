@@ -102,7 +102,7 @@ The `info` tool and `schema://json` resource return equivalent content but serve
 
 ## Usage
 
-Start the server via the `--mcp` flag (required; the binary has no other entry point).
+Start the server via `--mcp` (stdio transport) or `--mcp-http` (streamable HTTP transport). These are the only entry points; there is no REST/CLI-CRUD surface.
 
 ### Multi-table mode
 
@@ -124,6 +124,43 @@ Register it once in `.mcp.json` to serve all mounted tables:
   }
 }
 ```
+
+### Multi-device mode (streamable HTTP)
+
+Run one central daemon that owns the SQLite files, and connect from any number of devices as remote MCP clients. Because every device talks to the same single process, the single-writer storage model is preserved — no cross-device sync or conflict handling exists or is needed.
+
+```sh
+# Central host — loopback (same-machine clients, e.g. behind an SSH tunnel)
+mini-app-mcp --mcp-http                          # default bind 127.0.0.1:8484
+
+# Central host — LAN exposure requires a token
+MINI_APP_HTTP_TOKEN=<random-string> mini-app-mcp --mcp-http --bind 0.0.0.0:8484
+```
+
+Client registration in `.mcp.json` (any device on the network):
+
+```json
+{
+  "mcpServers": {
+    "mini-app": {
+      "type": "http",
+      "url": "http://central-host:8484/mcp",
+      "headers": { "Authorization": "Bearer <random-string>" }
+    }
+  }
+}
+```
+
+Security model:
+
+- **Loopback bind (default)**: `MINI_APP_HTTP_TOKEN` is optional. The transport's built-in `Host` header validation (loopback-only) guards against DNS rebinding.
+- **Non-loopback bind**: `MINI_APP_HTTP_TOKEN` **must** be set — startup is refused otherwise. Every request must then carry `Authorization: Bearer <token>`.
+- Transport encryption (TLS) and any richer authorization are intentionally out of scope; terminate TLS at a reverse proxy if you need it.
+
+Daemon templates for the central host live under `contrib/`:
+
+- Linux: `contrib/systemd/mini-app-mcp.service` (systemd user unit; install instructions in the file header)
+- macOS: `contrib/launchd/io.github.ynishi.mini-app-mcp.plist` (launchd user agent; install instructions in the file header)
 
 ### Legacy single-table mode
 

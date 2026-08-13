@@ -1,0 +1,25 @@
+# systemd user unit for mini-app-mcp multi-device mode (Linux).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/systemd/mini-app-mcp.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now mini-app-mcp
+#
+# Logs: journalctl --user -u mini-app-mcp -f
+
+[Unit]
+Description=mini-app-mcp — Agent-First CRUD store MCP server (streamable HTTP)
+After=network.target
+
+[Service]
+ExecStart=%h/.cargo/bin/mini-app-mcp --mcp-http --bind 127.0.0.1:8484
+Environment=MINI_APP_USER_DIR=%h/.mini-app
+# LAN exposure requires a token (startup is refused otherwise):
+#   Environment=MINI_APP_HTTP_TOKEN=<random-string>
+# and change --bind to 0.0.0.0:8484 in ExecStart.
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

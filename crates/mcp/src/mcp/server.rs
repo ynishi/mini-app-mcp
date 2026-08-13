@@ -82,6 +82,108 @@ use mini_app_core::order_by::OrderByItem;
 /// Zero-table start is **not** an error: the server logs a warning and starts
 /// in empty mode, returning `TABLE_REQUIRED` on tool calls.
 pub async fn run() -> anyhow::Result<()> {
+    let server = build_server().await?;
+    let service = server.serve(stdio()).await?;
+    service.waiting().await?;
+    Ok(())
+}
+
+/// Serve over streamable HTTP transport (multi-device mode).
+///
+/// One central daemon owns the SQLite files; remote devices connect as MCP
+/// clients to `http://<bind>/mcp`. Because every device talks to the same
+/// single process, the existing single-writer storage model is preserved and
+/// no cross-device sync/conflict handling is needed.
+///
+/// # Security model
+///
+/// - Loopback bind (default `127.0.0.1:8484`): token optional. rmcp's default
+///   `Host` header validation (loopback-only) guards against DNS rebinding.
+/// - Non-loopback bind: `MINI_APP_HTTP_TOKEN` **must** be set or startup is
+///   refused. When a token is set, every request must carry
+///   `Authorization: Bearer <token>`. Host validation is disabled in this
+///   case (the bearer token replaces it); TLS termination, if desired, is a
+///   reverse-proxy concern (認可層は別 layer の想定).
+pub async fn run_http(bind: &str) -> anyhow::Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+
+    let server = build_server().await?;
+
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --bind address {bind:?}: {e}"))?;
+    let token = std::env::var("MINI_APP_HTTP_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(Arc::<str>::from);
+    let loopback = addr.ip().is_loopback();
+    if !loopback && token.is_none() {
+        anyhow::bail!(
+            "refusing to bind non-loopback address {addr} without MINI_APP_HTTP_TOKEN \
+             (set the token, or bind a loopback address)"
+        );
+    }
+
+    let mut http_config = StreamableHttpServerConfig::default();
+    if !loopback {
+        // Bearer auth replaces loopback Host validation for LAN/remote binds.
+        http_config.allowed_hosts.clear();
+    }
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        http_config,
+    );
+
+    let mut router = axum::Router::new().nest_service("/mcp", service);
+    if let Some(token) = token {
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let token = Arc::clone(&token);
+                async move {
+                    if bearer_token_matches(req.headers(), &token) {
+                        next.run(req).await
+                    } else {
+                        axum::response::IntoResponse::into_response((
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            "missing or invalid bearer token",
+                        ))
+                    }
+                }
+            },
+        ));
+    }
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, auth = if loopback { "loopback" } else { "bearer-token" }, "serving MCP over streamable HTTP at /mcp");
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+/// Constant-time comparison of the request's `Authorization: Bearer` value
+/// against the configured token.
+fn bearer_token_matches(headers: &axum::http::HeaderMap, token: &str) -> bool {
+    let Some(presented) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    let (a, b) = (presented.as_bytes(), token.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Load config and mount tables into a ready-to-serve [`MiniAppMcpServer`].
+///
+/// Shared by [`run`] (stdio) and [`run_http`] (streamable HTTP); transport
+/// choice never affects mount semantics.
+async fn build_server() -> anyhow::Result<MiniAppMcpServer> {
     let config = Config::load()?;
 
     // Ensure the User-scope dir physically exists so first-time deployments
@@ -128,10 +230,7 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let arc_config = Arc::new(config);
-    let server = MiniAppMcpServer::new_multi(registry, Arc::clone(&arc_config));
-    let service = server.serve(stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+    Ok(MiniAppMcpServer::new_multi(registry, arc_config))
 }
 
 // =============================================================================

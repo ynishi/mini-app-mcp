@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent for mini-app-mcp multi-device mode (macOS).
+
+  launchd does not expand ~ — replace __HOME__ with your home directory
+  (e.g. /Users/you) before installing:
+
+    sed "s|__HOME__|$HOME|g" contrib/launchd/io.github.ynishi.mini-app-mcp.plist \
+      > ~/Library/LaunchAgents/io.github.ynishi.mini-app-mcp.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.ynishi.mini-app-mcp.plist
+
+  Stop / remove:
+    launchctl bootout gui/$(id -u)/io.github.ynishi.mini-app-mcp
+
+  LAN exposure requires MINI_APP_HTTP_TOKEN (startup is refused otherwise):
+  add it under EnvironmentVariables and change the bind address.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.ynishi.mini-app-mcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.cargo/bin/mini-app-mcp</string>
+        <string>--mcp-http</string>
+        <string>--bind</string>
+        <string>127.0.0.1:8484</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MINI_APP_USER_DIR</key>
+        <string>__HOME__/.mini-app</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/mini-app-mcp.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mini-app-mcp.err</string>
+</dict>
+</plist>
