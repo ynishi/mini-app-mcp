@@ -38,6 +38,7 @@ thiserror = "2"
 anyhow = "1"
 dotenvy = "0.15"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 arc-swap = "1"
 uuid = { version = "1", features = ["v4"] }
 

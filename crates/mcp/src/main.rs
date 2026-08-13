@@ -31,6 +31,18 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Logs go to stderr: stdout is the MCP protocol channel in stdio mode,
+    // and launchd/systemd capture stderr via their standard log paths.
+    // Level defaults to `info`; override with RUST_LOG.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .init();
+
     let cli = Cli::parse();
     if cli.mcp {
         mini_app_mcp::mcp::run().await
