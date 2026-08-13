@@ -19,6 +19,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.17.0] - 2026-08-13
+
+### Added
+
+- **Streamable HTTP transport (multi-device mode)** — `--mcp-http` flag + `--bind` (default `127.0.0.1:8484`) serves MCP over streamable HTTP at `/mcp`. One central daemon owns the SQLite files; any number of devices connect as remote MCP clients, so the single-writer storage model is preserved with no cross-device sync. Bearer auth via `MINI_APP_HTTP_TOKEN`; non-loopback binds are refused at startup without a token. stdio mode (`--mcp`) unchanged.
+- Daemon templates under `contrib/`: systemd user unit (Linux) and launchd user agent (macOS).
+- `docs/runbooks/multi-device-smoke.md` — 8-item smoke test runbook for the HTTP transport (verified on Linux and macOS).
+
+### Changed
+
+- rmcp 1.5 → 1.8 (enables `transport-streamable-http-server`); axum 0.8 added for the HTTP listener.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **Empty daemon logs** — the tracing subscriber was never initialized, so `tracing::info!` output went nowhere. Logs now go to stderr (stdout stays the MCP protocol channel in stdio mode), default level `info` with `RUST_LOG` override, ANSI disabled for non-tty writers (launchd/systemd log files).
+
+### Security
+
 ## [0.16.0] - 2026-07-05
 
 ### Added
