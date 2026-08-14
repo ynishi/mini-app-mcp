@@ -56,6 +56,8 @@ scp /tmp/mini-app-data.tgz <central-host>:/tmp/
 systemctl --user stop mini-app-mcp
 mv ~/.mini-app ~/.mini-app.bak.$(date +%Y%m%d)   # keep, do not delete
 tar -C ~ -xzf /tmp/mini-app-data.tgz
+# if any schema.yaml is a symlink, re-point it now — see §6. Schemas are read
+# at startup, so this belongs between extract and start.
 systemctl --user start mini-app-mcp
 ```
 
@@ -94,15 +96,30 @@ tool works too.
   differs from the archived copy. That is expected — `-shm` is regenerated
   shared memory, not data.
 - **Symlinked `schema.yaml`**: a table's `schema.yaml` may be a symlink to an
-  absolute path on the source host and will dangle after migration. Check
-  with:
+  absolute path on the source host — common when schemas are kept in a
+  separate version-controlled repo. Those links dangle after migration, and
+  since the pattern is normally applied repo-wide it hits **every linked
+  table at once**, not one stray file. List them with:
 
   ```sh
   find ~/.mini-app -type l ! -exec test -e {} \; -print
   ```
 
-  Replace any hit with a real file (copy the target from the source host) or
-  re-point it to a path that exists on the central host.
+  If the schema repo is checked out on the central host too, re-point them in
+  one pass. Run this after the §4 extract and **before** starting the daemon:
+
+  ```sh
+  SCHEMA_DIR="$HOME/<schema-repo>/mini-app"   # schema repo path on this host
+  find ~/.mini-app -maxdepth 2 -name schema.yaml -type l | while read -r link; do
+    ln -sfn "$SCHEMA_DIR/$(basename "$(dirname "$link")")/schema.yaml" "$link"
+  done
+  find ~/.mini-app -type l ! -exec test -e {} \; -print   # expect: no output
+  ```
+
+  If the repo is not available there, archive with `tar -czhf` in §2 instead
+  (`-h` = dereference), which stores each schema as a real file — at the cost
+  of severing it from the repo that was its source of truth. `-h` errors on an
+  already dangling link, so delete dead table dirs before archiving.
 - **Old host becomes a client**: after migration the source host should talk
   to the central daemon over HTTP only. Do not leave a config that reads the
   local `~/.mini-app` — two writable copies means two diverging sources of
