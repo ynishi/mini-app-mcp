@@ -162,6 +162,8 @@ Daemon templates for the central host live under `contrib/`:
 - Linux: `contrib/systemd/mini-app-mcp.service` (systemd user unit; install instructions in the file header)
 - macOS: `contrib/launchd/io.github.ynishi.mini-app-mcp.plist` (launchd user agent; install instructions in the file header)
 
+To host the central daemon on Fly.io instead of your own machine (persistent volume, edge TLS, bearer auth, daily backup cron), see `docs/runbooks/fly-io-deploy.md` and `contrib/fly/fly.toml`.
+
 ### Legacy single-table mode
 
 ```sh
@@ -317,6 +319,17 @@ Semantics:
 - Compatibility notes: uploads are single `PutObject` requests (no multipart), and no `x-amz-checksum-*` headers are sent unless you opt in via `MINI_APP_S3_CHECKSUM=sha256` — the two aws-sdk-side pitfalls that break some S3-compatible providers do not apply by default.
 
 Alternative without the feature: keep the server as-is and ship snapshots externally, e.g. a cron entry `mini-app snapshot → rclone copy ~/.mini-app/_snapshots b2:my-bucket/mini-app-snapshots` or a `restic backup ~/.mini-app` job — equivalent result with the credentials held by the external tool.
+
+### Scheduled backups
+
+`contrib/backup/mini-app-backup.sh` turns the upload into a cron job: it calls `data_snapshot(upload=true)` on a running `--mcp-http` daemon (initialize → tools/call over streamable HTTP; deps: `curl`, `jq`) and exits non-zero when the call fails or `upload_errors[]` is non-empty, so failures surface in cron mail / journal / supercronic logs. Against a local daemon:
+
+```cron
+# daily 03:00 — MINI_APP_URL / MINI_APP_HTTP_TOKEN via env if non-default
+0 3 * * * /path/to/contrib/backup/mini-app-backup.sh
+```
+
+In the container image the script is bundled as `mini-app-backup` together with [supercronic](https://github.com/aptible/supercronic); setting `BACKUP_CRON` (e.g. `0 3 * * *`) makes the entrypoint run it on schedule alongside the server (see `contrib/docker/entrypoint.sh`).
 
 ## Row materialization
 
