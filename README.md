@@ -133,7 +133,8 @@ Run one central daemon that owns the SQLite files, and connect from any number o
 # Central host — loopback (same-machine clients, e.g. behind an SSH tunnel)
 mini-app-mcp --mcp-http                          # default bind 127.0.0.1:8484
 
-# Central host — LAN exposure requires a token
+# Central host — LAN exposure requires a token (generate one once):
+#   openssl rand -hex 32
 MINI_APP_HTTP_TOKEN=<random-string> mini-app-mcp --mcp-http --bind 0.0.0.0:8484
 ```
 

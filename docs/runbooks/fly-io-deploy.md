@@ -33,8 +33,11 @@ Secrets become environment variables inside the machine — the same
 `MINI_APP_*` contract as a local daemon.
 
 ```sh
+# Generate the server key once and keep it — clients need the same value (§6).
+TOKEN=$(openssl rand -hex 32) && echo "$TOKEN"
+
 fly secrets set --app <your-app-name> \
-  MINI_APP_HTTP_TOKEN=<token> \
+  MINI_APP_HTTP_TOKEN=$TOKEN \
   MINI_APP_S3_ENDPOINT=https://s3.<region>.backblazeb2.com \
   MINI_APP_S3_BUCKET=<bucket> \
   MINI_APP_S3_ACCESS_KEY_ID=<key-id> \
