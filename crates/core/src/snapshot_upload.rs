@@ -28,7 +28,7 @@
 /// | `MINI_APP_S3_ACCESS_KEY_ID` | yes | access key id |
 /// | `MINI_APP_S3_SECRET_ACCESS_KEY` | yes | secret access key |
 /// | `MINI_APP_S3_PREFIX` | no | key prefix (default `mini-app-snapshots/`) |
-/// | `MINI_APP_S3_REGION` | no | signing region (default `us-east-1`; B2: match the endpoint region) |
+/// | `MINI_APP_S3_REGION` | no | signing region. Unset = derived from `s3.<region>.<domain>` endpoints (B2 / AWS regional); underivable hosts fall back to `us-east-1` |
 /// | `MINI_APP_S3_VIRTUAL_HOSTED_STYLE` | no | `true` = virtual-hosted addressing; default `false` = path style (MinIO-compatible) |
 /// | `MINI_APP_S3_CHECKSUM` | no | `sha256` = send `x-amz-checksum-sha256` on put; default `none` (some S3-compatible providers reject checksum headers) |
 ///
@@ -65,12 +65,38 @@ pub const ENV_CHECKSUM: &str = "MINI_APP_S3_CHECKSUM";
 /// Default key prefix used when `MINI_APP_S3_PREFIX` is not set.
 pub const DEFAULT_PREFIX: &str = "mini-app-snapshots/";
 
-/// Dummy signing region used when `MINI_APP_S3_REGION` is not set.
+/// Dummy signing region used when `MINI_APP_S3_REGION` is not set **and** no
+/// region can be derived from the endpoint host.
 ///
 /// Several S3-compatible providers accept any region string but the SigV4
-/// signer requires one; B2 rejects mismatched regions, so B2 users must set
-/// `MINI_APP_S3_REGION` to the region embedded in their endpoint.
+/// signer requires one. Endpoints of the form `s3.<region>.<domain>` (B2,
+/// AWS regional) have their region derived automatically — see
+/// [`derive_region_from_endpoint`] — so this fallback only applies to hosts
+/// without an embedded region (MinIO, R2, `s3.amazonaws.com`).
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// Derives the signing region from an endpoint of the form
+/// `https://s3.<region>.<domain>...` (Backblaze B2 and AWS regional
+/// endpoints embed the region as the second host label).
+///
+/// Returns `None` when the host does not match that shape — e.g.
+/// `s3.amazonaws.com` (3 labels, no region), MinIO hosts, or R2's
+/// `<account>.r2.cloudflarestorage.com`.
+pub fn derive_region_from_endpoint(endpoint: &str) -> Option<String> {
+    let host = endpoint
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split(['/', ':'])
+        .next()?;
+    let labels: Vec<&str> = host.split('.').collect();
+    // `s3.<region>.<domain>.<tld>` needs at least 4 labels so that the second
+    // label is a region and not the registrable domain itself.
+    if labels.len() >= 4 && labels[0] == "s3" && !labels[1].is_empty() {
+        Some(labels[1].to_string())
+    } else {
+        None
+    }
+}
 
 /// Resolved upload configuration for an S3-compatible destination.
 #[derive(Debug, Clone)]
@@ -166,13 +192,17 @@ impl S3UploadConfig {
 
         // SAFETY of unwraps: all four options were verified Some above
         // (missing.is_empty() implies each individual check passed).
+        let endpoint = endpoint.unwrap();
+        // Explicit env wins; otherwise derive from `s3.<region>.<domain>`
+        // endpoints (B2 / AWS regional) so users don't repeat themselves.
+        let region = get(ENV_REGION).or_else(|| derive_region_from_endpoint(&endpoint));
         Ok(S3UploadConfig {
-            endpoint: endpoint.unwrap(),
+            endpoint,
             bucket: bucket.unwrap(),
             access_key_id: access_key_id.unwrap(),
             secret_access_key: secret_access_key.unwrap(),
             prefix: get(ENV_PREFIX).unwrap_or_else(|| DEFAULT_PREFIX.to_string()),
-            region: get(ENV_REGION),
+            region,
             virtual_hosted_style,
             checksum_sha256,
         })
@@ -373,6 +403,43 @@ mod tests {
             !msg.contains(ENV_ENDPOINT),
             "endpoint was provided and must not be listed: {msg}"
         );
+    }
+
+    /// T1: region is derived from `s3.<region>.<domain>` endpoints when the
+    /// env var is absent (B2 users must not need to repeat the region).
+    #[test]
+    fn from_vars_region_derived_from_endpoint() {
+        let mut vars = full_vars();
+        vars.insert(
+            ENV_ENDPOINT.to_string(),
+            "https://s3.us-east-005.backblazeb2.com".to_string(),
+        );
+        let config = S3UploadConfig::from_vars(&vars).expect("must resolve");
+        assert_eq!(config.region.as_deref(), Some("us-east-005"));
+
+        // Explicit env always wins over derivation.
+        vars.insert(ENV_REGION.to_string(), "eu-central-003".to_string());
+        let config = S3UploadConfig::from_vars(&vars).expect("must resolve");
+        assert_eq!(config.region.as_deref(), Some("eu-central-003"));
+    }
+
+    /// T2: derivation shapes — regional hosts yield a region, others None.
+    #[test]
+    fn derive_region_shapes() {
+        for (endpoint, expected) in [
+            ("https://s3.us-east-005.backblazeb2.com", Some("us-east-005")),
+            ("https://s3.us-west-2.amazonaws.com", Some("us-west-2")),
+            ("https://s3.us-west-2.amazonaws.com/extra/path", Some("us-west-2")),
+            ("https://s3.amazonaws.com", None),
+            ("http://localhost:9000", None),
+            ("https://account.r2.cloudflarestorage.com", None),
+        ] {
+            assert_eq!(
+                derive_region_from_endpoint(endpoint).as_deref(),
+                expected,
+                "endpoint '{endpoint}'"
+            );
+        }
     }
 
     /// T2: key_for joins with exactly one slash regardless of prefix shape.

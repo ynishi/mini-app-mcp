@@ -305,7 +305,7 @@ Configuration is environment-only (rides `.mini-app-mcp.env`); credentials never
 | `MINI_APP_S3_ACCESS_KEY_ID` | yes | Access key id (B2: Application Key ID) |
 | `MINI_APP_S3_SECRET_ACCESS_KEY` | yes | Secret access key (B2: Application Key) |
 | `MINI_APP_S3_PREFIX` | no | Object key prefix (default `mini-app-snapshots/`) |
-| `MINI_APP_S3_REGION` | no | Signing region. Defaults to the dummy `us-east-1` (some providers accept any value); **B2 rejects mismatched regions — set this to the region embedded in your endpoint** |
+| `MINI_APP_S3_REGION` | no | Signing region. Unset = derived automatically from `s3.<region>.<domain>` endpoints (B2 / AWS regional), so B2 users can omit it; hosts without an embedded region (MinIO, R2) fall back to the dummy `us-east-1`. An explicit value always wins — B2 rejects mismatched regions, so set it only if it matches your endpoint |
 | `MINI_APP_S3_VIRTUAL_HOSTED_STYLE` | no | `true` = virtual-hosted addressing (`bucket.endpoint/key`); default `false` = path style (`endpoint/bucket/key`), which MinIO requires and AWS / B2 / R2 accept |
 | `MINI_APP_S3_CHECKSUM` | no | `sha256` = send `x-amz-checksum-sha256` on put; default `none`, because some S3-compatible providers reject checksum headers with `400 InvalidArgument: Unsupported header` |
 
