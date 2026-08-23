@@ -68,6 +68,12 @@ pub mod backup;
 /// Snapshot utilities (SQLite-only online snapshot with retention).
 pub mod snapshot;
 
+/// S3-compatible snapshot upload (`data_snapshot` `upload=true` backend).
+///
+/// Configuration resolution (`MINI_APP_S3_*` env) is always compiled; the
+/// network put path requires the `s3-upload` cargo feature.
+pub mod snapshot_upload;
+
 /// Top-level orchestration for `alias_run` — single entry point exposed for
 /// both the MCP tool handler and direct SDK consumers.
 pub mod alias_run;

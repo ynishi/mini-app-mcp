@@ -257,6 +257,17 @@ pub struct DataSnapshotParams {
     /// would-purge counts) **without** creating, modifying, or deleting any
     /// file or database state (Crux: dry_run zero-write guarantee).
     pub dry_run: Option<bool>,
+    /// When `true`, each written snapshot is additionally uploaded to the
+    /// S3-compatible destination configured via `MINI_APP_S3_*` environment
+    /// variables (requires the `s3-upload` cargo feature).
+    ///
+    /// Configuration is validated **before** any snapshot is written: a build
+    /// without the feature or incomplete env returns `UPLOAD_NOT_CONFIGURED`
+    /// immediately. Individual upload failures are non-fatal — local snapshot
+    /// and purge results stand, and failures are reported in the
+    /// `upload_errors[]` response field. Combined with `dry_run=true`, the
+    /// configuration is still validated but no upload is attempted.
+    pub upload: Option<bool>,
 }
 
 /// A single entry resolved for snapshotting.
@@ -307,6 +318,20 @@ pub async fn do_data_snapshot(
     params: DataSnapshotParams,
 ) -> Result<String, MiniAppError> {
     let dry_run = params.dry_run.unwrap_or(false);
+    let upload_requested = params.upload.unwrap_or(false);
+
+    // Resolve upload configuration BEFORE any write so that a misconfigured
+    // upload never produces a half-done call (D4: fail before first snapshot).
+    let upload_config = if upload_requested {
+        if !crate::snapshot_upload::upload_feature_enabled() {
+            return Err(MiniAppError::UploadNotConfigured(
+                "server built without the 's3-upload' cargo feature".into(),
+            ));
+        }
+        Some(crate::snapshot_upload::S3UploadConfig::from_env()?)
+    } else {
+        None
+    };
 
     // Resolve the target entries from the registry.  The ArcSwap Guard is
     // dropped immediately after the clone loop (no Guard across .await).
@@ -363,6 +388,10 @@ pub async fn do_data_snapshot(
     // Real path: write snapshots and purge old generations.
     let mut snapshotted: Vec<serde_json::Value> = Vec::new();
     let mut purged: Vec<serde_json::Value> = Vec::new();
+    #[cfg_attr(not(feature = "s3-upload"), allow(unused_mut))]
+    let mut uploaded: Vec<serde_json::Value> = Vec::new();
+    #[cfg_attr(not(feature = "s3-upload"), allow(unused_mut))]
+    let mut upload_errors: Vec<serde_json::Value> = Vec::new();
 
     let retention = config.snapshot_retention();
 
@@ -400,12 +429,57 @@ pub async fn do_data_snapshot(
                 "generations_removed": removed,
             }));
         }
+
+        // Upload the snapshot just written (non-fatal on per-table failure:
+        // the local snapshot and purge results above stand regardless).
+        if let Some(upload_config) = &upload_config {
+            #[cfg(feature = "s3-upload")]
+            {
+                match &snapshot_path {
+                    Some(path) => {
+                        let file_name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or_default();
+                        let key = upload_config.key_for(file_name);
+                        match crate::snapshot_upload::upload_snapshot(upload_config, path, &key)
+                            .await
+                        {
+                            Ok(bytes) => uploaded.push(serde_json::json!({
+                                "table": target.table_name,
+                                "key": key,
+                                "bytes": bytes,
+                            })),
+                            Err(e) => upload_errors.push(serde_json::json!({
+                                "table": target.table_name,
+                                "error": e.to_string(),
+                            })),
+                        }
+                    }
+                    None => upload_errors.push(serde_json::json!({
+                        "table": target.table_name,
+                        "error": "snapshot file not found after write",
+                    })),
+                }
+            }
+            #[cfg(not(feature = "s3-upload"))]
+            {
+                let _ = upload_config;
+                unreachable!(
+                    "upload=true is rejected before any write when the s3-upload feature is disabled"
+                );
+            }
+        }
     }
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "snapshotted": snapshotted,
         "purged": purged,
     });
+    if upload_requested {
+        result["uploaded"] = serde_json::Value::Array(uploaded);
+        result["upload_errors"] = serde_json::Value::Array(upload_errors);
+    }
     serde_json::to_string(&result)
         .map_err(|e| MiniAppError::Snapshot(format!("json serialization error: {e}")))
 }
@@ -1003,6 +1077,7 @@ mod tests {
             table: None,
             scope: None,
             dry_run: Some(true),
+            upload: None,
         };
 
         let result = do_data_snapshot(&config, &tables, params)
@@ -1046,6 +1121,56 @@ mod tests {
         assert!(
             json["affects"]["would_purge_generations"].is_object(),
             "would_purge_generations must be an object"
+        );
+    }
+
+    /// T3 (D4 fail-before-first-write): `upload=true` on a build without the
+    /// `s3-upload` feature errors with UPLOAD_NOT_CONFIGURED before any
+    /// snapshot file is written.
+    ///
+    /// Gated to non-feature builds so the assertion is deterministic (with the
+    /// feature enabled the same call proceeds to env resolution instead).
+    #[cfg(not(feature = "s3-upload"))]
+    #[tokio::test]
+    async fn test_upload_without_feature_errors_before_any_write() {
+        use crate::config::Config;
+        use crate::registry::TableRegistry;
+        use arc_swap::ArcSwap;
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().expect("temp dir");
+
+        let registry = TableRegistry::from_entries(HashMap::new(), None);
+        let tables: Arc<ArcSwap<TableRegistry>> = Arc::new(ArcSwap::from_pointee(registry));
+        let config = Config {
+            schema_path: None,
+            db_path: None,
+            user_dir: None,
+            project_dir: Some(dir.path().to_path_buf()),
+            backup_retention: None,
+            snapshot_retention: None,
+        };
+
+        let params = DataSnapshotParams {
+            table: None,
+            scope: None,
+            dry_run: None,
+            upload: Some(true),
+        };
+
+        let err = do_data_snapshot(&config, &tables, params)
+            .await
+            .expect_err("upload=true without the feature must error");
+        assert_eq!(
+            err.code(),
+            crate::error::codes::UPLOAD_NOT_CONFIGURED,
+            "expected UPLOAD_NOT_CONFIGURED, got {err:?}"
+        );
+
+        // No snapshot dir may have been created (error precedes all writes).
+        assert!(
+            !dir.path().join("_snapshots").exists(),
+            "_snapshots must not exist after an UPLOAD_NOT_CONFIGURED error"
         );
     }
 }

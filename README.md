@@ -283,6 +283,41 @@ data_snapshot(dry_run=true)           # preview without writing
 
 Snapshots are written to `<scope_root>/_snapshots/<table>.<unix_secs>.db` using the SQLite hot backup API (`rusqlite::Connection::backup`), so the source database remains open and writable during the operation. The retention limit (default 10) is controlled independently via `MINI_APP_SNAPSHOT_RETENTION` and never interacts with `_backup/`.
 
+### Snapshot upload (S3-compatible, opt-in)
+
+With the `s3-upload` build feature, `data_snapshot` can push each written snapshot to any **S3-protocol** destination — AWS S3, Backblaze B2 (S3-Compatible API), Cloudflare R2, MinIO — selected purely by endpoint:
+
+```sh
+cargo install mini-app-mcp --features s3-upload
+```
+
+```
+data_snapshot(upload=true)             # snapshot all tables, then upload each
+data_snapshot(table="notes", upload=true)
+```
+
+Configuration is environment-only (rides `.mini-app-mcp.env`); credentials never travel through tool-call arguments:
+
+| Environment variable | Required | Description |
+|---|---|---|
+| `MINI_APP_S3_ENDPOINT` | yes | S3-compatible endpoint URL. B2: `https://s3.<region>.backblazeb2.com` |
+| `MINI_APP_S3_BUCKET` | yes | Bucket name |
+| `MINI_APP_S3_ACCESS_KEY_ID` | yes | Access key id (B2: Application Key ID) |
+| `MINI_APP_S3_SECRET_ACCESS_KEY` | yes | Secret access key (B2: Application Key) |
+| `MINI_APP_S3_PREFIX` | no | Object key prefix (default `mini-app-snapshots/`) |
+| `MINI_APP_S3_REGION` | no | Signing region. Defaults to the dummy `us-east-1` (some providers accept any value); **B2 rejects mismatched regions — set this to the region embedded in your endpoint** |
+| `MINI_APP_S3_VIRTUAL_HOSTED_STYLE` | no | `true` = virtual-hosted addressing (`bucket.endpoint/key`); default `false` = path style (`endpoint/bucket/key`), which MinIO requires and AWS / B2 / R2 accept |
+| `MINI_APP_S3_CHECKSUM` | no | `sha256` = send `x-amz-checksum-sha256` on put; default `none`, because some S3-compatible providers reject checksum headers with `400 InvalidArgument: Unsupported header` |
+
+Semantics:
+
+- Configuration is validated **before** any snapshot is written — a binary built without the feature, or incomplete env, returns `UPLOAD_NOT_CONFIGURED` immediately.
+- Individual upload failures are **non-fatal**: local snapshot and purge results stand, and failures are reported per table in the `upload_errors[]` response field. Successes appear in `uploaded[]` as `{table, key, bytes}`.
+- **Remote retention is out of scope** (KNOWN LIMITATION): the server never deletes remote objects. Configure a bucket lifecycle rule to expire old generations.
+- Compatibility notes: uploads are single `PutObject` requests (no multipart), and no `x-amz-checksum-*` headers are sent unless you opt in via `MINI_APP_S3_CHECKSUM=sha256` — the two aws-sdk-side pitfalls that break some S3-compatible providers do not apply by default.
+
+Alternative without the feature: keep the server as-is and ship snapshots externally, e.g. a cron entry `mini-app snapshot → rclone copy ~/.mini-app/_snapshots b2:my-bucket/mini-app-snapshots` or a `restic backup ~/.mini-app` job — equivalent result with the credentials held by the external tool.
+
 ## Row materialization
 
 `row_materialize` exports rows from any mounted table to the local filesystem in a format your agent or toolchain can consume directly — without re-reading the database.

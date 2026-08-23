@@ -1688,6 +1688,10 @@ impl MiniAppMcpServer {
                        table: name of a single table to snapshot; omit for all tables in scope. \
                        dry_run=true: return affects (target_tables, row_counts, \
                        would_purge_generations) without any FS or DB write. \
+                       upload=true: additionally upload each snapshot to the S3-compatible \
+                       destination configured via MINI_APP_S3_* env (requires the 's3-upload' \
+                       build feature; per-table upload failures are non-fatal and reported in \
+                       upload_errors[]). \
                        Retention controlled by MINI_APP_SNAPSHOT_RETENTION (default 10), \
                        strictly separate from MINI_APP_BACKUP_RETENTION.",
         annotations(

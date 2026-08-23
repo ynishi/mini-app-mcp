@@ -42,6 +42,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 arc-swap = "1"
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+# Enable S3-compatible snapshot upload (data_snapshot upload=true).
+s3-upload = ["mini-app-core/s3-upload"]
+
 [dev-dependencies]
 tempfile = "3"
 futures = "0.3"

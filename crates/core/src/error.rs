@@ -109,6 +109,13 @@ pub mod codes {
     /// Returned when `content_insert` receives a `line` value that exceeds
     /// `total_lines + 1`.
     pub const OUT_OF_RANGE: &str = "OUT_OF_RANGE";
+    /// Returned when `data_snapshot` is called with `upload=true` but the
+    /// server binary was built without the `s3-upload` feature, or the
+    /// `MINI_APP_S3_*` environment variables are incomplete.
+    pub const UPLOAD_NOT_CONFIGURED: &str = "UPLOAD_NOT_CONFIGURED";
+    /// Returned when an S3-compatible upload operation fails (network error,
+    /// auth rejection, or local snapshot file read failure).
+    pub const UPLOAD_FAILED: &str = "UPLOAD_FAILED";
 }
 
 /// All errors that can arise inside mini-app-core.
@@ -247,6 +254,15 @@ pub enum MiniAppError {
     /// `content_insert` received a `line` that exceeds `total_lines + 1`.
     #[error("line {line} is out of range (field has {total_lines} lines)")]
     LineOutOfRange { line: u32, total_lines: u32 },
+
+    /// `data_snapshot` was asked to upload but the upload backend is not
+    /// available (feature disabled or `MINI_APP_S3_*` env incomplete).
+    #[error("upload not configured: {0}")]
+    UploadNotConfigured(String),
+
+    /// An S3-compatible upload operation failed.
+    #[error("upload failed: {0}")]
+    Upload(String),
 }
 
 impl MiniAppError {
@@ -284,6 +300,8 @@ impl MiniAppError {
             MiniAppError::StringNotFound { .. } => codes::STRING_NOT_FOUND,
             MiniAppError::AmbiguousMatch { .. } => codes::AMBIGUOUS_MATCH,
             MiniAppError::LineOutOfRange { .. } => codes::OUT_OF_RANGE,
+            MiniAppError::UploadNotConfigured(_) => codes::UPLOAD_NOT_CONFIGURED,
+            MiniAppError::Upload(_) => codes::UPLOAD_FAILED,
         }
     }
 }
@@ -441,6 +459,14 @@ mod tests {
                     line: 100,
                     total_lines: 50,
                 },
+            ),
+            (
+                codes::UPLOAD_NOT_CONFIGURED,
+                MiniAppError::UploadNotConfigured("missing MINI_APP_S3_BUCKET".into()),
+            ),
+            (
+                codes::UPLOAD_FAILED,
+                MiniAppError::Upload("put rejected".into()),
             ),
         ];
         for (expected_code, err) in cases {

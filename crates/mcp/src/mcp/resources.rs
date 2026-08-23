@@ -83,11 +83,12 @@ Re-scan `MINI_APP_USER_DIR` / `MINI_APP_PROJECT_DIR` and atomically replace the 
 
 ## `data_snapshot`
 Create per-table SQLite snapshot dump(s) under `{scope_root}/_snapshots/`. Uses the rusqlite hot backup API so the source DB remains open and writable during the operation. Schema is not modified.
-- **Input**: `{ "table": "<name>" (optional), "scope": "project"|"user" (optional), "dry_run": true|false (optional) }`
+- **Input**: `{ "table": "<name>" (optional), "scope": "project"|"user" (optional), "dry_run": true|false (optional), "upload": true|false (optional) }`
   - `table`: target a single table; omit to snapshot all tables in the given scope.
   - `scope`: restrict to `"project"` (`MINI_APP_PROJECT_DIR`) or `"user"` (`MINI_APP_USER_DIR`); omit for all scopes.
   - `dry_run=true`: return `affects` (target tables, row counts, would-purge counts) **without** any FS or DB write.
-- **Output (dry_run=false)**: `{ "snapshotted": [{"table": "...", "scope": "...", "snapshot_path": "...", "unix_secs": N}, ...], "purged": [{"table": "...", "generations_removed": N}, ...] }`
+  - `upload=true`: additionally upload each written snapshot to the S3-compatible destination configured via `MINI_APP_S3_*` env vars (requires the `s3-upload` build feature; otherwise `UPLOAD_NOT_CONFIGURED`). Per-table upload failures are non-fatal and reported in `upload_errors[]`.
+- **Output (dry_run=false)**: `{ "snapshotted": [{"table": "...", "scope": "...", "snapshot_path": "...", "unix_secs": N}, ...], "purged": [{"table": "...", "generations_removed": N}, ...] }` — with `upload=true`, adds `"uploaded": [{"table": "...", "key": "...", "bytes": N}, ...]` and `"upload_errors": [{"table": "...", "error": "..."}, ...]`
 - **Output (dry_run=true)**: `{ "dry_run": true, "affects": { "target_tables": [...], "row_counts": {"table": N}, "would_purge_generations": {"table": N} } }`
 - **Retention**: controlled by `MINI_APP_SNAPSHOT_RETENTION` (default 10); strictly separate from `MINI_APP_BACKUP_RETENTION`.
 - Annotations: `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=false`
@@ -212,6 +213,8 @@ All MCP errors carry a structured JSON `data` object with at minimum:
 | `TABLE_NOT_FOUND` | 404 | The specified `table` name is not mounted in the server. Also includes `"table": "<name>"` in `data`. |
 | `TABLE_REQUIRED` | 422 | Multi-table mode requires a `table` argument but it was omitted. |
 | `SNAPSHOT_ERROR` | 500 | SQLite snapshot creation or purge failed. |
+| `UPLOAD_NOT_CONFIGURED` | 422 | `data_snapshot` was called with `upload=true` but the binary lacks the `s3-upload` build feature or the `MINI_APP_S3_*` env vars are incomplete (message lists the missing names). Checked before any snapshot is written. |
+| `UPLOAD_FAILED` | 500 | An S3-compatible upload operation failed (network, auth, or local file read). Per-table failures inside `data_snapshot` are reported in `upload_errors[]` instead of this top-level error. |
 | `MATERIALIZE_DEST_RELATIVE` | 422 | The `dest` path supplied to `row_materialize` is not absolute. Absolute paths are required (Agent-First trust model). Also includes `"path": "<path>"` in `data`. |
 | `MATERIALIZE_DEST_INVALID` | 422 | The `dest` path is absolute but invalid (e.g. parent directory cannot be created, or file already exists when `write_mode=error`). Also includes `"path"` and `"reason"` in `data`. |
 | `MATERIALIZE_IO_ERROR` | 500 | A filesystem I/O error occurred during `row_materialize` (file write failure). |

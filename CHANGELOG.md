@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **S3-compatible snapshot upload (opt-in `s3-upload` build feature)** — `data_snapshot` accepts `upload: true` and pushes each written snapshot to an S3-protocol destination (AWS S3 / Backblaze B2 S3-Compatible API / R2 / MinIO) selected by `MINI_APP_S3_ENDPOINT`. Configuration is environment-only (`MINI_APP_S3_*`, rides `.mini-app-mcp.env`); validated before any snapshot is written (`UPLOAD_NOT_CONFIGURED`), per-table upload failures are non-fatal and reported in `upload_errors[]` (`uploaded[]` on success). Remote retention is intentionally out of scope — use bucket lifecycle rules. Default build carries zero new dependencies.
+
 ### Changed
 
 ### Deprecated
