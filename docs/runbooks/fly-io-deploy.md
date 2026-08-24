@@ -81,8 +81,13 @@ the swap. Archive creation follows `docs/runbooks/data-migration.md` §2
 (stop the local daemon first so WAL/SHM are quiescent):
 
 ```sh
-# local host
-tar -czf /tmp/mini-app-data.tar.gz -C ~ .mini-app
+# local host — note the `h`: dereference symlinks. Tables whose schema.yaml
+# is a symlink into a separate repo (see data-migration.md §6) would
+# otherwise dangle on the machine, where no repo checkout exists, and get
+# skipped at startup ("schema.yaml not found"). From then on the machine's
+# schemas are regular files — apply later schema changes via the
+# schema_update tool instead of the repo symlink.
+tar -czhf /tmp/mini-app-data.tar.gz -C ~ .mini-app
 fly ssh sftp shell --app <your-app-name>
 >> put /tmp/mini-app-data.tar.gz /data/incoming.tar.gz
 ```

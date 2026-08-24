@@ -29,6 +29,7 @@ primary_region = "nrt"
   destination = "/data"
 
 [http_service]
+  processes = ["app"]
   internal_port = 8484
   force_https = true
   # A stateful daemon should not scale to zero or fan out: exactly one
