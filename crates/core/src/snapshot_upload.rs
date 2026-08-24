@@ -297,7 +297,10 @@ mod tests {
 
     fn full_vars() -> HashMap<String, String> {
         HashMap::from([
-            (ENV_ENDPOINT.to_string(), "https://s3.example.com".to_string()),
+            (
+                ENV_ENDPOINT.to_string(),
+                "https://s3.example.com".to_string(),
+            ),
             (ENV_BUCKET.to_string(), "my-bucket".to_string()),
             (ENV_ACCESS_KEY_ID.to_string(), "AKID".to_string()),
             (ENV_SECRET_ACCESS_KEY.to_string(), "SECRET".to_string()),
@@ -319,7 +322,12 @@ mod tests {
     /// T2: checksum flag parses none/sha256 strictly.
     #[test]
     fn from_vars_checksum_parse() {
-        for (raw, expected) in [("none", false), ("NONE", false), ("sha256", true), ("SHA256", true)] {
+        for (raw, expected) in [
+            ("none", false),
+            ("NONE", false),
+            ("sha256", true),
+            ("SHA256", true),
+        ] {
             let mut vars = full_vars();
             vars.insert(ENV_CHECKSUM.to_string(), raw.to_string());
             let config = S3UploadConfig::from_vars(&vars).expect("must resolve");
@@ -341,7 +349,13 @@ mod tests {
     /// T2: addressing-style flag parses true/false variants strictly.
     #[test]
     fn from_vars_virtual_hosted_style_parse() {
-        for (raw, expected) in [("true", true), ("TRUE", true), ("1", true), ("false", false), ("0", false)] {
+        for (raw, expected) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("false", false),
+            ("0", false),
+        ] {
             let mut vars = full_vars();
             vars.insert(ENV_VIRTUAL_HOSTED_STYLE.to_string(), raw.to_string());
             let config = S3UploadConfig::from_vars(&vars).expect("must resolve");
@@ -427,9 +441,15 @@ mod tests {
     #[test]
     fn derive_region_shapes() {
         for (endpoint, expected) in [
-            ("https://s3.us-east-005.backblazeb2.com", Some("us-east-005")),
+            (
+                "https://s3.us-east-005.backblazeb2.com",
+                Some("us-east-005"),
+            ),
             ("https://s3.us-west-2.amazonaws.com", Some("us-west-2")),
-            ("https://s3.us-west-2.amazonaws.com/extra/path", Some("us-west-2")),
+            (
+                "https://s3.us-west-2.amazonaws.com/extra/path",
+                Some("us-west-2"),
+            ),
             ("https://s3.amazonaws.com", None),
             ("http://localhost:9000", None),
             ("https://account.r2.cloudflarestorage.com", None),
