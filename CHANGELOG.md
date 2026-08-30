@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.19.0] - 2026-08-30
+
+### Added
+
 - Row-history two-tier storage: raw entries beyond `MINI_APP_HISTORY_KEEP_RECENT`
   (default 16) are automatically compacted into zstd-compressed JSONL chunks in
   the new `_row_history_archive` table (roll happens inside the same write
@@ -25,14 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `_row_history.prev_data_json` is no longer written (the pre-operation state
   is the previous entry's `data_json`; the column remains readable for
   databases written by older versions). Halves history write volume.
-
-### Deprecated
-
-### Removed
-
-### Fixed
-
-### Security
 
 ## [0.18.0] - 2026-08-24
 
