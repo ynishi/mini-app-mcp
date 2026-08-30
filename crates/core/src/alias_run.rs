@@ -326,6 +326,7 @@ mod tests {
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         }
     }
 

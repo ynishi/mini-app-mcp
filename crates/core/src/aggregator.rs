@@ -658,6 +658,7 @@ mod tests {
                 },
             ],
             dump: None,
+            history: Default::default(),
         }
     }
 

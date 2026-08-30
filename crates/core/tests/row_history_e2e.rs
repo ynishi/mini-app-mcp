@@ -30,6 +30,7 @@ async fn make_store() -> Store {
             description: None,
         }],
         dump: None,
+        history: Default::default(),
     };
     Store::open(Path::new(":memory:"), schema)
         .await

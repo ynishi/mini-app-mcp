@@ -27,6 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 arc-swap = "1"
 sha2 = "0.10"
 hex = "0.4"
+zstd = "0.13"
 minijinja = "2"
 object_store = { version = "0.12", features = ["aws"], optional = true }
 bytes = { version = "1", optional = true }

@@ -9,7 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Row-history two-tier storage: raw entries beyond `MINI_APP_HISTORY_KEEP_RECENT`
+  (default 16) are automatically compacted into zstd-compressed JSONL chunks in
+  the new `_row_history_archive` table (roll happens inside the same write
+  transaction; `row_restore` / version listings read through the archive
+  transparently). At most one chunk is rolled per write, so pre-existing
+  backlogs drain gradually with bounded memory. History is compressed, never
+  discarded.
+- `history: off` opt-out in `schema.yaml` for automated high-frequency writer
+  tables — disables `_row_history` recording entirely for that table.
+- Env tunables `MINI_APP_HISTORY_KEEP_RECENT` / `MINI_APP_HISTORY_CHUNK_MIN`.
+
 ### Changed
+
+- `_row_history.prev_data_json` is no longer written (the pre-operation state
+  is the previous entry's `data_json`; the column remains readable for
+  databases written by older versions). Halves history write volume.
 
 ### Deprecated
 

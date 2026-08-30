@@ -1039,6 +1039,7 @@ mod tests {
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let store = Store::open(&db_path, schema.clone())
             .await

@@ -426,6 +426,7 @@ impl Store {
             serde_json::to_string(&value).expect("serde_json::Value serialization is infallible");
 
         let table_name = self.schema.table.clone();
+        let history_enabled = self.schema.history.enabled();
         let conn = self.conn.clone();
         let id_inner = id.clone();
         let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
@@ -437,15 +438,16 @@ impl Store {
                 "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![id_inner, data_str, now, now],
             )?;
-            crate::row_history::record_in_tx(
-                &tx,
-                &table_name,
-                &id_inner,
-                crate::row_history::HistoryOp::Create,
-                Some(&serde_json::to_string(&value).expect("infallible")),
-                None,
-                now,
-            )?;
+            if history_enabled {
+                crate::row_history::record_in_tx(
+                    &tx,
+                    &table_name,
+                    &id_inner,
+                    crate::row_history::HistoryOp::Create,
+                    Some(&serde_json::to_string(&value).expect("infallible")),
+                    now,
+                )?;
+            }
             tx.commit()?;
             Ok(RowRecord {
                 id: id_inner,
@@ -736,15 +738,16 @@ impl Store {
                 "UPDATE rows SET data = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![merged_str, now, id_str],
             )?;
-            crate::row_history::record_in_tx(
-                &tx,
-                &table_name,
-                &id_str,
-                crate::row_history::HistoryOp::Update,
-                Some(&merged_str),
-                Some(&current_data_str),
-                now,
-            )?;
+            if schema.history.enabled() {
+                crate::row_history::record_in_tx(
+                    &tx,
+                    &table_name,
+                    &id_str,
+                    crate::row_history::HistoryOp::Update,
+                    Some(&merged_str),
+                    now,
+                )?;
+            }
             tx.commit()?;
 
             Ok(RowRecord {
@@ -864,6 +867,7 @@ impl Store {
         let conn = self.conn.clone();
         let id = id.to_string();
         let table_name = self.schema.table.clone();
+        let history_enabled = self.schema.history.enabled();
         let now = now_secs();
 
         // The closure returns the resolved (full) UUID so that on_delete
@@ -893,15 +897,16 @@ impl Store {
                 // Row disappeared between SELECT and DELETE (race); roll back naturally.
                 return Err(MiniAppError::NotFound { id: resolved });
             }
-            crate::row_history::record_in_tx(
-                &tx,
-                &table_name,
-                &resolved,
-                crate::row_history::HistoryOp::Delete,
-                Some(&data_str),
-                None,
-                now,
-            )?;
+            if history_enabled {
+                crate::row_history::record_in_tx(
+                    &tx,
+                    &table_name,
+                    &resolved,
+                    crate::row_history::HistoryOp::Delete,
+                    Some(&data_str),
+                    now,
+                )?;
+            }
             tx.commit()?;
             Ok(resolved)
         })
@@ -940,6 +945,7 @@ impl Store {
         let data_str =
             serde_json::to_string(&data).expect("serde_json::Value serialization is infallible");
         let table_name = self.schema.table.clone();
+        let history_enabled = self.schema.history.enabled();
         let conn = self.conn.clone();
 
         let record = tokio::task::spawn_blocking(move || -> Result<RowRecord, MiniAppError> {
@@ -951,15 +957,16 @@ impl Store {
                 "INSERT INTO rows (id, data, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![id_str, data_str, now, now],
             )?;
-            crate::row_history::record_in_tx(
-                &tx,
-                &table_name,
-                &id_str,
-                crate::row_history::HistoryOp::Create,
-                Some(&data_str),
-                None,
-                now,
-            )?;
+            if history_enabled {
+                crate::row_history::record_in_tx(
+                    &tx,
+                    &table_name,
+                    &id_str,
+                    crate::row_history::HistoryOp::Create,
+                    Some(&data_str),
+                    now,
+                )?;
+            }
             tx.commit()?;
             Ok(RowRecord {
                 id: id_str,
@@ -993,6 +1000,14 @@ impl Store {
         id: &str,
         at_unix_secs: i64,
     ) -> Result<Option<crate::row_history::HistoryRecord>, MiniAppError> {
+        // With `history: off` this table has no restore surface. Entries from
+        // before a full→off cutover may still exist in the DB, but serving
+        // them here would let row_restore silently overwrite live data with a
+        // pre-cutover snapshot (and the overwrite itself would leave no
+        // history entry to undo) — so the switch also disables reads.
+        if !self.schema.history.enabled() {
+            return Ok(None);
+        }
         let conn = self.conn.clone();
         let table_name = self.schema.table.clone();
         let id_str = id.to_string();
@@ -1452,15 +1467,16 @@ impl Store {
                     "UPDATE rows SET data = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![new_data_str, now, id_str],
                 )?;
-                crate::row_history::record_in_tx(
-                    &tx,
-                    &table_name,
-                    &id_str,
-                    crate::row_history::HistoryOp::Update,
-                    Some(&new_data_str),
-                    Some(&data_str),
-                    now,
-                )?;
+                if schema.history.enabled() {
+                    crate::row_history::record_in_tx(
+                        &tx,
+                        &table_name,
+                        &id_str,
+                        crate::row_history::HistoryOp::Update,
+                        Some(&new_data_str),
+                        now,
+                    )?;
+                }
                 tx.commit()?;
 
                 Ok((
@@ -1568,15 +1584,16 @@ impl Store {
                 "UPDATE rows SET data = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![new_data_str, now, id_str],
             )?;
-            crate::row_history::record_in_tx(
-                &tx,
-                &table_name,
-                &id_str,
-                crate::row_history::HistoryOp::Update,
-                Some(&new_data_str),
-                Some(&data_str),
-                now,
-            )?;
+            if schema.history.enabled() {
+                crate::row_history::record_in_tx(
+                    &tx,
+                    &table_name,
+                    &id_str,
+                    crate::row_history::HistoryOp::Update,
+                    Some(&new_data_str),
+                    now,
+                )?;
+            }
             tx.commit()?;
 
             Ok(RowRecord {
@@ -1625,6 +1642,7 @@ mod tests {
                 },
             ],
             dump: None,
+            history: Default::default(),
         };
         Store::open(Path::new(":memory:"), schema).await.unwrap()
     }
@@ -1650,6 +1668,7 @@ mod tests {
                     description: None,
                 },
             ],
+            history: Default::default(),
             dump: Some(DumpConfig {
                 dir: Some(dir.to_path_buf()),
                 title_field: None,
@@ -1661,6 +1680,83 @@ mod tests {
     }
 
     // --- Basic CRUD ---
+
+    #[tokio::test]
+    async fn test_history_off_records_nothing() {
+        let schema = SchemaConfig {
+            table: "test".into(),
+            title: None,
+            description: None,
+            fields: vec![FieldDef {
+                name: "title".into(),
+                ty: FieldType::String,
+                required: true,
+                description: None,
+            }],
+            dump: None,
+            history: crate::schema::HistoryMode::Off,
+        };
+        let store = Store::open(Path::new(":memory:"), schema).await.unwrap();
+        let row = store
+            .create(serde_json::json!({"title": "a"}))
+            .await
+            .unwrap();
+        store
+            .update(
+                &row.id,
+                serde_json::json!({"title": "b"}),
+                UpdateMode::Merge,
+            )
+            .await
+            .unwrap();
+        store.delete(&row.id).await.unwrap();
+
+        let n: i64 = store
+            .conn_for_test()
+            .query_row("SELECT COUNT(*) FROM _row_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "history: off must not record any entry");
+
+        // The restore surface is disabled too: even if pre-cutover entries
+        // existed, fetch_history_at must not serve them (stale-restore guard).
+        assert!(
+            store
+                .fetch_history_at(&row.id, i64::MAX)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_history_full_still_records() {
+        let store = make_test_store().await;
+        let row = store
+            .create(serde_json::json!({"title": "a"}))
+            .await
+            .unwrap();
+        store
+            .update(
+                &row.id,
+                serde_json::json!({"title": "b"}),
+                UpdateMode::Merge,
+            )
+            .await
+            .unwrap();
+        let versions = store.conn_for_test();
+        let n: i64 = versions
+            .query_row("SELECT COUNT(*) FROM _row_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        let prev_n: i64 = versions
+            .query_row(
+                "SELECT COUNT(*) FROM _row_history WHERE prev_data_json IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prev_n, 0, "prev_data_json must no longer be written");
+    }
 
     #[tokio::test]
     async fn test_create_and_get_roundtrip() {
@@ -1975,6 +2071,7 @@ mod tests {
                 required: false,
                 description: None,
             }],
+            history: Default::default(),
             dump: Some(DumpConfig {
                 dir: None,
                 title_field: None,
@@ -2196,6 +2293,7 @@ mod tests {
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let store = Store::open(&db_path, schema)
             .await
@@ -2224,6 +2322,7 @@ mod tests {
             description: None,
             fields,
             dump: None,
+            history: Default::default(),
         }
     }
 

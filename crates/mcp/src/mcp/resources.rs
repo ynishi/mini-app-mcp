@@ -567,6 +567,7 @@ mod tests {
                 },
             ],
             dump: None,
+            history: Default::default(),
         }
     }
 
@@ -625,6 +626,7 @@ mod tests {
                 },
             ],
             dump: None,
+            history: Default::default(),
         };
         let js = derive_json_schema(&schema);
         assert_eq!(js["properties"]["s"]["type"], "string");

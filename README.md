@@ -810,13 +810,39 @@ Every `create`, `update`, and `delete` call automatically writes a full-JSON sna
 
 ### What gets recorded
 
-| Event | `op` value | `data_json` | `prev_data_json` |
-|---|---|---|---|
-| `create` | `"create"` | new row JSON | `null` |
-| `update` | `"update"` | merged result JSON | previous row JSON |
-| `delete` | `"delete"` | deleted row JSON | `null` |
+| Event | `op` value | `data_json` |
+|---|---|---|
+| `create` | `"create"` | new row JSON |
+| `update` | `"update"` | merged result JSON |
+| `delete` | `"delete"` | deleted row JSON |
 
 Every history record also carries a monotonically increasing `version` counter (scoped per `table + row id`) and a `recorded_at` Unix seconds timestamp.
+
+The pre-operation state of any entry is simply the previous entry's `data_json`, so it is not stored again (the legacy `prev_data_json` column remains readable in databases written by older versions, but new entries leave it `null` — this halves history write volume).
+
+### Two-tier storage: raw + compressed archive
+
+History is never discarded, but it must not eat the disk either (a single 178KB row updated 949 times used to leave 222MB of full-copy history). The raw `_row_history` table only keeps the newest entries per row; older entries are automatically compacted — inside the same write transaction — into zstd-compressed JSONL chunks in `_row_history_archive`. Near-duplicate JSON versions compress at roughly three orders of magnitude, so long histories stay cheap while remaining fully restorable: `row_restore` and version listings read through the archive transparently.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MINI_APP_HISTORY_KEEP_RECENT` | `16` | raw (uncompressed) entries kept per row — the undo hot set |
+| `MINI_APP_HISTORY_CHUNK_MIN` | `48` | minimum entries rolled into one archive chunk (roll triggers past `KEEP_RECENT + CHUNK_MIN`) |
+
+### Opting out per table (`history: off`)
+
+Tables written at high frequency by automated jobs (heartbeat stamps, log-cache style rows) can disable history entirely in `schema.yaml`:
+
+```yaml
+table: tick_stamps
+history: off   # default: full
+fields:
+  - name: label
+    type: string
+    required: true
+```
+
+With `history: off` no `_row_history` entry is written for any mutation of that table (and `row_restore` has nothing to restore from — use it only where per-write history has no recovery value).
 
 ### Restoring a row with `row_restore`
 

@@ -652,6 +652,7 @@ mod tests {
                 },
             ],
             dump: None,
+            history: Default::default(),
         };
 
         // Use an in-memory SQLite store for tests.
@@ -1675,6 +1676,7 @@ mod tests {
                 },
             ],
             dump: None,
+            history: Default::default(),
         }
     }
 

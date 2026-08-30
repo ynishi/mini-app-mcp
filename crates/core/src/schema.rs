@@ -111,6 +111,33 @@ pub struct SchemaConfig {
     /// the dump feature is disabled entirely (backward-compatible default).
     #[serde(default)]
     pub dump: Option<crate::dump::DumpConfig>,
+    /// Row-history recording mode for this table.
+    ///
+    /// `full` (default) records every create/update/delete into `_row_history`
+    /// (with automatic compressed archive roll — see `row_history` module).
+    /// `off` disables history recording entirely; intended for automated
+    /// high-frequency writers (log-cache style tables) where per-write history
+    /// has no recovery value and only accumulates disk.
+    #[serde(default)]
+    pub history: HistoryMode,
+}
+
+/// Row-history recording mode declared in `schema.yaml` (`history:` key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryMode {
+    /// Record every mutation (default).
+    #[default]
+    Full,
+    /// Do not record history for this table.
+    Off,
+}
+
+impl HistoryMode {
+    /// Whether mutations on this table should be recorded into `_row_history`.
+    pub fn enabled(self) -> bool {
+        matches!(self, HistoryMode::Full)
+    }
 }
 
 impl SchemaConfig {
@@ -283,6 +310,24 @@ mod tests {
         f
     }
 
+    #[test]
+    fn history_mode_defaults_to_full_when_absent() {
+        let f = write_yaml("table: t\nfields:\n- name: a\n  type: string\n  required: true\n");
+        let schema = load_from_path(f.path()).expect("valid YAML must parse");
+        assert_eq!(schema.history, HistoryMode::Full);
+        assert!(schema.history.enabled());
+    }
+
+    #[test]
+    fn history_mode_off_parses_from_yaml() {
+        let f = write_yaml(
+            "table: t\nhistory: off\nfields:\n- name: a\n  type: string\n  required: true\n",
+        );
+        let schema = load_from_path(f.path()).expect("valid YAML must parse");
+        assert_eq!(schema.history, HistoryMode::Off);
+        assert!(!schema.history.enabled());
+    }
+
     /// Helper: build a simple SchemaConfig for write_to_path tests.
     fn make_test_schema() -> SchemaConfig {
         SchemaConfig {
@@ -304,6 +349,7 @@ mod tests {
                 },
             ],
             dump: None,
+            history: Default::default(),
         }
     }
 
@@ -356,6 +402,7 @@ fields:
                 },
             ],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({ "title": "hello", "count": 42 });
         assert!(schema.validate(&value).is_ok());
@@ -374,6 +421,7 @@ fields:
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({});
         assert!(schema.validate(&value).is_ok());
@@ -393,6 +441,7 @@ fields:
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({ "title": "hi", "extra_key": 99 });
         assert!(schema.validate(&value).is_ok());
@@ -413,6 +462,7 @@ fields:
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({ "title": null });
         let err = schema
@@ -437,6 +487,7 @@ fields:
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({ "state": null });
         assert!(schema.validate(&value).is_ok());
@@ -450,6 +501,7 @@ fields:
             description: None,
             fields: vec![],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({});
         assert!(schema.validate(&value).is_ok());
@@ -463,6 +515,7 @@ fields:
             description: None,
             fields: vec![],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!([1, 2, 3]);
         let err = schema.validate(&value).expect_err("array root must error");
@@ -484,6 +537,7 @@ fields:
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({});
         let err = schema
@@ -511,6 +565,7 @@ fields:
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({ "score": "not-a-number" });
         let err = schema
@@ -545,6 +600,7 @@ fields:
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({ "active": 1 });
         let err = schema.validate(&value).expect_err("number is not boolean");
@@ -564,6 +620,7 @@ fields:
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let value = serde_json::json!({ "tags": "not-an-array" });
         let err = schema.validate(&value).expect_err("string is not array");

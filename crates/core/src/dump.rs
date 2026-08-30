@@ -236,6 +236,7 @@ mod tests {
                 },
             ],
             dump: None,
+            history: Default::default(),
         }
     }
 
@@ -258,6 +259,7 @@ mod tests {
                     description: None,
                 },
             ],
+            history: Default::default(),
             dump: Some(DumpConfig {
                 dir: Some(dir.to_path_buf()),
                 title_field: None,
@@ -391,6 +393,7 @@ mod tests {
             title: None,
             description: None,
             fields: vec![],
+            history: Default::default(),
             dump: Some(DumpConfig {
                 dir: Some(tmp.path().to_path_buf()),
                 title_field: None,
@@ -413,6 +416,7 @@ mod tests {
             description: None,
             fields: vec![],
             dump: None,
+            history: Default::default(),
         };
         let dump = DumpConfig {
             dir: None,
@@ -482,6 +486,7 @@ mod tests {
             title: None,
             description: None,
             fields: vec![],
+            history: Default::default(),
             dump: Some(DumpConfig {
                 dir: Some(subdir.clone()),
                 title_field: None,

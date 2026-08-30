@@ -410,6 +410,7 @@ pub async fn do_schema_create(
         description: params.description.clone(),
         fields,
         dump: None,
+        history: Default::default(),
     };
 
     // Create the table directory (idempotent).
@@ -564,6 +565,7 @@ pub async fn do_schema_update(
         description: params.description.clone(),
         fields: new_fields,
         dump: None,
+        history: Default::default(),
     };
     new_schema.write_to_path(&yaml_path).await?;
 
@@ -1083,6 +1085,7 @@ pub async fn execute_batch(
                     description: description.clone(),
                     fields: parsed_fields,
                     dump: None,
+                    history: Default::default(),
                 };
 
                 // Create the directory.
@@ -1120,6 +1123,7 @@ pub async fn execute_batch(
                     description: description.clone(),
                     fields: parsed_fields,
                     dump: None,
+                    history: Default::default(),
                 };
                 deferred_writes.push(DeferredYamlWrite::Write {
                     path: yaml_path,
@@ -1287,6 +1291,7 @@ pub async fn execute_batch(
                 description: description.clone(),
                 fields: parsed_fields,
                 dump: None,
+                history: Default::default(),
             };
             // Ensure the DB file is created and initialized.
             let _ = yaml_path; // already written above

@@ -34,6 +34,7 @@ fn make_schema(table: &str) -> SchemaConfig {
             description: None,
         }],
         dump: None,
+        history: Default::default(),
     }
 }
 

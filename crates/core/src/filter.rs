@@ -541,6 +541,7 @@ mod tests {
                 })
                 .collect(),
             dump: None,
+            history: Default::default(),
         }
     }
 

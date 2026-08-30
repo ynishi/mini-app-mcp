@@ -2496,6 +2496,7 @@ fields:\n\
                 },
             ],
             dump: None,
+            history: Default::default(),
         };
         let store = Store::open(Path::new(":memory:"), schema.clone())
             .await
@@ -3071,6 +3072,7 @@ fields:\n\
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
         let schema_b = SchemaConfig {
             table: "table_b".to_string(),
@@ -3083,6 +3085,7 @@ fields:\n\
                 description: None,
             }],
             dump: None,
+            history: Default::default(),
         };
 
         let store_a = Store::open(Path::new(":memory:"), schema_a.clone())
@@ -3265,6 +3268,7 @@ fields:\n\
             description: None,
             fields: vec![],
             dump: None,
+            history: Default::default(),
         };
         let schema_b = SchemaConfig {
             table: "table_b".to_string(),
@@ -3272,6 +3276,7 @@ fields:\n\
             description: None,
             fields: vec![],
             dump: None,
+            history: Default::default(),
         };
         let schema_c = SchemaConfig {
             table: "table_c".to_string(),
@@ -3279,6 +3284,7 @@ fields:\n\
             description: None,
             fields: vec![],
             dump: None,
+            history: Default::default(),
         };
 
         // old registry: table_a, table_b
@@ -3445,6 +3451,7 @@ fields:\n\
                 description: Some("The main content field.".to_string()),
             }],
             dump: None,
+            history: Default::default(),
         };
 
         let store = Store::open(Path::new(":memory:"), schema.clone())
@@ -3564,6 +3571,7 @@ fields:\n\
                 },
             ],
             dump: None,
+            history: Default::default(),
         };
         let store = Store::open(Path::new(":memory:"), schema.clone())
             .await
