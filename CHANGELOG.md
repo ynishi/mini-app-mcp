@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.19.1] - 2026-09-02
+
+### Changed
+
 - Fly template (`contrib/fly/fly.toml`) now sets `MINI_APP_SNAPSHOT_RETENTION = "1"`:
   row history (versioned + compressed since 0.19.0) covers point-in-time
   recovery and the backup cron uploads snapshots to S3, so the local snapshot
