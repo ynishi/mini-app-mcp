@@ -19,6 +19,12 @@ primary_region = "nrt"
 [env]
   # SQLite + schema.yaml live on the mounted volume.
   MINI_APP_USER_DIR = "/data/mini-app"
+  # Keep only 1 snapshot generation per table on the 1GB volume — row_history
+  # (versioned + compressed, v0.19.0) covers point-in-time recovery and the
+  # daily cron uploads to S3, so the local generation is just a working copy
+  # (2026-08/09 incidents: 2 generations of a 237MB table still filled the
+  # volume; the local copy count is not the backup).
+  MINI_APP_SNAPSHOT_RETENTION = "1"
   # Daily backup via supercronic (contrib/docker/entrypoint.sh).
   # Cron runs in UTC: 03:00 UTC = 12:00 JST. Unset to disable.
   BACKUP_CRON = "0 3 * * *"
